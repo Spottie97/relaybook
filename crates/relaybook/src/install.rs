@@ -234,6 +234,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.starts_with("keep\n"), "{text}");
         assert!(text.contains(super::EXECUTOR_HEADING));
+        assert!(text.contains("If you must deviate from the plan"));
         assert!(!text.contains("AgentMesh"));
         assert_eq!(text.matches(MARKER_START).count(), 1);
     }
