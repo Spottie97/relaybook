@@ -31,6 +31,7 @@ pub(crate) struct Options {
     pub no_graphify: bool,
     pub no_hooks: bool,
     pub no_claude_hook: bool,
+    pub no_commands: bool,
     pub ci: bool,
 }
 
@@ -51,6 +52,7 @@ pub(crate) fn run(cwd: &Path, options: Options) -> Result<Report, Error> {
     let mut steps = Vec::new();
     record_ledger(&root, &mut steps)?;
     record_docs(&root, &mut steps)?;
+    record_commands(&root, &options, &mut steps);
     record_prompt_hook(&root, &options, &mut steps);
     record_graphify(&root, &options, &mut steps);
     record_graphify_guards(&root, &mut steps);
@@ -106,6 +108,35 @@ fn record_docs(root: &Path, steps: &mut Vec<Step>) -> Result<(), Error> {
         format!("{claude} CLAUDE.md, {cursor} AGENTS.md"),
     );
     Ok(())
+}
+
+fn record_commands(root: &Path, options: &Options, steps: &mut Vec<Step>) {
+    if options.no_commands {
+        push(steps, "claude command", "skipped", "--no-commands");
+        return;
+    }
+    match crate::commands::install_claude(root) {
+        Ok(crate::commands::Status::Updated) => {
+            push(
+                steps,
+                "claude command",
+                "done",
+                "wrote .claude/commands/relaybook.md",
+            );
+        }
+        Ok(crate::commands::Status::Unchanged) => {
+            push(steps, "claude command", "skipped", "already installed");
+        }
+        Ok(crate::commands::Status::LeftAlone) => {
+            push(
+                steps,
+                "claude command",
+                "skipped",
+                "file has no relaybook:managed marker",
+            );
+        }
+        Err(err) => push(steps, "claude command", "failed", err.to_string()),
+    }
 }
 
 fn record_prompt_hook(root: &Path, options: &Options, steps: &mut Vec<Step>) {

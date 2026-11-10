@@ -164,6 +164,9 @@ enum Command {
         /// Skip the Claude Code UserPromptSubmit hook.
         #[arg(long)]
         no_claude_hook: bool,
+        /// Skip the Claude and Cursor /relaybook commands.
+        #[arg(long)]
+        no_commands: bool,
         /// Write the opt-in GitHub Actions workflow and graph.json merge driver.
         #[arg(long)]
         ci: bool,
@@ -506,29 +509,27 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         } => {
             let prd = match (prd, prd_path) {
                 (Some(_), Some(_)) => {
-                    return Err(Fail::Usage(
-                        "pass either a PRD path or --prd".to_string(),
-                    ));
+                    return Err(Fail::Usage("pass either a PRD path or --prd".to_string()));
                 }
                 (Some(path), None) | (None, Some(path)) => Some(path),
                 (None, None) => None,
             };
             run_auto(
-            &cwd,
-            runloop::Launch {
-                prd,
-                resume,
-                approve: false,
-                stop: matches!(action, Some(RunAction::Stop)),
-                complete: matches!(action, Some(RunAction::Complete)),
-                max_cycles,
-                max_agent_calls,
-                max_reopens,
-                cursor_timeout_min,
-                est_cost_cap_usd,
-                gates,
-            },
-        )
+                &cwd,
+                runloop::Launch {
+                    prd,
+                    resume,
+                    approve: false,
+                    stop: matches!(action, Some(RunAction::Stop)),
+                    complete: matches!(action, Some(RunAction::Complete)),
+                    max_cycles,
+                    max_agent_calls,
+                    max_reopens,
+                    cursor_timeout_min,
+                    est_cost_cap_usd,
+                    gates,
+                },
+            )
         }
         Command::Approve => run_auto(
             &cwd,
@@ -557,6 +558,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             no_graphify,
             no_hooks,
             no_claude_hook,
+            no_commands,
             ci,
         } => setup_project(
             &cwd,
@@ -564,6 +566,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                 no_graphify,
                 no_hooks,
                 no_claude_hook,
+                no_commands,
                 ci,
             },
         ),

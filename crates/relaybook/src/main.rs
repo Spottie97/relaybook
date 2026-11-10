@@ -5,6 +5,7 @@ fn main() -> std::process::ExitCode {
 mod agents;
 mod claude_hook;
 mod cli;
+mod commands;
 mod gitinfo;
 mod graphify;
 mod hooks;

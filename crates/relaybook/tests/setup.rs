@@ -468,6 +468,73 @@ fn setup_merges_the_prompt_hook_without_duplicating_it() {
 }
 
 #[test]
+fn setup_installs_and_preserves_the_claude_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir
+        .path()
+        .join(".claude")
+        .join("commands")
+        .join("relaybook.md");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude command: done (wrote .claude/commands/relaybook.md)",
+        ));
+    let body = fs::read_to_string(&path).expect("command");
+    assert!(body.contains("relaybook:managed"), "{body}");
+    assert!(body.contains("AskUserQuestion"), "{body}");
+    assert!(body.contains("run_in_background"), "{body}");
+
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude command: skipped (already installed)",
+        ));
+    assert_eq!(fs::read_to_string(&path).expect("command"), body);
+
+    fs::write(&path, body.replace("Relaybook:", "Old:")).expect("edit");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude command: done (wrote .claude/commands/relaybook.md)",
+        ));
+    assert_eq!(fs::read_to_string(&path).expect("command"), body);
+
+    fs::write(&path, "custom command\n").expect("custom");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude command: skipped (file has no relaybook:managed marker)",
+        ));
+    assert_eq!(
+        fs::read_to_string(&path).expect("command"),
+        "custom command\n"
+    );
+}
+
+#[test]
+fn no_commands_skips_the_claude_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    setup_plain(dir.path(), &["setup", "--no-graphify", "--no-commands"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude command: skipped (--no-commands)",
+        ));
+    assert!(
+        !dir.path()
+            .join(".claude")
+            .join("commands")
+            .join("relaybook.md")
+            .exists()
+    );
+}
+
+#[test]
 fn prompt_hook_reports_installed_when_relaybook_is_on_path() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bin = dir.path().join("bin");
