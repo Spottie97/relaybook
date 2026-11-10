@@ -36,9 +36,30 @@ fn missing_graphify_skips_without_failing() {
         .env("PATH", "/usr/bin:/bin")
         .assert()
         .success()
-        .stdout(predicates::str::contains("uv tool install graphifyy"));
+        .stdout(predicates::str::contains("uv tool install graphifyy"))
+        .stdout(predicates::str::contains("install.sh --with-rtk"));
     assert!(dir.path().join("CLAUDE.md").is_file());
     assert!(dir.path().join(".relaybook").join("ledger.db").is_file());
+}
+
+#[test]
+fn rtk_step_follows_the_fake_on_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = fake_graphify(dir.path(), false);
+    let rtk = bin.join("rtk");
+    fs::write(
+        &rtk,
+        "#!/bin/sh\nif [ \"$1\" = verify ]; then exit 0; fi\nexit 1\n",
+    )
+    .expect("write");
+    let mut permissions = fs::metadata(&rtk).expect("meta").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&rtk, permissions).expect("chmod");
+    let log = dir.path().join("graphify.log");
+    setup(dir.path(), &bin, &log, &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("rtk: done"));
 }
 
 #[test]

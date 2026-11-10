@@ -52,6 +52,7 @@ pub(crate) fn run(cwd: &Path, options: Options) -> Result<Report, Error> {
     record_docs(&root, &mut steps)?;
     record_graphify(&root, &options, &mut steps);
     record_hooks(&root, &options, &mut steps);
+    record_rtk(&mut steps);
     if options.ci {
         record_ci(&root, &mut steps)?;
     }
@@ -127,6 +128,43 @@ fn record_graphify(root: &Path, options: &Options, steps: &mut Vec<Step>) {
         let status = if result.ok { "done" } else { "failed" };
         push(steps, name, status, result.detail);
     }
+}
+
+fn record_rtk(steps: &mut Vec<Step>) {
+    if !command_on_path("rtk") {
+        push(
+            steps,
+            "rtk",
+            "skipped",
+            "install with `install.sh --with-rtk`",
+        );
+        return;
+    }
+    let verified = std::process::Command::new("rtk")
+        .arg("verify")
+        .output()
+        .ok()
+        .is_some_and(|output| output.status.success());
+    if verified {
+        push(steps, "rtk", "done", "rtk verify");
+    } else {
+        push(
+            steps,
+            "rtk",
+            "skipped",
+            "rtk is installed; run `rtk init -g` to add its hook",
+        );
+    }
+}
+
+fn command_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let candidate = dir.join(name);
+        candidate.is_file()
+    })
 }
 
 fn record_hooks(root: &Path, options: &Options, steps: &mut Vec<Step>) {

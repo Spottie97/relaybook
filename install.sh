@@ -9,11 +9,15 @@ install_dir="${RELAYBOOK_INSTALL_DIR:-$HOME/.local/bin}"
 release_base="${RELAYBOOK_RELEASE_BASE:-https://github.com/${repo}/releases/latest/download}"
 no_graphify=0
 upgrade=0
+with_rtk=0
+assume_yes=0
 
 for arg in "$@"; do
   case "$arg" in
     --no-graphify) no_graphify=1 ;;
     --upgrade) upgrade=1 ;;
+    --with-rtk) with_rtk=1 ;;
+    --yes) assume_yes=1 ;;
     *)
       echo "unknown argument: $arg" >&2
       exit 2
@@ -115,6 +119,33 @@ else
   else
     echo "graphify was not installed. Install uv or pipx, then run: uv tool install graphifyy" >&2
     echo "or: pipx install graphifyy" >&2
+  fi
+fi
+
+if [ "$with_rtk" -eq 0 ]; then
+  :
+elif command -v rtk >/dev/null 2>&1; then
+  echo "rtk already installed"
+else
+  if command -v brew >/dev/null 2>&1; then
+    brew install rtk || echo "warning: rtk install failed; Relaybook is still installed" >&2
+  else
+    echo "rtk was not installed. See https://www.rtk-ai.app/ or run: brew install rtk" >&2
+  fi
+fi
+
+if [ "$with_rtk" -eq 1 ] && command -v rtk >/dev/null 2>&1; then
+  if [ "$assume_yes" -eq 1 ]; then
+    rtk init -g || echo "warning: rtk init failed; Relaybook is still installed" >&2
+  elif [ -t 0 ]; then
+    printf 'Add the RTK hook to your global Claude settings? [y/N] '
+    read -r answer || answer=""
+    case "$answer" in
+      y|Y|yes|YES) rtk init -g || echo "warning: rtk init failed; Relaybook is still installed" >&2 ;;
+      *) echo "skipped rtk init; run: rtk init -g" ;;
+    esac
+  else
+    echo "skipped rtk init; run: rtk init -g"
   fi
 fi
 

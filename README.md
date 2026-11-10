@@ -199,6 +199,21 @@ does not rewrite `relaybook` commands.
 `scripts/measure-context.sh --check` fails when fixture context exceeds 4000 bytes, a
 write acknowledgement exceeds 120 bytes, or an instruction block exceeds 600 bytes.
 
+## Token savings stack
+
+Graphify (Apache-2.0, installed by default) keeps code questions on the graph instead
+of a full-repo read. RTK (Apache-2.0, maintained separately) compacts git, test, build,
+and grep output. Relaybook compacts the work ledger. Skip Graphify with `--no-graphify`.
+Skip the pull hooks with `--no-hooks`. RTK is opt-in:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --with-rtk
+```
+
+`--yes` also runs `rtk init -g` without the y/N prompt. Without a terminal and without
+`--yes`, the installer prints `rtk init -g` instead of editing `~/.claude/settings.json`.
+`relaybook setup` never installs RTK and never edits that global file.
+
 ## Library
 
 `relaybook-core` owns the ledger. A future MCP adapter, or any other front end, should
