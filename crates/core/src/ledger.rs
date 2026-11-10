@@ -101,7 +101,12 @@ impl Ledger {
         })
     }
 
-    pub fn list_tasks(&self, status: Option<Status>, ready: bool) -> Result<Vec<Task>, Error> {
+    pub fn list_tasks(
+        &self,
+        status: Option<Status>,
+        ready: bool,
+        include_done: bool,
+    ) -> Result<Vec<Task>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, slug, title, status, claimed_by, created_at, updated_at
              FROM tasks
@@ -114,6 +119,8 @@ impl Ledger {
         fill_dependencies(&self.conn, &mut tasks)?;
         if ready {
             tasks.retain(|task| task.status == Status::Open && task.needs.is_empty());
+        } else if status.is_none() && !include_done {
+            tasks.retain(|task| task.status != Status::Done);
         }
         Ok(tasks)
     }
@@ -418,7 +425,7 @@ impl Ledger {
         let tasks = if let Some(slug) = slug {
             vec![load_task(&self.conn, slug)?]
         } else {
-            let mut tasks = self.list_tasks(None, false)?;
+            let mut tasks = self.list_tasks(None, false, true)?;
             if !include_done {
                 tasks.retain(|task| task.status != Status::Done);
             }
@@ -438,7 +445,7 @@ impl Ledger {
     }
 
     fn hidden_done_count(&self, shown: &[TaskDetail]) -> Result<usize, Error> {
-        let done = self.list_tasks(Some(Status::Done), false)?;
+        let done = self.list_tasks(Some(Status::Done), false, true)?;
         let shown_done = shown
             .iter()
             .filter(|detail| detail.task.status == Status::Done)
@@ -811,7 +818,9 @@ mod tests {
             .create_task("ledger", "Open the ledger")
             .expect("create");
         ledger.claim_task("auth", "cursor").expect("claim");
-        let open = ledger.list_tasks(Some(Status::Open), false).expect("list");
+        let open = ledger
+            .list_tasks(Some(Status::Open), false, true)
+            .expect("list");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].slug, "ledger");
         ledger.complete_task("auth").expect("done");

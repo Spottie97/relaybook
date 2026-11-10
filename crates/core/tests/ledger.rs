@@ -252,7 +252,7 @@ fn dependencies_gate_claims_and_reject_cycles() {
         feature_state.depends_on,
         vec!["base".to_string(), "other".to_string()]
     );
-    let ready = ledger.list_tasks(None, true).expect("ready");
+    let ready = ledger.list_tasks(None, true, false).expect("ready");
     assert!(ready.iter().all(|task| task.slug != "feature"));
 
     assert_eq!(

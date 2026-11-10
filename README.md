@@ -127,7 +127,7 @@ when the ledger is missing.
 relaybook init
 relaybook context [slug]
 relaybook task create <slug> --title "..." [--depends-on <slug>]
-relaybook task list [--status open|claimed|done|blocked] [--ready]
+relaybook task list [--status open|claimed|done|blocked] [--ready] [--all]
 relaybook task depend <slug> --on <slug>
 relaybook task undepend <slug> --on <slug>
 relaybook task claim <slug> --by <agent>

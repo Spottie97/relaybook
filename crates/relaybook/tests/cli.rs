@@ -505,6 +505,46 @@ fn edit_step_accepts_a_leading_dash() {
 }
 
 #[test]
+fn task_list_hides_done_tasks_until_asked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["task", "create", "old", "--title", "Old"])
+        .assert()
+        .success();
+    run(dir.path(), ["task", "done", "old"]).assert().success();
+    run(dir.path(), ["task", "create", "now", "--title", "Now"])
+        .assert()
+        .success();
+
+    run(dir.path(), ["task", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("now"))
+        .stdout(predicate::str::contains("old").not())
+        .stdout(predicate::str::contains(
+            "1 done tasks hidden (relaybook task list --all)",
+        ));
+    run(dir.path(), ["task", "list", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("old"));
+    run(dir.path(), ["task", "list", "--status", "done"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("old"))
+        .stdout(predicate::str::contains("hidden").not());
+    run(dir.path(), ["task", "list", "--ready"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("now"))
+        .stdout(predicate::str::contains("hidden").not());
+
+    let data = json_data(dir.path(), ["task", "list", "--json"]);
+    assert_eq!(data["hidden_done"], 1);
+    assert_eq!(data["tasks"].as_array().expect("tasks").len(), 1);
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");

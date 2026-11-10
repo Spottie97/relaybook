@@ -63,6 +63,7 @@ measure() {
     limit=0
     case $label in
       context) limit=4000 ;;
+      task-list) limit=1500 ;;
       write-*) limit=120 ;;
     esac
     if [ "$limit" -gt 0 ] && [ "$bytes" -gt "$limit" ]; then

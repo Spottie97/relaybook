@@ -70,7 +70,7 @@ mod tests {
         assert!(!dir.path().join(".agentmesh").exists());
         assert_eq!(moved.to, dir.path().join(".relaybook").join("ledger.db"));
         let ledger = Ledger::open(&moved.to).expect("open");
-        let tasks = ledger.list_tasks(None, false).expect("list");
+        let tasks = ledger.list_tasks(None, false, true).expect("list");
         assert_eq!(tasks[0].slug, "auth");
         assert!(migrate_legacy_ledger(dir.path()).expect("again").is_none());
     }

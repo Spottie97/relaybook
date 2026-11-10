@@ -129,6 +129,9 @@ enum TaskCmd {
         /// Open tasks whose dependencies are all done.
         #[arg(long)]
         ready: bool,
+        /// Include done tasks.
+        #[arg(long)]
+        all: bool,
     },
     /// Record that a task waits for another task.
     Depend {
@@ -304,8 +307,8 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             title,
             depends_on,
         }) => create_task(&cwd, &slug, &title, &depends_on),
-        Command::Task(TaskCmd::List { status, ready }) => {
-            list_tasks(&cwd, status.map(StatusOpt::status), ready)
+        Command::Task(TaskCmd::List { status, ready, all }) => {
+            list_tasks(&cwd, status.map(StatusOpt::status), ready, all)
         }
         Command::Task(TaskCmd::Depend { slug, on }) => depend(&cwd, &slug, &on),
         Command::Task(TaskCmd::Undepend { slug, on }) => undepend(&cwd, &slug, &on),
@@ -389,11 +392,28 @@ fn undepend(cwd: &Path, slug: &str, on: &str) -> Result<Outcome, Fail> {
     json_outcome(task_ack(&task), human)
 }
 
-fn list_tasks(cwd: &Path, status: Option<Status>, ready: bool) -> Result<Outcome, Fail> {
+fn list_tasks(cwd: &Path, status: Option<Status>, ready: bool, all: bool) -> Result<Outcome, Fail> {
     let ledger = open_ledger(cwd)?;
-    let tasks = ledger.list_tasks(status, ready)?;
-    let human = render::tasks(&tasks);
-    json_outcome(tasks, human)
+    let include_done = all || status.is_some() || ready;
+    let tasks = ledger.list_tasks(status, ready, include_done)?;
+    let hidden_done = if include_done {
+        0
+    } else {
+        ledger.list_tasks(Some(Status::Done), false, true)?.len()
+    };
+    let mut human = render::tasks(&tasks);
+    if hidden_done > 0 {
+        human.push_str(&render::line(&format!(
+            "{hidden_done} done tasks hidden (relaybook task list --all)"
+        )));
+    }
+    json_outcome(
+        serde_json::json!({
+            "tasks": tasks,
+            "hidden_done": hidden_done,
+        }),
+        human,
+    )
 }
 
 fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
