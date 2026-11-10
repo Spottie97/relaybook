@@ -270,6 +270,19 @@ fn hands_off_run_opens_a_pr_and_leaves_main_untouched() {
 }
 
 #[test]
+fn positional_prd_starts_a_run() {
+    let dir = repo();
+    let output = run(dir.path(), "happy", &["run", "prd.md"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("opened https://example.test/pr/1"), "{text}");
+}
+
+#[test]
 fn plan_gate_waits_and_approve_finishes() {
     let dir = repo();
     relaybook(dir.path())

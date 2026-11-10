@@ -7,6 +7,7 @@ use relaybook_core::{Error, Ledger, RECENT_EVENT_LIMIT, Status};
 use crate::gitinfo;
 use crate::install;
 use crate::paths;
+use crate::picker::{self, Pick};
 use crate::render;
 use crate::runloop;
 use crate::setup;
@@ -102,6 +103,11 @@ enum Command {
         /// `manual` or `auto`. Omit to print the current mode.
         value: Option<String>,
     },
+    /// Print or set the auto-run checkpoints.
+    Gates {
+        /// `none`, `plan`, or `plan,review`. Omit to print the current value.
+        value: Option<String>,
+    },
     /// List or change auto-run settings.
     Config {
         #[command(subcommand)]
@@ -111,9 +117,11 @@ enum Command {
     Status,
     /// Run the auto-mode loop, or stop and complete it.
     Run {
-        /// PRD file to implement. Relative to the repository.
+        /// PRD file to implement. Same as the positional path.
         #[arg(long)]
         prd: Option<std::path::PathBuf>,
+        /// PRD file to implement.
+        prd_path: Option<std::path::PathBuf>,
         /// Resume a stopped, paused, or waiting run.
         #[arg(long)]
         resume: bool,
@@ -473,7 +481,11 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Inbox => show_inbox(&cwd),
         Command::Mode { value } => match value {
             Some(value) => set_mode(&cwd, &value),
-            None => show_mode(&cwd),
+            None => choose_setting(&cwd, "mode", picker::MODES, set_mode, show_mode),
+        },
+        Command::Gates { value } => match value {
+            Some(value) => set_gates(&cwd, &value),
+            None => choose_setting(&cwd, "gates", picker::GATES, set_gates, show_gates),
         },
         Command::Config { action } => match action {
             Some(ConfigAction::Set { key, value }) => set_config(&cwd, &key, &value),
@@ -482,6 +494,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Status => show_status(&cwd),
         Command::Run {
             prd,
+            prd_path,
             resume,
             max_cycles,
             max_agent_calls,
@@ -490,7 +503,17 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             est_cost_cap_usd,
             gates,
             action,
-        } => run_auto(
+        } => {
+            let prd = match (prd, prd_path) {
+                (Some(_), Some(_)) => {
+                    return Err(Fail::Usage(
+                        "pass either a PRD path or --prd".to_string(),
+                    ));
+                }
+                (Some(path), None) | (None, Some(path)) => Some(path),
+                (None, None) => None,
+            };
+            run_auto(
             &cwd,
             runloop::Launch {
                 prd,
@@ -505,7 +528,8 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                 est_cost_cap_usd,
                 gates,
             },
-        ),
+        )
+        }
         Command::Approve => run_auto(
             &cwd,
             runloop::Launch {
@@ -756,6 +780,44 @@ fn run_auto(cwd: &Path, launch: runloop::Launch) -> Result<Outcome, Fail> {
             Some(trimmed)
         },
     })
+}
+
+fn choose_setting(
+    cwd: &Path,
+    label: &str,
+    options: &[&str],
+    set: fn(&Path, &str) -> Result<Outcome, Fail>,
+    show: fn(&Path) -> Result<Outcome, Fail>,
+) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let settings = ledger.settings()?;
+    let current = match label {
+        "mode" => settings.mode,
+        _ => settings.gates,
+    };
+    match picker::pick(label, options, &current).map_err(Fail::Usage)? {
+        Pick::UseExisting => show(cwd),
+        Pick::Cancelled => json_outcome(serde_json::json!({ "unchanged": current }), String::new()),
+        Pick::Selected(value) => set(cwd, &value),
+    }
+}
+
+fn show_gates(cwd: &Path) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let settings = ledger.settings()?;
+    json_outcome(
+        serde_json::json!({ "gates": settings.gates }),
+        render::line(&settings.gates),
+    )
+}
+
+fn set_gates(cwd: &Path, value: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let settings = ledger.set_setting("gates", value)?;
+    json_outcome(
+        serde_json::json!({ "gates": settings.gates }),
+        render::line(&format!("gates {}", settings.gates)),
+    )
 }
 
 fn show_mode(cwd: &Path) -> Result<Outcome, Fail> {

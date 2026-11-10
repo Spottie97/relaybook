@@ -10,6 +10,7 @@ mod graphify;
 mod hooks;
 mod install;
 mod paths;
+mod picker;
 mod render;
 mod runloop;
 mod setup;

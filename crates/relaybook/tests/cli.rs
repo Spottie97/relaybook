@@ -816,6 +816,26 @@ fn mode_and_config_use_agent_call_limits() {
         .assert()
         .success()
         .stdout("manual\n");
+    run(dir.path(), ["gates"])
+        .assert()
+        .success()
+        .stdout("plan\n");
+    run(dir.path(), ["gates", "sometimes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid gates: sometimes"));
+    run(dir.path(), ["gates", "plan,review"])
+        .assert()
+        .success()
+        .stdout("gates plan,review\n");
+    run(dir.path(), ["gates"])
+        .assert()
+        .success()
+        .stdout("plan,review\n");
+    run(dir.path(), ["run", "a.md", "--prd", "b.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("pass either a PRD path or --prd"));
     run(dir.path(), ["config"])
         .assert()
         .success()
