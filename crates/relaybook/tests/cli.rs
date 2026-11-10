@@ -371,8 +371,8 @@ fn install_is_idempotent_and_keeps_existing_text() {
     let first = fs::read(&path).expect("read");
     let text = String::from_utf8(first.clone()).expect("utf8");
     assert!(text.starts_with("hello\n"), "{text}");
-    assert_eq!(text.matches("<!-- agentmesh:start -->").count(), 1);
-    assert!(text.contains("## AgentMesh coordination (planner)"));
+    assert_eq!(text.matches("<!-- relaybook:start -->").count(), 1);
+    assert!(text.contains("## Relaybook coordination (planner)"));
 
     run(dir.path(), ["install", "--claude"])
         .assert()
@@ -385,12 +385,12 @@ fn install_is_idempotent_and_keeps_existing_text() {
 fn install_leaves_an_existing_heading_unchanged() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");
-    let original = "notes\n## AgentMesh coordination (planner)\ncustom\n";
+    let original = "notes\n## Relaybook coordination (planner)\ncustom\n";
     fs::write(&path, original).expect("write");
 
     run(dir.path(), ["install", "--claude"]).assert().success();
     assert_eq!(fs::read_to_string(&path).expect("read"), original);
-    assert!(!original.contains("<!-- agentmesh:start -->"));
+    assert!(!original.contains("<!-- relaybook:start -->"));
 }
 
 fn run(dir: &Path, args: impl IntoIterator<Item = &'static str>) -> Command {
@@ -400,7 +400,7 @@ fn run(dir: &Path, args: impl IntoIterator<Item = &'static str>) -> Command {
 }
 
 fn command(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("agentmesh").expect("agentmesh binary");
+    let mut cmd = Command::cargo_bin("relaybook").expect("relaybook binary");
     cmd.current_dir(dir);
     cmd.env_remove("GIT_DIR");
     cmd.env_remove("GIT_WORK_TREE");

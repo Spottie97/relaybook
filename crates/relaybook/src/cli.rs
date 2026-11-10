@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use agentmesh_core::{Error, Ledger, RECENT_EVENT_LIMIT, Status};
 use clap::{Parser, Subcommand, ValueEnum};
+use relaybook_core::{Error, Ledger, RECENT_EVENT_LIMIT, Status};
 
 use crate::gitinfo;
 use crate::install;
@@ -16,6 +16,14 @@ pub(crate) fn execute() -> ExitCode {
         Err(err) => err.exit(),
     };
     let json = cli.json;
+    if let Err(err) = announce_legacy_move() {
+        if json {
+            print!("{}", envelope(false, None, Some(&err.to_string())));
+        } else {
+            eprintln!("{err}");
+        }
+        return ExitCode::from(err.code());
+    }
     match dispatch(cli) {
         Ok(outcome) => {
             if json {
@@ -45,7 +53,7 @@ pub(crate) fn execute() -> ExitCode {
 
 #[derive(Parser)]
 #[command(
-    name = "agentmesh",
+    name = "relaybook",
     version,
     about = "Shared coordination ledger for coding agents",
     arg_required_else_help = true
@@ -225,7 +233,7 @@ impl std::fmt::Display for Fail {
         match self {
             Self::Core(err) => write!(formatter, "{err}"),
             Self::Io(err) => write!(formatter, "io: {err}"),
-            Self::NoLedger => formatter.write_str("no ledger found (run `agentmesh init`)"),
+            Self::NoLedger => formatter.write_str("no ledger found (run `relaybook init`)"),
             Self::Usage(message) => formatter.write_str(message),
         }
     }
@@ -250,6 +258,18 @@ impl From<setup::Error> for Fail {
             setup::Error::Io(err) => Self::Io(err),
         }
     }
+}
+
+fn announce_legacy_move() -> Result<(), Fail> {
+    let cwd = std::env::current_dir()?;
+    if let Some(moved) = paths::migrate_legacy(&cwd)? {
+        eprintln!(
+            "moved ledger from {} to {}",
+            moved.from.display(),
+            moved.to.display()
+        );
+    }
+    Ok(())
 }
 
 fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
@@ -296,7 +316,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
 }
 
 fn init_ledger(cwd: &Path) -> Result<Outcome, Fail> {
-    let path = paths::init_root(cwd).join(".agentmesh").join("ledger.db");
+    let path = paths::init_root(cwd).join(".relaybook").join("ledger.db");
     let created = !path.exists();
     let ledger = Ledger::initialize(&path)?;
     drop(ledger);

@@ -1,15 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const START: &str = "# agentmesh:hooks:start";
-const END: &str = "# agentmesh:hooks:end";
+use relaybook_core::legacy;
+
+const START: &str = "# relaybook:hooks:start";
+const END: &str = "# relaybook:hooks:end";
 const BLOCK: &str = "\
-# agentmesh:hooks:start
+# relaybook:hooks:start
 # Refresh the Graphify graph after a merge or rebase without blocking the pull.
 if command -v graphify >/dev/null 2>&1; then
   (graphify update . >/dev/null 2>&1 &)
 fi
-# agentmesh:hooks:end
+# relaybook:hooks:end
 ";
 
 pub(crate) enum Status {
@@ -59,7 +61,7 @@ fn describe(result: &HookResult) -> String {
 fn external_hooks(root: &Path) -> Option<String> {
     if let Some(path) = git_config(root, "core.hooksPath") {
         return Some(format!(
-            "core.hooksPath is {path}. Add post-merge and post-rewrite hooks there that run `graphify update .` in the background. AgentMesh did not write .git/hooks."
+            "core.hooksPath is {path}. Add post-merge and post-rewrite hooks there that run `graphify update .` in the background. Relaybook did not write .git/hooks."
         ));
     }
     if root.join(".husky").is_dir() {
@@ -88,12 +90,38 @@ fn place_hook(dir: &Path, name: &str) -> Result<HookResult, std::io::Error> {
     if existing.contains(START) && existing.contains(END) {
         return Ok(HookResult::Unchanged);
     }
+    if existing.contains(legacy::HOOK_START) && existing.contains(legacy::HOOK_END) {
+        std::fs::write(
+            &path,
+            replace_span(&existing, legacy::HOOK_START, legacy::HOOK_END, BLOCK),
+        )?;
+        make_executable(&path)?;
+        return Ok(HookResult::Installed);
+    }
     if let Some(interpreter) = foreign_interpreter(&existing) {
         return Ok(HookResult::Foreign { interpreter });
     }
     std::fs::write(&path, insert_block(&existing))?;
     make_executable(&path)?;
     Ok(HookResult::Installed)
+}
+
+fn replace_span(existing: &str, start: &str, end: &str, replacement: &str) -> String {
+    let start_at = existing.find(start).unwrap_or(0);
+    let end_at = existing[start_at..]
+        .find(end)
+        .map(|index| start_at + index + end.len())
+        .unwrap_or(existing.len());
+    let end_at = if existing[end_at..].starts_with('\n') {
+        end_at + 1
+    } else {
+        end_at
+    };
+    let mut block = replacement.to_string();
+    if !block.ends_with('\n') {
+        block.push('\n');
+    }
+    format!("{}{block}{}", &existing[..start_at], &existing[end_at..])
 }
 
 fn foreign_interpreter(script: &str) -> Option<String> {

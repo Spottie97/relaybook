@@ -1,5 +1,5 @@
 [package]
-name = "agentmesh"
+name = "relaybook"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,11 +7,11 @@ description = "Shared coordination ledger for coding agents"
 publish = false
 
 [[bin]]
-name = "agentmesh"
+name = "relaybook"
 path = "src/main.rs"
 
 [dependencies]
-agentmesh-core = { path = "../core" }
+relaybook-core = { path = "../core" }
 clap = { version = "4.6.7", features = ["derive"] }
 serde = "1.0.229"
 serde_json = "1.0.154"

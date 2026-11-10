@@ -15,8 +15,8 @@ fn fresh_setup_is_safe_to_rerun() {
     setup(dir.path(), &bin, &log, &["setup"]).assert().success();
 
     let claude = fs::read_to_string(dir.path().join("CLAUDE.md")).expect("claude");
-    assert_eq!(claude.matches("<!-- agentmesh:start -->").count(), 1);
-    assert!(dir.path().join(".agentmesh").join("ledger.db").is_file());
+    assert_eq!(claude.matches("<!-- relaybook:start -->").count(), 1);
+    assert!(dir.path().join(".relaybook").join("ledger.db").is_file());
     assert!(dir.path().join("AGENTS.md").is_file());
 
     setup(dir.path(), &bin, &log, &["setup"])
@@ -31,14 +31,14 @@ fn fresh_setup_is_safe_to_rerun() {
 #[test]
 fn missing_graphify_skips_without_failing() {
     let dir = tempfile::tempdir().expect("tempdir");
-    agentmesh(dir.path())
+    relaybook(dir.path())
         .args(["setup"])
         .env("PATH", "/usr/bin:/bin")
         .assert()
         .success()
         .stdout(predicates::str::contains("uv tool install graphifyy"));
     assert!(dir.path().join("CLAUDE.md").is_file());
-    assert!(dir.path().join(".agentmesh").join("ledger.db").is_file());
+    assert!(dir.path().join(".relaybook").join("ledger.db").is_file());
 }
 
 #[test]
@@ -54,7 +54,7 @@ fn no_graphify_does_not_invoke_graphify() {
 }
 
 #[test]
-fn failing_graphify_still_finishes_agentmesh_steps() {
+fn failing_graphify_still_finishes_relaybook_steps() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bin = fake_graphify(dir.path(), true);
     let log = dir.path().join("graphify.log");
@@ -64,7 +64,7 @@ fn failing_graphify_still_finishes_agentmesh_steps() {
         .code(1)
         .stdout(predicates::str::contains("failed"));
     assert!(dir.path().join("CLAUDE.md").is_file());
-    assert!(dir.path().join(".agentmesh").join("ledger.db").is_file());
+    assert!(dir.path().join(".relaybook").join("ledger.db").is_file());
 
     let output = setup(dir.path(), &bin, &log, &["setup", "--json"])
         .output()
@@ -100,7 +100,7 @@ fn merge_and_rebase_refresh_the_graph_and_keep_existing_hooks() {
     setup(root, &bin, &log, &["setup"]).assert().success();
     let merged =
         fs::read_to_string(root.join(".git").join("hooks").join("post-merge")).expect("hook");
-    assert_eq!(merged.matches("# agentmesh:hooks:start").count(), 1);
+    assert_eq!(merged.matches("# relaybook:hooks:start").count(), 1);
     assert!(merged.contains("echo merge >>"));
 
     let before = count_log(&log, "update .");
@@ -304,6 +304,30 @@ fn ci_workflow_is_written_once_and_never_overwrites() {
 }
 
 #[test]
+fn legacy_hook_markers_are_replaced_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let hook = dir.path().join(".git").join("hooks").join("post-merge");
+    write_hook(
+        &hook,
+        "#!/bin/sh\n# agentmesh:hooks:start\necho old\n# agentmesh:hooks:end\necho kept\n",
+    );
+    let bin = fake_graphify(dir.path(), false);
+    let log = dir.path().join("graphify.log");
+    setup(dir.path(), &bin, &log, &["setup"]).assert().success();
+    let text = fs::read_to_string(&hook).expect("hook");
+    assert_eq!(text.matches("# relaybook:hooks:start").count(), 1);
+    assert!(!text.contains("agentmesh"));
+    assert!(text.contains("echo kept"));
+    let again = text.clone();
+    setup(dir.path(), &bin, &log, &["setup"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("post-merge: already installed"));
+    assert_eq!(fs::read_to_string(&hook).expect("hook"), again);
+}
+
+#[test]
 fn shell_hook_with_exit_still_refreshes_the_graph() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
@@ -318,7 +342,7 @@ fn shell_hook_with_exit_still_refreshes_the_graph() {
     setup(root, &bin, &log, &["setup"]).assert().success();
     let hook =
         fs::read_to_string(root.join(".git").join("hooks").join("post-merge")).expect("hook");
-    let block = hook.find("# agentmesh:hooks:start").expect("block");
+    let block = hook.find("# relaybook:hooks:start").expect("block");
     let exit_at = hook.find("exit 0").expect("exit");
     assert!(block < exit_at, "{hook}");
     commit(root, "base.txt", "base");
@@ -378,21 +402,21 @@ fn python_hook_is_left_unchanged() {
 }
 
 fn setup(dir: &Path, bin: &Path, log: &Path, args: &[&str]) -> Command {
-    let mut cmd = agentmesh(dir);
+    let mut cmd = relaybook(dir);
     cmd.args(args);
     with_graphify(&mut cmd, bin, log);
     cmd
 }
 
 fn setup_plain(dir: &Path, args: &[&str]) -> Command {
-    let mut cmd = agentmesh(dir);
+    let mut cmd = relaybook(dir);
     cmd.args(args);
     cmd.env("PATH", "/usr/bin:/bin");
     cmd
 }
 
-fn agentmesh(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("agentmesh").expect("agentmesh binary");
+fn relaybook(dir: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("relaybook").expect("relaybook binary");
     cmd.current_dir(dir);
     cmd.env_remove("GIT_DIR");
     cmd.env_remove("GIT_WORK_TREE");
@@ -427,8 +451,8 @@ fn git_init(dir: &Path) {
 }
 
 fn configure(dir: &Path) {
-    git(dir, &["config", "user.name", "AgentMesh"]);
-    git(dir, &["config", "user.email", "agentmesh@example.com"]);
+    git(dir, &["config", "user.name", "Relaybook"]);
+    git(dir, &["config", "user.email", "relaybook@example.com"]);
     git(dir, &["config", "commit.gpgsign", "false"]);
 }
 

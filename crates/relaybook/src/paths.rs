@@ -1,11 +1,25 @@
 use std::path::{Path, PathBuf};
 
+use relaybook_core::{Error, migrate_legacy_ledger};
+
 use crate::gitinfo;
+
+pub(crate) fn migrate_legacy(start: &Path) -> Result<Option<relaybook_core::LegacyMove>, Error> {
+    let mut current = start.to_path_buf();
+    loop {
+        if let Some(moved) = migrate_legacy_ledger(&current)? {
+            return Ok(Some(moved));
+        }
+        if !current.pop() {
+            return Ok(None);
+        }
+    }
+}
 
 pub(crate) fn ledger_path(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
     loop {
-        let candidate = current.join(".agentmesh").join("ledger.db");
+        let candidate = current.join(".relaybook").join("ledger.db");
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -36,9 +50,9 @@ mod tests {
     fn ledger_in_a_parent_sets_the_install_root() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
-        let nested = root.join("crates").join("agentmesh");
+        let nested = root.join("crates").join("relaybook");
         std::fs::create_dir_all(&nested).expect("mkdir");
-        let database = root.join(".agentmesh").join("ledger.db");
+        let database = root.join(".relaybook").join("ledger.db");
         std::fs::create_dir_all(database.parent().expect("parent")).expect("mkdir");
         std::fs::write(&database, b"db").expect("write");
 

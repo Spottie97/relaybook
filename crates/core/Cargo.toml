@@ -1,9 +1,9 @@
 [package]
-name = "agentmesh-core"
+name = "relaybook-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Domain and storage for the AgentMesh ledger"
+description = "Domain and storage for the Relaybook ledger"
 publish = false
 
 [dependencies]

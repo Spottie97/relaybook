@@ -17,8 +17,8 @@ target
 rustc-ice-*.txt
 
 # SQLite WAL sidecars. The ledger file itself can be committed.
-.agentmesh/*.db-wal
-.agentmesh/*.db-shm
+.relaybook/*.db-wal
+.relaybook/*.db-shm
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

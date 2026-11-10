@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-use agentmesh_core::{Error as CoreError, Ledger};
+use relaybook_core::{Error as CoreError, Ledger};
 use serde::Serialize;
 
 use crate::graphify::{self, INSTALL_HINT};
@@ -68,13 +68,13 @@ pub(crate) fn render(report: &Report) -> String {
 }
 
 fn record_ledger(root: &Path, steps: &mut Vec<Step>) -> Result<(), Error> {
-    let path = root.join(".agentmesh").join("ledger.db");
+    let path = root.join(".relaybook").join("ledger.db");
     let existed = path.exists();
     Ledger::initialize(&path)?;
     if existed {
         push(steps, "init", "skipped", "ledger already exists");
     } else {
-        push(steps, "init", "done", "created .agentmesh/ledger.db");
+        push(steps, "init", "done", "created .relaybook/ledger.db");
     }
     Ok(())
 }

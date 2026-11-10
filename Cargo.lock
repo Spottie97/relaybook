@@ -3,29 +3,6 @@
 version = 4
 
 [[package]]
-name = "agentmesh"
-version = "0.1.0"
-dependencies = [
- "agentmesh-core",
- "assert_cmd",
- "clap",
- "predicates",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "agentmesh-core"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -430,6 +407,29 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "relaybook"
+version = "0.1.0"
+dependencies = [
+ "assert_cmd",
+ "clap",
+ "predicates",
+ "relaybook-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "relaybook-core"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "rsqlite-vfs"

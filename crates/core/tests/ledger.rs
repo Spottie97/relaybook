@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use agentmesh_core::{EventKind, Ledger, Status, replay};
+use relaybook_core::{EventKind, Ledger, Status, replay};
 
 #[test]
 fn replay_matches_projection_and_progress_is_once_per_commit() {
@@ -330,7 +330,7 @@ fn spawn_claim(
     path: PathBuf,
     by: &'static str,
     barrier: Arc<Barrier>,
-) -> thread::JoinHandle<Result<agentmesh_core::Task, agentmesh_core::Error>> {
+) -> thread::JoinHandle<Result<relaybook_core::Task, relaybook_core::Error>> {
     thread::spawn(move || {
         barrier.wait();
         let mut ledger = Ledger::open(&path).expect("open");

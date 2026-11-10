@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use agentmesh_core::{Context, Task};
+use relaybook_core::{Context, Task};
 
 pub(crate) fn tasks(tasks: &[Task]) -> String {
     if tasks.is_empty() {
@@ -77,7 +77,7 @@ fn needs_suffix(task: &Task) -> String {
 #[cfg(test)]
 mod tests {
     use super::{context, line, tasks};
-    use agentmesh_core::{Context, Decision, Event, EventKind, Status, Step, Task, TaskDetail};
+    use relaybook_core::{Context, Decision, Event, EventKind, Status, Step, Task, TaskDetail};
 
     fn task(status: Status, claimed_by: Option<&str>) -> Task {
         Task {

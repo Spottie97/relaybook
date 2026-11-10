@@ -1,29 +1,29 @@
-# AgentMesh
+# Relaybook
 
-**AgentMesh is a shared coordination layer for coding agents.** A single Rust binary
+**Relaybook is a shared coordination layer for coding agents.** A single Rust binary
 that keeps tasks, progress, and decisions in one SQLite ledger, so agents working in
 the same repo stop stepping on each other.
 
-Graphify maps the code — the "what is this and where" (the map). AgentMesh tracks the
-work — the "who is doing what and why" (the bus). Use Graphify for structure, AgentMesh
+Graphify maps the code — the "what is this and where" (the map). Relaybook tracks the
+work — the "who is doing what and why" (the bus). Use Graphify for structure, Relaybook
 for state.
 
 ## Quick start
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Spottie97/AgentMesh/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh
 ```
 
 Then, in the project:
 
 ```sh
-agentmesh setup
+relaybook setup
 ```
 
 Upgrade an existing install with:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Spottie97/AgentMesh/main/install.sh | sh -s -- --upgrade
+curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --upgrade
 ```
 
 Any agent that can run a shell command can join. No protocol, no server, no lock-in.
@@ -31,15 +31,15 @@ Any agent that can run a shell command can join. No protocol, no server, no lock
 ## Daily workflow
 
 ```text
-agentmesh task list --ready
-agentmesh task claim auth --by cursor
-agentmesh progress report auth --note "..."
-agentmesh task done auth
+relaybook task list --ready
+relaybook task claim auth --by cursor
+relaybook progress report auth --note "..."
+relaybook task done auth
 ```
 
 ## Setup
 
-`agentmesh setup` creates the ledger when it is missing, appends the planner block to
+`relaybook setup` creates the ledger when it is missing, appends the planner block to
 `CLAUDE.md` and the executor block to `AGENTS.md`, then runs `graphify claude install`,
 `graphify cursor install`, `graphify hook install`, and `graphify update .` when
 `graphify` is on `PATH`. The update is AST-only and does not call an LLM. Run it again
@@ -60,11 +60,11 @@ whenever you want: existing instruction blocks and hooks are left as they are.
 ## How the graph stays current
 
 Local hooks are the default. `graphify hook install` refreshes the graph after a
-commit and a checkout. `agentmesh setup` adds post-merge and post-rewrite hooks that
+commit and a checkout. `relaybook setup` adds post-merge and post-rewrite hooks that
 run `graphify update .` in the background, so `git pull` and `git pull --rebase`
-return immediately. `agentmesh setup --no-hooks` leaves those hooks out.
+return immediately. `relaybook setup --no-hooks` leaves those hooks out.
 
-`agentmesh setup --ci` is the opt-in GitHub Actions path for teams that want the graph
+`relaybook setup --ci` is the opt-in GitHub Actions path for teams that want the graph
 committed. Pushes that only change `graphify-out/` do not start another run. Delete
 `.github/workflows/graphify-update.yml` to turn that job off.
 
@@ -80,13 +80,13 @@ run. Without that secret the workflow uses `GITHUB_TOKEN`.
 - The installer supports linux x86_64 and macos aarch64. On another machine, use
   `cargo build --release`.
 - If `~/.local/bin` is not on `PATH`, the installer still finishes, then prints the
-  `export PATH=...` line to add to `~/.zshrc` or `~/.bashrc`. `AGENTMESH_INSTALL_DIR`
+  `export PATH=...` line to add to `~/.zshrc` or `~/.bashrc`. `RELAYBOOK_INSTALL_DIR`
   chooses a different directory. A plain re-run skips an existing binary. Update it
   with `--upgrade`.
 - If Graphify is missing, install [uv](https://docs.astral.sh/uv/) and run
   `uv tool install graphifyy`. `pipx install graphifyy` is the fallback. Setup still
   finishes and skips the Graphify steps. Skip Graphify during install with
-  `curl -fsSL https://raw.githubusercontent.com/Spottie97/AgentMesh/main/install.sh | sh -s -- --no-graphify`.
+  `curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --no-graphify`.
 - If `core.hooksPath` is set, or the repo uses Husky or Lefthook, setup does not write
   `.git/hooks`. It prints where to add post-merge and post-rewrite commands that run
   `graphify update .` in the background.
@@ -97,20 +97,20 @@ run. Without that secret the workflow uses `GITHUB_TOKEN`.
 cargo build --release
 ```
 
-The binary is `target/release/agentmesh`. It is a single static executable: SQLite is
+The binary is `target/release/relaybook`. It is a single static executable: SQLite is
 compiled in via `rusqlite` with the `bundled` feature. There is no server and no daemon.
 
 ## Ledger
 
-`agentmesh init` creates `.agentmesh/ledger.db` at the git repository root (or in the
+`relaybook init` creates `.relaybook/ledger.db` at the git repository root (or in the
 current directory when you are not in a work tree). Later commands walk up from the
 working directory until they find that file.
 
 The database runs in WAL mode with a 5 second busy timeout. Tasks, steps, and decisions
 are the current projection. The `events` table is append-only (`task_created`, `claimed`,
-`progress`, `decision`, `status_changed`, `dependency_changed`, `task_renamed`); AgentMesh
+`progress`, `decision`, `status_changed`, `dependency_changed`, `task_renamed`); Relaybook
 never updates or deletes a row there.
-`agentmesh task block <slug> --reason "..."` sets `status=blocked` on an open or claimed
+`relaybook task block <slug> --reason "..."` sets `status=blocked` on an open or claimed
 task and records why. Blocking a task that is already blocked succeeds and writes no new
 event. A done task cannot be blocked.
 
@@ -124,22 +124,22 @@ stdout. Exit `0` on success, `1` on an operational failure, and `2` on a usage e
 when the ledger is missing.
 
 ```text
-agentmesh init
-agentmesh context [slug]
-agentmesh task create <slug> --title "..." [--depends-on <slug>]
-agentmesh task list [--status open|claimed|done|blocked] [--ready]
-agentmesh task depend <slug> --on <slug>
-agentmesh task undepend <slug> --on <slug>
-agentmesh task claim <slug> --by <agent>
-agentmesh task block <slug> --reason "..."
-agentmesh task rename <slug> --title "..."
-agentmesh task done <slug>
-agentmesh step add <slug> "..."
-agentmesh step check <slug> <n>
-agentmesh progress report <slug> --note "..."
-agentmesh decision log <slug> --why "..." --by <agent>
-agentmesh install --claude --cursor
-agentmesh setup [--no-graphify] [--no-hooks] [--ci]
+relaybook init
+relaybook context [slug]
+relaybook task create <slug> --title "..." [--depends-on <slug>]
+relaybook task list [--status open|claimed|done|blocked] [--ready]
+relaybook task depend <slug> --on <slug>
+relaybook task undepend <slug> --on <slug>
+relaybook task claim <slug> --by <agent>
+relaybook task block <slug> --reason "..."
+relaybook task rename <slug> --title "..."
+relaybook task done <slug>
+relaybook step add <slug> "..."
+relaybook step check <slug> <n>
+relaybook progress report <slug> --note "..."
+relaybook decision log <slug> --why "..." --by <agent>
+relaybook install --claude --cursor
+relaybook setup [--no-graphify] [--no-hooks] [--ci]
 ```
 
 Slugs match `[a-z0-9]+(-[a-z0-9]+)*` and stay permanent. `task rename` changes the title
@@ -147,7 +147,7 @@ only, and writes a `task_renamed` event. The same title again succeeds and write
 A missing slug fails with `no such task: <slug>`. Checklist positions start at 1.
 `install` appends the planner block to `CLAUDE.md` (`--claude`) and the executor block
 to `AGENTS.md` (`--cursor`). A second run does not change a file that already has the
-AgentMesh markers or the coordination heading. Text outside the block is kept.
+Relaybook markers or the coordination heading. Text outside the block is kept.
 
 ## JSON
 
@@ -182,8 +182,8 @@ another event.
 
 ## Library
 
-`agentmesh-core` owns the ledger. A future MCP adapter, or any other front end, should
-call that crate. It should not invent a second protocol or a second store. The `agentmesh`
+`relaybook-core` owns the ledger. A future MCP adapter, or any other front end, should
+call that crate. It should not invent a second protocol or a second store. The `relaybook`
 binary is only the CLI over the same API.
 
 ## License
