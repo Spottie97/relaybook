@@ -483,7 +483,15 @@ fn setup_installs_and_preserves_the_claude_command() {
             "claude command: done (wrote .claude/commands/relaybook.md)",
         ));
     let body = fs::read_to_string(&path).expect("command");
-    assert!(body.contains("relaybook:managed"), "{body}");
+    let front = claude_front_matter(&body);
+    assert_eq!(
+        front.get("description").map(String::as_str),
+        Some("Relaybook: mode, checkpoints, auto runs, inbox")
+    );
+    assert_eq!(
+        front.get("allowed-tools").map(String::as_str),
+        Some("Bash(relaybook:*)")
+    );
     assert!(body.contains("AskUserQuestion"), "{body}");
     assert!(body.contains("run_in_background"), "{body}");
 
@@ -515,6 +523,71 @@ fn setup_installs_and_preserves_the_claude_command() {
         fs::read_to_string(&path).expect("command"),
         "custom command\n"
     );
+}
+
+#[test]
+fn setup_upgrades_an_old_claude_command_marker() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir
+        .path()
+        .join(".claude")
+        .join("commands")
+        .join("relaybook.md");
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &path,
+        "<!-- relaybook:managed -->\n---\ndescription: Relaybook: mode, checkpoints, auto runs, inbox\n---\n\nold\n",
+    )
+    .expect("old");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude command: done (wrote .claude/commands/relaybook.md)",
+        ));
+    let body = fs::read_to_string(&path).expect("command");
+    assert!(body.starts_with("---\n"), "{body}");
+    assert!(
+        body.split("\n---\n")
+            .next()
+            .expect("front matter")
+            .contains("# relaybook:managed"),
+        "{body}"
+    );
+    assert_eq!(
+        claude_front_matter(&body)
+            .get("description")
+            .map(String::as_str),
+        Some("Relaybook: mode, checkpoints, auto runs, inbox")
+    );
+}
+
+fn claude_front_matter(body: &str) -> std::collections::BTreeMap<String, String> {
+    assert!(
+        body.starts_with("---\n"),
+        "front matter must start on line 1: {body}"
+    );
+    let rest = &body["---\n".len()..];
+    let end = rest.find("\n---\n").expect("closing front matter");
+    let mut fields = std::collections::BTreeMap::new();
+    for line in rest[..end].lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, raw) = line.split_once(':').expect("front matter field");
+        let raw = raw.trim();
+        let value = if let Some(quoted) = raw.strip_prefix('"') {
+            quoted.strip_suffix('"').expect("closing quote").to_string()
+        } else {
+            assert!(
+                !raw.contains(": "),
+                "unquoted value contains a colon: {line}"
+            );
+            raw.to_string()
+        };
+        fields.insert(key.trim().to_string(), value);
+    }
+    fields
 }
 
 #[test]

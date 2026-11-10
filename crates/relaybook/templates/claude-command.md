@@ -1,6 +1,6 @@
-<!-- relaybook:managed -->
 ---
-description: Relaybook: mode, checkpoints, auto runs, inbox
+# relaybook:managed
+description: "Relaybook: mode, checkpoints, auto runs, inbox"
 argument-hint: "[mode|gates|run|approve|inbox|status] [value]"
 allowed-tools: Bash(relaybook:*)
 ---
