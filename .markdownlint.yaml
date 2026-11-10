@@ -1,0 +1,6 @@
+# MD013 fights badges, long commands, and the Contributor Covenant text.
+# MD033 is the README picture element and centered badges. GitHub does not
+# theme those from Markdown alone.
+default: true
+MD013: false
+MD033: false

@@ -18,7 +18,7 @@ shellcheck install.sh
 
 Use a Conventional Commits subject:
 
-```
+```text
 feat: add task dependencies
 fix: keep setup hooks quiet for missing tools
 docs: explain auto mode
