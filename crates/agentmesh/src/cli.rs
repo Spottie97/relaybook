@@ -96,6 +96,12 @@ enum TaskCmd {
     },
     /// Mark a task done.
     Done { slug: String },
+    /// Mark an open or claimed task blocked.
+    Block {
+        slug: String,
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -200,6 +206,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Task(TaskCmd::List { status }) => list_tasks(&cwd, status.map(StatusOpt::status)),
         Command::Task(TaskCmd::Claim { slug, by }) => claim_task(&cwd, &slug, &by),
         Command::Task(TaskCmd::Done { slug }) => complete_task(&cwd, &slug),
+        Command::Task(TaskCmd::Block { slug, reason }) => block_task(&cwd, &slug, &reason),
         Command::Step(StepCmd::Add { slug, description }) => add_step(&cwd, &slug, &description),
         Command::Step(StepCmd::Check { slug, n }) => check_step(&cwd, &slug, n),
         Command::Progress(ProgressCmd::Report { slug, note }) => {
@@ -255,6 +262,13 @@ fn complete_task(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.complete_task(slug)?;
     let human = render::line(&format!("done {}", task.slug));
+    json_outcome(task, human)
+}
+
+fn block_task(cwd: &Path, slug: &str, reason: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let task = ledger.block_task(slug, reason)?;
+    let human = render::line(&format!("blocked {}: {reason}", task.slug));
     json_outcome(task, human)
 }
 

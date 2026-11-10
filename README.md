@@ -33,8 +33,9 @@ working directory until they find that file.
 The database runs in WAL mode with a 5 second busy timeout. Tasks, steps, and decisions
 are the current projection. The `events` table is append-only (`task_created`, `claimed`,
 `progress`, `decision`, `status_changed`); AgentMesh never updates or deletes a row there.
-`status=blocked` is a valid stored state and can be listed, and this CLI has no command
-that sets it.
+`agentmesh task block <slug> --reason "..."` sets `status=blocked` on an open or claimed
+task and records why. Blocking a task that is already blocked succeeds and writes no new
+event. A done task cannot be blocked.
 
 WAL sidecar files (`.db-wal`, `.db-shm`) are gitignored. The ledger file itself is safe to
 commit after a command exits; each write checkpoints so the `.db` file holds the data.
@@ -51,6 +52,7 @@ agentmesh context [slug]
 agentmesh task create <slug> --title "..."
 agentmesh task list [--status open|claimed|done|blocked]
 agentmesh task claim <slug> --by <agent>
+agentmesh task block <slug> --reason "..."
 agentmesh task done <slug>
 agentmesh step add <slug> "..."
 agentmesh step check <slug> <n>

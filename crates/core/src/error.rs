@@ -11,6 +11,7 @@ pub enum Error {
     TaskExists(String),
     NoSuchTask(String),
     AlreadyClaimed,
+    CannotBlockDone,
     NoSuchStep(i64),
     AlreadyReported(String),
     DatabaseBusy,
@@ -29,6 +30,7 @@ impl fmt::Display for Error {
             Self::TaskExists(slug) => write!(formatter, "task already exists: {slug}"),
             Self::NoSuchTask(slug) => write!(formatter, "no such task: {slug}"),
             Self::AlreadyClaimed => formatter.write_str("already claimed"),
+            Self::CannotBlockDone => formatter.write_str("cannot block a done task"),
             Self::NoSuchStep(position) => write!(formatter, "no such step: {position}"),
             Self::AlreadyReported(sha) => write!(formatter, "already reported for {sha}"),
             Self::DatabaseBusy => formatter.write_str("database busy"),
@@ -74,6 +76,10 @@ mod tests {
     #[test]
     fn messages_match_the_cli_contract() {
         assert_eq!(Error::AlreadyClaimed.to_string(), "already claimed");
+        assert_eq!(
+            Error::CannotBlockDone.to_string(),
+            "cannot block a done task"
+        );
         assert_eq!(
             Error::AlreadyReported("abc".to_string()).to_string(),
             "already reported for abc"

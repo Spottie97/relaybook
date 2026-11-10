@@ -112,6 +112,62 @@ fn two_claims_one_winner() {
     );
 }
 
+#[test]
+fn block_task_from_open_or_claimed_and_rejects_done() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+
+    assert_eq!(
+        ledger
+            .block_task("missing", "stuck")
+            .expect_err("missing")
+            .to_string(),
+        "no such task: missing"
+    );
+
+    ledger.create_task("auth", "Add auth").expect("create");
+    let blocked = ledger
+        .block_task("auth", "waiting on schema")
+        .expect("block");
+    assert_eq!(blocked.status, Status::Blocked);
+    let again = ledger.block_task("auth", "still waiting").expect("repeat");
+    assert_eq!(again.status, Status::Blocked);
+
+    let ctx = ledger.context(Some("auth"), 20).expect("context");
+    let changes: Vec<_> = ctx
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::StatusChanged)
+        .collect();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].payload["to"], "blocked");
+    assert_eq!(changes[0].payload["from"], "open");
+    assert_eq!(changes[0].payload["reason"], "waiting on schema");
+    let replayed = replay(&ctx.events).expect("replay");
+    assert_eq!(replayed[0].status, Status::Blocked);
+
+    ledger
+        .create_task("ledger", "Open the ledger")
+        .expect("create");
+    ledger.claim_task("ledger", "cursor").expect("claim");
+    let claimed = ledger
+        .block_task("ledger", "needs a decision")
+        .expect("block claimed");
+    assert_eq!(claimed.status, Status::Blocked);
+    assert_eq!(claimed.claimed_by.as_deref(), Some("cursor"));
+
+    ledger.create_task("ship", "Ship it").expect("create");
+    ledger.complete_task("ship").expect("done");
+    assert_eq!(
+        ledger
+            .block_task("ship", "too late")
+            .expect_err("done")
+            .to_string(),
+        "cannot block a done task"
+    );
+}
+
 fn spawn_claim(
     path: PathBuf,
     by: &'static str,

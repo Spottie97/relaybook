@@ -159,6 +159,73 @@ fn context_json_includes_task_step_decision_and_events() {
 }
 
 #[test]
+fn block_sets_status_and_rejects_a_done_task() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+
+    let data = json_data(
+        dir.path(),
+        [
+            "task",
+            "block",
+            "auth",
+            "--reason",
+            "waiting on schema",
+            "--json",
+        ],
+    );
+    assert_eq!(data["status"], "blocked");
+    assert_eq!(data["slug"], "auth");
+
+    run(dir.path(), ["task", "list", "--status", "blocked"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("auth"));
+
+    run(
+        dir.path(),
+        ["task", "block", "auth", "--reason", "still waiting"],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("blocked auth"));
+
+    let after = json_data(dir.path(), ["context", "auth", "--json"]);
+    let changes = after["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|event| event["kind"] == "status_changed")
+        .count();
+    assert_eq!(changes, 1);
+
+    run(dir.path(), ["task", "create", "ship", "--title", "Ship it"])
+        .assert()
+        .success();
+    run(dir.path(), ["task", "done", "ship"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "block", "ship", "--reason", "too late"],
+    )
+    .assert()
+    .failure()
+    .code(1)
+    .stderr(predicate::str::contains("cannot block a done task"));
+
+    run(dir.path(), ["task", "block", "missing", "--reason", "gone"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("no such task: missing"));
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");

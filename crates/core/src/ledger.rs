@@ -121,6 +121,36 @@ impl Ledger {
         })
     }
 
+    pub fn block_task(&mut self, slug: &str, reason: &str) -> Result<Task, Error> {
+        let slug = checked_slug(slug)?;
+        let reason = required_text("reason", reason)?;
+        self.transaction(|conn| {
+            let task = load_task(conn, &slug)?;
+            match task.status {
+                Status::Blocked => return Ok(task),
+                Status::Done => return Err(Error::CannotBlockDone),
+                Status::Open | Status::Claimed => {}
+            }
+            let from = task.status.as_str();
+            let ts = now(conn)?;
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', updated_at = ?1 WHERE id = ?2",
+                params![ts, task.id],
+            )?;
+            insert_event(
+                conn,
+                EventKind::StatusChanged,
+                serde_json::json!({
+                    "slug": slug,
+                    "from": from,
+                    "to": "blocked",
+                    "reason": reason,
+                }),
+            )?;
+            load_task(conn, &slug)
+        })
+    }
+
     pub fn add_step(&mut self, slug: &str, description: &str) -> Result<Step, Error> {
         let slug = checked_slug(slug)?;
         let description = required_text("description", description)?;
