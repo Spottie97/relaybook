@@ -1,0 +1,15 @@
+[package]
+name = "agentmesh-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Domain and storage for the AgentMesh ledger"
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"

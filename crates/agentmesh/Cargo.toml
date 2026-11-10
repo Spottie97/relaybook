@@ -1,0 +1,23 @@
+[package]
+name = "agentmesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared coordination ledger for coding agents"
+publish = false
+
+[[bin]]
+name = "agentmesh"
+path = "src/main.rs"
+
+[dependencies]
+agentmesh-core = { path = "../core" }
+clap = { version = "4.6.7", features = ["derive"] }
+serde = "1.0.229"
+serde_json = "1.0.154"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+serde_json = "1.0.154"
+tempfile = "3.27.0"
