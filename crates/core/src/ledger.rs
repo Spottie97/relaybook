@@ -237,6 +237,86 @@ impl Ledger {
         reports::count_unreviewed(&self.conn)
     }
 
+    pub fn settings(&self) -> Result<crate::settings::Snapshot, Error> {
+        crate::settings::load(&self.conn)
+    }
+
+    pub fn set_setting(
+        &mut self,
+        key: &str,
+        value: &str,
+    ) -> Result<crate::settings::Snapshot, Error> {
+        self.transaction(|conn| crate::settings::set(conn, key, value))
+    }
+
+    pub fn status_view(&self) -> Result<crate::settings::StatusView, Error> {
+        crate::settings::status(&self.conn)
+    }
+
+    pub fn hook_wait_line(&self) -> Result<Option<String>, Error> {
+        crate::settings::hook_wait_line(&self.conn)
+    }
+
+    pub fn assign_run(&mut self, slug: &str, run_id: i64) -> Result<(), Error> {
+        let slug = checked_slug(slug)?;
+        self.transaction(|conn| {
+            let _ = load_task(conn, &slug)?;
+            crate::runs::assign_task(conn, &slug, run_id)
+        })
+    }
+
+    pub fn active_run(&self) -> Result<Option<crate::runs::Run>, Error> {
+        crate::runs::active(&self.conn)
+    }
+
+    pub fn resumable_run(&self) -> Result<Option<crate::runs::Run>, Error> {
+        crate::runs::resumable(&self.conn)
+    }
+
+    pub fn start_run(
+        &mut self,
+        prd_path: &str,
+        prd_sha256: &str,
+        branch: &str,
+    ) -> Result<crate::runs::Run, Error> {
+        self.transaction(|conn| {
+            let ts = now(conn)?;
+            crate::runs::insert(conn, prd_path, prd_sha256, branch, &ts)
+        })
+    }
+
+    pub fn save_run(&mut self, run: &crate::runs::Run) -> Result<(), Error> {
+        self.transaction(|conn| crate::runs::save(conn, run))
+    }
+
+    pub fn run_tasks(&self, run_id: i64) -> Result<Vec<Task>, Error> {
+        let slugs = crate::runs::task_slugs(&self.conn, run_id)?;
+        let mut tasks = Vec::new();
+        for slug in slugs {
+            tasks.push(load_task(&self.conn, &slug)?);
+        }
+        fill_dependencies(&self.conn, &mut tasks)?;
+        Ok(tasks)
+    }
+
+    pub fn reopen_count(&self, slug: &str) -> Result<i64, Error> {
+        crate::runs::reopen_count(&self.conn, slug)
+    }
+
+    pub fn latest_report_meta(&self, slug: &str) -> Result<Option<(i64, Option<String>)>, Error> {
+        crate::runs::latest_report(&self.conn, slug)
+    }
+
+    pub fn request_run_complete(&mut self) -> Result<(), Error> {
+        self.transaction(|conn| {
+            let Some(mut run) = crate::runs::active(conn)? else {
+                return Err(Error::InvalidSetting("no active run".to_string()));
+            };
+            run.complete_requested = true;
+            crate::runs::save(conn, &run)
+        })
+    }
+
     pub fn accept_report(&mut self, slug: &str) -> Result<usize, Error> {
         let slug = checked_slug(slug)?;
         self.transaction(|conn| {
@@ -1034,7 +1114,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
         let deps: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_deps'",
@@ -1050,7 +1130,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 3);
+        assert_eq!(version, 5);
         let stored_again: String = conn
             .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
                 row.get(0)
@@ -1102,5 +1182,63 @@ mod tests {
             )
             .expect("reports");
         assert_eq!(reports, 1);
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn v3_ledger_gains_settings_without_touching_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        let payload = r#"{"slug":"auth","from":"open","to":"done"}"#;
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE reports (
+                    id INTEGER PRIMARY KEY,
+                    task_id INTEGER,
+                    kind TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    bytes INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                ",
+            )
+            .expect("schema");
+            conn.pragma_update(None, "user_version", 3)
+                .expect("version");
+            conn.execute(
+                "INSERT INTO events (id, ts, kind, payload) VALUES (4, '2026-01-01T00:00:00.000Z', 'status_changed', ?1)",
+                rusqlite::params![payload],
+            )
+            .expect("insert");
+        }
+        let ledger = Ledger::open(&path).expect("migrate");
+        let settings = ledger.settings().expect("settings");
+        assert_eq!(settings.mode, "manual");
+        assert_eq!(settings.max_agent_calls, 60);
+        assert_eq!(settings.est_cost_cap_usd, None);
+        drop(ledger);
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        let stored: String = conn
+            .query_row("SELECT payload FROM events WHERE id = 4", [], |row| {
+                row.get(0)
+            })
+            .expect("payload");
+        assert_eq!(stored, payload);
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 5);
     }
 }

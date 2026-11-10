@@ -25,6 +25,7 @@ pub enum Error {
     DatabaseBusy,
     BadStatus(String),
     BadEvent(String),
+    InvalidSetting(String),
 }
 
 impl fmt::Display for Error {
@@ -54,6 +55,7 @@ impl fmt::Display for Error {
             Self::DatabaseBusy => formatter.write_str("database busy"),
             Self::BadStatus(status) => write!(formatter, "invalid status: {status}"),
             Self::BadEvent(message) => write!(formatter, "invalid event: {message}"),
+            Self::InvalidSetting(message) => formatter.write_str(message),
         }
     }
 }

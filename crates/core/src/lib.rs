@@ -8,7 +8,9 @@ mod migrate;
 mod model;
 mod replay;
 mod reports;
+mod runs;
 mod schema;
+mod settings;
 
 pub use error::Error;
 pub use ledger::Ledger;
@@ -18,3 +20,8 @@ pub use model::{
 };
 pub use replay::{ReplayedDecision, ReplayedTask, replay};
 pub use reports::{InboxItem, Sections};
+pub use runs::{
+    Run, blocked_slug as blocked_run_slug, ready_slug as ready_run_slug,
+    unfinished as unfinished_run,
+};
+pub use settings::{RunView, Snapshot as Settings, StatusView, format_config, format_status};

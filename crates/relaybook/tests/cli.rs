@@ -809,6 +809,97 @@ fn hook_prompt_is_one_line_or_silent() {
 }
 
 #[test]
+fn mode_and_config_use_agent_call_limits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["mode"])
+        .assert()
+        .success()
+        .stdout("manual\n");
+    run(dir.path(), ["config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("max_agent_calls 60"))
+        .stdout(predicate::str::contains("est_cost_cap_usd unset"))
+        .stdout(predicate::str::contains("gates plan"));
+    run(dir.path(), ["config", "set", "gates", "sometimes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid gates: sometimes"));
+    run(dir.path(), ["config", "set", "gates", "plan,review"])
+        .assert()
+        .success()
+        .stdout("gates plan,review\n");
+    run(dir.path(), ["config", "set", "max_agent_calls", "15"])
+        .assert()
+        .success()
+        .stdout("max_agent_calls 15\n");
+    run(dir.path(), ["config", "set", "est_cost_cap_usd", "5"])
+        .assert()
+        .success()
+        .stdout("est_cost_cap_usd 5.00\n");
+    run(dir.path(), ["config", "set", "est_cost_cap_usd", "unset"])
+        .assert()
+        .success()
+        .stdout("est_cost_cap_usd unset\n");
+    run(dir.path(), ["mode", "auto"])
+        .assert()
+        .success()
+        .stdout("mode auto\n");
+    run(dir.path(), ["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("mode auto"))
+        .stdout(predicate::str::contains("no active run"))
+        .stdout(predicate::str::contains("cap unset"));
+
+    let db = dir.path().join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    conn.execute(
+        "INSERT INTO runs (prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd, status, stop_reason, started_at)
+         VALUES ('docs/prd.md', 'abc', 'relaybook/prd', 'review', 3, 9, 4.1, 'waiting', NULL, '2026-11-10T12:00:00.000Z')",
+        [],
+    )
+    .expect("insert");
+    drop(conn);
+
+    let status = run(dir.path(), ["status"]).assert().success();
+    let status = String::from_utf8(status.get_output().stdout.clone()).expect("utf8");
+    assert!(status.contains("calls 9/15"), "{status}");
+    assert!(status.contains("est 4.10 USD (estimate)"), "{status}");
+    assert!(status.contains("waiting on approval"), "{status}");
+    assert!(status.len() < 400, "{}", status.len());
+    run(dir.path(), ["hook", "prompt"])
+        .assert()
+        .success()
+        .stdout("waiting for approval: relaybook approve\n");
+
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    conn.execute(
+        "UPDATE runs SET status = 'paused', stop_reason = 'claude|2026-11-10T18:00:00Z' WHERE id = 1",
+        [],
+    )
+    .expect("update");
+    drop(conn);
+    run(dir.path(), ["hook", "prompt"])
+        .assert()
+        .success()
+        .stdout(
+            "usage limit reached on claude; relaybook run --resume after 2026-11-10T18:00:00Z\n",
+        );
+    run(dir.path(), ["mode", "manual"])
+        .assert()
+        .success()
+        .stdout("mode manual\n");
+    run(dir.path(), ["status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "usage limit (claude, until 2026-11-10T18:00:00Z)",
+        ));
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");

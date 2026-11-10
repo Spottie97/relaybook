@@ -2,6 +2,7 @@ fn main() -> std::process::ExitCode {
     cli::execute()
 }
 
+mod agents;
 mod claude_hook;
 mod cli;
 mod gitinfo;
@@ -10,5 +11,6 @@ mod hooks;
 mod install;
 mod paths;
 mod render;
+mod runloop;
 mod setup;
 mod workflow;

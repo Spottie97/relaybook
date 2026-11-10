@@ -23,6 +23,7 @@ rustc-ice-*.txt
 # Graphify writes a backup beside Claude settings, and the local graph stays per developer.
 .claude/*.graphify-bak
 graphify-out/
+.relaybook/runs/
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

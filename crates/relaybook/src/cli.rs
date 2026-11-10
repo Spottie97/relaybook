@@ -8,6 +8,7 @@ use crate::gitinfo;
 use crate::install;
 use crate::paths;
 use crate::render;
+use crate::runloop;
 use crate::setup;
 
 pub(crate) fn execute() -> ExitCode {
@@ -96,6 +97,43 @@ enum Command {
     Report(ReportCmd),
     /// List unreviewed reports.
     Inbox,
+    /// Print or set manual/auto mode.
+    Mode {
+        /// `manual` or `auto`. Omit to print the current mode.
+        value: Option<String>,
+    },
+    /// List or change auto-run settings.
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+    /// Print mode, limits, and the active run.
+    Status,
+    /// Run the auto-mode loop, or stop and complete it.
+    Run {
+        /// PRD file to implement. Relative to the repository.
+        #[arg(long)]
+        prd: Option<std::path::PathBuf>,
+        /// Resume a stopped, paused, or waiting run.
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        max_cycles: Option<i64>,
+        #[arg(long)]
+        max_agent_calls: Option<i64>,
+        #[arg(long)]
+        max_reopens: Option<i64>,
+        #[arg(long)]
+        cursor_timeout_min: Option<i64>,
+        #[arg(long)]
+        est_cost_cap_usd: Option<String>,
+        #[arg(long)]
+        gates: Option<String>,
+        #[command(subcommand)]
+        action: Option<RunAction>,
+    },
+    /// Resume a run that is waiting for approval.
+    Approve,
     #[command(subcommand)]
     Hook(HookCmd),
     /// Append coordination instructions to CLAUDE.md and AGENTS.md.
@@ -210,6 +248,20 @@ enum TaskCmd {
         #[arg(long)]
         title: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RunAction {
+    /// End the active run.
+    Stop,
+    /// Mark the PRD covered. The loop opens the PR when nothing is open.
+    Complete,
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Change one setting.
+    Set { key: String, value: String },
 }
 
 #[derive(Subcommand)]
@@ -419,6 +471,57 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         }
         Command::Report(ReportCmd::Note { by, text }) => add_note(&cwd, &by, text),
         Command::Inbox => show_inbox(&cwd),
+        Command::Mode { value } => match value {
+            Some(value) => set_mode(&cwd, &value),
+            None => show_mode(&cwd),
+        },
+        Command::Config { action } => match action {
+            Some(ConfigAction::Set { key, value }) => set_config(&cwd, &key, &value),
+            None => show_config(&cwd),
+        },
+        Command::Status => show_status(&cwd),
+        Command::Run {
+            prd,
+            resume,
+            max_cycles,
+            max_agent_calls,
+            max_reopens,
+            cursor_timeout_min,
+            est_cost_cap_usd,
+            gates,
+            action,
+        } => run_auto(
+            &cwd,
+            runloop::Launch {
+                prd,
+                resume,
+                approve: false,
+                stop: matches!(action, Some(RunAction::Stop)),
+                complete: matches!(action, Some(RunAction::Complete)),
+                max_cycles,
+                max_agent_calls,
+                max_reopens,
+                cursor_timeout_min,
+                est_cost_cap_usd,
+                gates,
+            },
+        ),
+        Command::Approve => run_auto(
+            &cwd,
+            runloop::Launch {
+                prd: None,
+                resume: false,
+                approve: true,
+                stop: false,
+                complete: false,
+                max_cycles: None,
+                max_agent_calls: None,
+                max_reopens: None,
+                cursor_timeout_min: None,
+                est_cost_cap_usd: None,
+                gates: None,
+            },
+        ),
         Command::Hook(HookCmd::Prompt) => Ok(Outcome {
             human: String::new(),
             data: serde_json::json!({}),
@@ -473,6 +576,12 @@ fn create_task(
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.create_task_depending(slug, title, depends_on)?;
+    if let Some(run_id) = std::env::var("RELAYBOOK_RUN_ID")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+    {
+        ledger.assign_run(&task.slug, run_id)?;
+    }
     let human = render::line(&format!("created {}", task.slug));
     json_outcome(task_ack(&task), human)
 }
@@ -629,6 +738,73 @@ fn hook_prompt() {
     if count > 0 {
         println!("{count} new Cursor reports: relaybook inbox");
     }
+    if let Ok(Some(line)) = ledger.hook_wait_line() {
+        println!("{line}");
+    }
+}
+
+fn run_auto(cwd: &Path, launch: runloop::Launch) -> Result<Outcome, Fail> {
+    let output = runloop::execute(cwd, launch);
+    let trimmed = output.text.trim().to_string();
+    Ok(Outcome {
+        data: serde_json::json!({ "text": trimmed }),
+        human: output.text,
+        code: output.code,
+        error: if output.code == 0 {
+            None
+        } else {
+            Some(trimmed)
+        },
+    })
+}
+
+fn show_mode(cwd: &Path) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let settings = ledger.settings()?;
+    json_outcome(
+        serde_json::json!({ "mode": settings.mode }),
+        render::line(&settings.mode),
+    )
+}
+
+fn set_mode(cwd: &Path, value: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let settings = ledger.set_setting("mode", value)?;
+    json_outcome(
+        serde_json::json!({ "mode": settings.mode }),
+        render::line(&format!("mode {}", settings.mode)),
+    )
+}
+
+fn show_config(cwd: &Path) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let settings = ledger.settings()?;
+    json_outcome(settings.clone(), relaybook_core::format_config(&settings))
+}
+
+fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let settings = ledger.set_setting(key, value)?;
+    let shown = match key {
+        "est_cost_cap_usd" => settings
+            .est_cost_cap_usd
+            .clone()
+            .unwrap_or_else(|| "unset".to_string()),
+        "mode" => settings.mode.clone(),
+        "gates" => settings.gates.clone(),
+        "max_cycles" => settings.max_cycles.to_string(),
+        "max_reopens_per_task" => settings.max_reopens_per_task.to_string(),
+        "max_agent_calls" => settings.max_agent_calls.to_string(),
+        "cursor_timeout_min" => settings.cursor_timeout_min.to_string(),
+        _ => value.to_string(),
+    };
+    json_outcome(settings, render::line(&format!("{key} {shown}")))
+}
+
+fn show_status(cwd: &Path) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let view = ledger.status_view()?;
+    json_outcome(view.clone(), relaybook_core::format_status(&view))
 }
 
 fn kept_lines(lines: &[String]) -> Vec<String> {

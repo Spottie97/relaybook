@@ -2,7 +2,7 @@
 ///
 /// `events_progress_once` rejects a second progress event for the same task
 /// and commit. A null commit (no git HEAD) is not covered, so those reports append.
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 5;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL CHECK (status IN ('open', 'claimed', 'done', 'blocked')),
     claimed_by TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    run_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS steps (
@@ -75,6 +76,53 @@ CREATE TABLE IF NOT EXISTS reports (
     reviewed_at TEXT,
     verdict TEXT CHECK (verdict IS NULL OR verdict IN ('accepted', 'reopened')),
     review_note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY,
+    prd_path TEXT NOT NULL,
+    prd_sha256 TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    cycle INTEGER NOT NULL,
+    agent_calls INTEGER NOT NULL,
+    est_cost_usd REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK (status IN ('active', 'waiting', 'paused', 'stopped', 'complete')),
+    stop_reason TEXT,
+    started_at TEXT NOT NULL,
+    failure_streak INTEGER NOT NULL DEFAULT 0,
+    current_slug TEXT,
+    complete_requested INTEGER NOT NULL DEFAULT 0
+);
+";
+
+pub(crate) const MIGRATE_V3_TO_V4: &str = "
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY,
+    prd_path TEXT NOT NULL,
+    prd_sha256 TEXT NOT NULL,
+    branch TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    cycle INTEGER NOT NULL,
+    agent_calls INTEGER NOT NULL,
+    est_cost_usd REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK (status IN ('active', 'waiting', 'paused', 'stopped', 'complete')),
+    stop_reason TEXT,
+    started_at TEXT NOT NULL
 );
 ";
 
