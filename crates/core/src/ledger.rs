@@ -367,20 +367,45 @@ impl Ledger {
     }
 
     pub fn context(&self, slug: Option<&str>, event_limit: usize) -> Result<Context, Error> {
+        self.context_view(slug, true, Some(event_limit))
+    }
+
+    pub fn context_view(
+        &self,
+        slug: Option<&str>,
+        include_done: bool,
+        event_limit: Option<usize>,
+    ) -> Result<Context, Error> {
         let slug = match slug {
             Some(value) => Some(checked_slug(value)?),
             None => None,
         };
-        let tasks = self.task_details(slug.as_deref())?;
-        let events = self.recent_events(slug.as_deref(), event_limit)?;
-        Ok(Context { tasks, events })
+        let tasks = self.scoped_tasks(slug.as_deref(), include_done)?;
+        let hidden_done = self.hidden_done_count(&tasks)?;
+        let events = match event_limit {
+            Some(limit) => self.recent_events(slug.as_deref(), limit)?,
+            None => Vec::new(),
+        };
+        Ok(Context {
+            tasks,
+            events,
+            hidden_done,
+        })
     }
 
-    fn task_details(&self, slug: Option<&str>) -> Result<Vec<TaskDetail>, Error> {
+    fn scoped_tasks(
+        &self,
+        slug: Option<&str>,
+        include_done: bool,
+    ) -> Result<Vec<TaskDetail>, Error> {
         let tasks = if let Some(slug) = slug {
             vec![load_task(&self.conn, slug)?]
         } else {
-            self.list_tasks(None, false)?
+            let mut tasks = self.list_tasks(None, false)?;
+            if !include_done {
+                tasks.retain(|task| task.status != Status::Done);
+            }
+            tasks
         };
         let mut details = Vec::with_capacity(tasks.len());
         for task in tasks {
@@ -393,6 +418,15 @@ impl Ledger {
             });
         }
         Ok(details)
+    }
+
+    fn hidden_done_count(&self, shown: &[TaskDetail]) -> Result<usize, Error> {
+        let done = self.list_tasks(Some(Status::Done), false)?;
+        let shown_done = shown
+            .iter()
+            .filter(|detail| detail.task.status == Status::Done)
+            .count();
+        Ok(done.len().saturating_sub(shown_done))
     }
 
     fn recent_events(&self, slug: Option<&str>, event_limit: usize) -> Result<Vec<Event>, Error> {

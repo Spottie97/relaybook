@@ -245,7 +245,9 @@ fn dependencies_show_in_json_and_ready_list() {
             "--json",
         ],
     );
-    assert_eq!(created["depends_on"][0], "base");
+    let created_task = json_data(dir.path(), ["context", "feature", "--json"]);
+    assert_eq!(created["slug"], "feature");
+    assert_eq!(created_task["tasks"][0]["depends_on"][0], "base");
 
     run(dir.path(), ["task", "list"])
         .assert()
@@ -308,14 +310,15 @@ fn rename_keeps_the_slug_and_shows_the_new_title() {
     )
     .assert()
     .success()
-    .stdout(predicate::str::contains("renamed auth: Add login"));
+    .stdout(predicate::str::contains("renamed auth"));
 
     let task = json_data(
         dir.path(),
         ["task", "rename", "auth", "--title", "Add login", "--json"],
     );
     assert_eq!(task["slug"], "auth");
-    assert_eq!(task["title"], "Add login");
+    let titled = json_data(dir.path(), ["context", "auth", "--json"]);
+    assert_eq!(titled["tasks"][0]["title"], "Add login");
     let renamed = event_rows(dir.path())
         .into_iter()
         .filter(|row| row.1 == "task_renamed")
@@ -402,6 +405,43 @@ fn unblock_returns_claimed_or_open() {
 }
 
 #[test]
+fn context_hides_done_tasks_until_asked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["task", "create", "old", "--title", "Old"])
+        .assert()
+        .success();
+    run(dir.path(), ["task", "done", "old"]).assert().success();
+    run(dir.path(), ["task", "create", "now", "--title", "Now"])
+        .assert()
+        .success();
+
+    run(dir.path(), ["context"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("now [open] Now"))
+        .stdout(predicate::str::contains("old [done]").not())
+        .stdout(predicate::str::contains(
+            "1 done tasks hidden (relaybook context --all)",
+        ))
+        .stdout(predicate::str::contains(
+            "events omitted (relaybook context --events 20)",
+        ));
+
+    run(dir.path(), ["context", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("old [done] Old"));
+
+    let data = json_data(dir.path(), ["context", "--json"]);
+    assert_eq!(data["hidden_done"], 1);
+    assert_eq!(data["tasks"].as_array().expect("tasks").len(), 1);
+    let full = json_data(dir.path(), ["context", "old", "--json"]);
+    assert_eq!(full["tasks"][0]["slug"], "old");
+    assert!(!full["events"].as_array().expect("events").is_empty());
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");
@@ -470,7 +510,7 @@ fn json_data(dir: &Path, args: impl IntoIterator<Item = &'static str>) -> Value 
 }
 
 fn event_rows(dir: &Path) -> Vec<(i64, String, Value)> {
-    let data = json_data(dir, ["context", "--json"]);
+    let data = json_data(dir, ["context", "--all", "--json"]);
     let mut rows: Vec<(i64, String, Value)> = data["events"]
         .as_array()
         .expect("events")

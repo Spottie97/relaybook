@@ -63,7 +63,15 @@ fn install_file(path: &Path, heading: &str, body: &str) -> Result<InstallState, 
     } else {
         String::new()
     };
-    if existing.contains(MARKER_START) || existing.contains(heading) {
+    if existing.contains(MARKER_START) && existing.contains(MARKER_END) {
+        let replaced = replace_span(&existing, MARKER_START, MARKER_END, &append_block("", body));
+        if replaced == existing {
+            return Ok(InstallState::Unchanged);
+        }
+        std::fs::write(path, replaced)?;
+        return Ok(InstallState::Updated);
+    }
+    if existing.contains(heading) {
         return Ok(InstallState::Unchanged);
     }
     if let Some(replaced) = replace_legacy(&existing, body) {
@@ -183,6 +191,28 @@ mod tests {
         assert_eq!(text.matches(MARKER_START).count(), 1);
         assert!(!text.contains("agentmesh"));
         assert!(text.contains(PLANNER_HEADING));
+
+        let second = apply(dir.path(), true, false).expect("install");
+        assert_eq!(second.claude, Some(InstallState::Unchanged));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), text);
+    }
+
+    #[test]
+    fn refreshes_a_stale_marker_block_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(
+            &path,
+            "<!-- relaybook:start -->\nstale\n<!-- relaybook:end -->\n",
+        )
+        .expect("write");
+
+        let first = apply(dir.path(), true, false).expect("install");
+        assert_eq!(first.claude, Some(InstallState::Updated));
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(text.matches(MARKER_START).count(), 1);
+        assert!(text.contains(PLANNER_HEADING));
+        assert!(!text.contains("stale"));
 
         let second = apply(dir.path(), true, false).expect("install");
         assert_eq!(second.claude, Some(InstallState::Unchanged));

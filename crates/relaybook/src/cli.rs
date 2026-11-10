@@ -71,7 +71,15 @@ enum Command {
     /// Create the ledger at the repository root.
     Init,
     /// Print tasks, steps, decisions, and recent events.
-    Context { slug: Option<String> },
+    Context {
+        slug: Option<String>,
+        /// Include done tasks and the full history.
+        #[arg(long)]
+        all: bool,
+        /// Append the last N events as one-line summaries.
+        #[arg(long)]
+        events: Option<usize>,
+    },
     #[command(subcommand)]
     Task(TaskCmd),
     #[command(subcommand)]
@@ -282,7 +290,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
     let cwd = std::env::current_dir()?;
     match cli.command {
         Command::Init => init_ledger(&cwd),
-        Command::Context { slug } => show_context(&cwd, slug.as_deref()),
+        Command::Context { slug, all, events } => show_context(&cwd, slug.as_deref(), all, events),
         Command::Task(TaskCmd::Create {
             slug,
             title,
@@ -354,22 +362,22 @@ fn create_task(
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.create_task_depending(slug, title, depends_on)?;
-    let human = render::line(&format!("created {}: {}", task.slug, task.title));
-    json_outcome(task, human)
+    let human = render::line(&format!("created {}", task.slug));
+    json_outcome(task_ack(&task), human)
 }
 
 fn depend(cwd: &Path, slug: &str, on: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.add_dependency(slug, on)?;
     let human = render::line(&format!("{slug} depends on {on}"));
-    json_outcome(task, human)
+    json_outcome(task_ack(&task), human)
 }
 
 fn undepend(cwd: &Path, slug: &str, on: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.remove_dependency(slug, on)?;
     let human = render::line(&format!("{slug} no longer depends on {on}"));
-    json_outcome(task, human)
+    json_outcome(task_ack(&task), human)
 }
 
 fn list_tasks(cwd: &Path, status: Option<Status>, ready: bool) -> Result<Outcome, Fail> {
@@ -384,45 +392,49 @@ fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
     let task = ledger.claim_task(slug, by)?;
     let agent = task.claimed_by.clone().unwrap_or_default();
     let human = render::line(&format!("claimed {} by {agent}", task.slug));
-    json_outcome(task, human)
+    json_outcome(task_ack(&task), human)
 }
 
 fn complete_task(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.complete_task(slug)?;
     let human = render::line(&format!("done {}", task.slug));
-    json_outcome(task, human)
+    json_outcome(task_ack(&task), human)
 }
 
 fn block_task(cwd: &Path, slug: &str, reason: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.block_task(slug, reason)?;
-    let human = render::line(&format!("blocked {}: {reason}", task.slug));
-    json_outcome(task, human)
+    let human = render::line(&format!("blocked {}", task.slug));
+    json_outcome(task_ack(&task), human)
 }
 
 fn unblock_task(cwd: &Path, slug: &str, note: Option<&str>) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.unblock_task(slug, note)?;
     let human = render::line(&format!("unblocked {}", task.slug));
-    json_outcome(task, human)
+    json_outcome(task_ack(&task), human)
 }
 
 fn rename_task(cwd: &Path, slug: &str, title: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.rename_task(slug, title)?;
-    let human = render::line(&format!("renamed {}: {}", task.slug, task.title));
-    json_outcome(task, human)
+    let human = render::line(&format!("renamed {}", task.slug));
+    json_outcome(task_ack(&task), human)
 }
 
 fn add_step(cwd: &Path, slug: &str, description: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let step = ledger.add_step(slug, description)?;
-    let human = render::line(&format!(
-        "added step {} on {slug}: {}",
-        step.position, step.description
-    ));
-    json_outcome(step, human)
+    let human = render::line(&format!("added step {} to {slug}", step.position));
+    json_outcome(
+        serde_json::json!({
+            "id": step.id,
+            "slug": slug,
+            "position": step.position,
+        }),
+        human,
+    )
 }
 
 fn check_step(cwd: &Path, slug: &str, position: i64) -> Result<Outcome, Fail> {
@@ -437,20 +449,36 @@ fn report_progress(cwd: &Path, slug: &str, note: &str) -> Result<Outcome, Fail> 
     let commit = gitinfo::head(cwd);
     let event = ledger.report_progress(slug, note, commit.as_deref())?;
     let human = render::line(&format!("recorded progress on {slug}"));
-    json_outcome(event, human)
+    json_outcome(serde_json::json!({ "id": event.id, "slug": slug }), human)
 }
 
 fn log_decision(cwd: &Path, slug: &str, why: &str, by: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let decision = ledger.log_decision(slug, why, by)?;
-    let human = render::line(&format!("logged decision on {slug}"));
-    json_outcome(decision, human)
+    let human = render::line(&format!("logged decision {} on {slug}", decision.id));
+    json_outcome(
+        serde_json::json!({ "id": decision.id, "slug": slug }),
+        human,
+    )
 }
 
-fn show_context(cwd: &Path, slug: Option<&str>) -> Result<Outcome, Fail> {
+fn show_context(
+    cwd: &Path,
+    slug: Option<&str>,
+    all: bool,
+    events: Option<usize>,
+) -> Result<Outcome, Fail> {
     let ledger = open_ledger(cwd)?;
-    let ctx = ledger.context(slug, RECENT_EVENT_LIMIT)?;
-    let human = render::context(&ctx);
+    let full = all || slug.is_some();
+    let event_limit = if let Some(limit) = events {
+        Some(limit)
+    } else if full {
+        Some(RECENT_EVENT_LIMIT)
+    } else {
+        None
+    };
+    let ctx = ledger.context_view(slug, full, event_limit)?;
+    let human = render::context(&ctx, !full, events.is_some());
     json_outcome(ctx, human)
 }
 
@@ -498,6 +526,14 @@ fn setup_project(cwd: &Path, options: setup::Options) -> Result<Outcome, Fail> {
 fn open_ledger(cwd: &Path) -> Result<Ledger, Fail> {
     let path = paths::ledger_path(cwd).ok_or(Fail::NoLedger)?;
     Ok(Ledger::open(&path)?)
+}
+
+fn task_ack(task: &relaybook_core::Task) -> serde_json::Value {
+    serde_json::json!({
+        "id": task.id,
+        "slug": task.slug,
+        "status": task.status,
+    })
 }
 
 fn json_outcome(value: impl serde::Serialize, human: String) -> Result<Outcome, Fail> {

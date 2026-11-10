@@ -147,6 +147,7 @@ pub struct TaskDetail {
 pub struct Context {
     pub tasks: Vec<TaskDetail>,
     pub events: Vec<Event>,
+    pub hidden_done: usize,
 }
 
 pub(crate) fn checked_slug(slug: &str) -> Result<String, Error> {

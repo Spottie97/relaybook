@@ -181,6 +181,24 @@ in the event payload. A second report for the same task and commit fails with
 is appended. `task done` on a task that is already done succeeds and does not write
 another event.
 
+## Context cost
+
+`relaybook context` shows active tasks only. Checked steps collapse to `n/m done`,
+older decisions stay behind `relaybook context <slug>`, and finished tasks stay behind
+`relaybook context --all`. Events stay behind `relaybook context --events N`. On a
+40-done fixture, context fell from 4567 bytes (~1141 tokens) to 1482 bytes (~370 tokens).
+A planning burst of one create, five steps, and a decision fell from 232 bytes to 152.
+Write commands answer with an id, slug, and status. Read commands still return the
+full record.
+
+Graphify answers where the code lives. Relaybook answers who is doing the work. Both
+default to a small answer and name the command that restores the rest. The pull hooks
+run `graphify update .` in the background and print nothing. Graphify's editor hook
+does not rewrite `relaybook` commands.
+
+`scripts/measure-context.sh --check` fails when fixture context exceeds 4000 bytes, a
+write acknowledgement exceeds 120 bytes, or an instruction block exceeds 600 bytes.
+
 ## Library
 
 `relaybook-core` owns the ledger. A future MCP adapter, or any other front end, should

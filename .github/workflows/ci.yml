@@ -27,6 +27,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+      - name: context budget
+        run: scripts/measure-context.sh --check
 
   shellcheck:
     name: shellcheck
