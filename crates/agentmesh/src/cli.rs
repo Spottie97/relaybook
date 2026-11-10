@@ -8,6 +8,7 @@ use crate::gitinfo;
 use crate::install;
 use crate::paths;
 use crate::render;
+use crate::setup;
 
 pub(crate) fn execute() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -79,6 +80,18 @@ enum Command {
         /// Append the executor block to AGENTS.md.
         #[arg(long)]
         cursor: bool,
+    },
+    /// Create the ledger, install agent instructions, and set up Graphify.
+    Setup {
+        /// Skip every Graphify command and the pull hooks.
+        #[arg(long)]
+        no_graphify: bool,
+        /// Skip git hook installation.
+        #[arg(long)]
+        no_hooks: bool,
+        /// Write the opt-in GitHub Actions workflow and graph.json merge driver.
+        #[arg(long)]
+        ci: bool,
     },
 }
 
@@ -230,6 +243,15 @@ impl From<std::io::Error> for Fail {
     }
 }
 
+impl From<setup::Error> for Fail {
+    fn from(err: setup::Error) -> Self {
+        match err {
+            setup::Error::Core(err) => Self::Core(err),
+            setup::Error::Io(err) => Self::Io(err),
+        }
+    }
+}
+
 fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
     let cwd = std::env::current_dir()?;
     match cli.command {
@@ -258,6 +280,18 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             log_decision(&cwd, &slug, &why, &by)
         }
         Command::Install { claude, cursor } => install_docs(&cwd, claude, cursor),
+        Command::Setup {
+            no_graphify,
+            no_hooks,
+            ci,
+        } => setup_project(
+            &cwd,
+            setup::Options {
+                no_graphify,
+                no_hooks,
+                ci,
+            },
+        ),
     }
 }
 
@@ -410,6 +444,18 @@ fn install_docs(cwd: &Path, claude: bool, cursor: bool) -> Result<Outcome, Fail>
         human,
         code: 0,
         error: None,
+    })
+}
+
+fn setup_project(cwd: &Path, options: setup::Options) -> Result<Outcome, Fail> {
+    let report = setup::run(cwd, options)?;
+    let data = serde_json::json!({ "steps": &report.steps });
+    let human = setup::render(&report);
+    Ok(Outcome {
+        data,
+        human,
+        code: u8::from(report.error.is_some()),
+        error: report.error,
     })
 }
 
