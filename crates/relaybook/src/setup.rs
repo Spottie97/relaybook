@@ -53,6 +53,8 @@ pub(crate) fn run(cwd: &Path, options: Options) -> Result<Report, Error> {
     record_docs(&root, &mut steps)?;
     record_prompt_hook(&root, &options, &mut steps);
     record_graphify(&root, &options, &mut steps);
+    record_graphify_guards(&root, &mut steps);
+    record_ignore(&root, &options, &mut steps)?;
     record_hooks(&root, &options, &mut steps);
     record_rtk(&mut steps);
     if options.ci {
@@ -112,6 +114,14 @@ fn record_prompt_hook(root: &Path, options: &Options, steps: &mut Vec<Step>) {
         return;
     }
     match crate::claude_hook::install(root) {
+        Ok(_) if !command_on_path("relaybook") => {
+            push(
+                steps,
+                "prompt hook",
+                "done",
+                "relaybook is not on PATH; the prompt hook stays silent until it is",
+            );
+        }
         Ok(crate::claude_hook::Status::Updated) => {
             push(steps, "prompt hook", "done", "added UserPromptSubmit");
         }
@@ -125,6 +135,80 @@ fn record_prompt_hook(root: &Path, options: &Options, steps: &mut Vec<Step>) {
         }
         Err(err) => push(steps, "prompt hook", "failed", err.to_string()),
     }
+}
+
+fn record_graphify_guards(root: &Path, steps: &mut Vec<Step>) {
+    match crate::claude_hook::guard_graphify(root) {
+        Ok(true) => push(steps, "graphify guards", "done", "wrapped PreToolUse"),
+        Ok(false) => push(
+            steps,
+            "graphify guards",
+            "skipped",
+            "PreToolUse already guarded",
+        ),
+        Err(err) => push(steps, "graphify guards", "failed", err.to_string()),
+    }
+}
+
+fn record_ignore(root: &Path, options: &Options, steps: &mut Vec<Step>) -> Result<(), Error> {
+    let path = root.join(".gitignore");
+    let original = if path.is_file() {
+        std::fs::read_to_string(&path)?
+    } else {
+        String::new()
+    };
+    let mut text = original;
+    let mut changed = insert_ignore(&mut text, ".claude/*.graphify-bak");
+    if options.ci {
+        changed |= delete_ignore(&mut text, "graphify-out/");
+    } else {
+        changed |= insert_ignore(&mut text, "graphify-out/");
+    }
+    if changed {
+        std::fs::write(&path, text)?;
+        let detail = if options.ci {
+            "graphify-out stays tracked"
+        } else {
+            "ignored .claude/*.graphify-bak and graphify-out/"
+        };
+        push(steps, "gitignore", "done", detail);
+    } else {
+        let detail = if options.ci {
+            "graphify-out stays tracked"
+        } else {
+            "already ignored"
+        };
+        push(steps, "gitignore", "skipped", detail);
+    }
+    Ok(())
+}
+
+fn insert_ignore(text: &mut String, line: &str) -> bool {
+    if text.lines().any(|item| item.trim() == line) {
+        return false;
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(line);
+    text.push('\n');
+    true
+}
+
+fn delete_ignore(text: &mut String, line: &str) -> bool {
+    if !text.lines().any(|item| item.trim() == line) {
+        return false;
+    }
+    let mut kept = String::new();
+    for item in text.lines() {
+        if item.trim() == line {
+            continue;
+        }
+        kept.push_str(item);
+        kept.push('\n');
+    }
+    *text = kept;
+    true
 }
 
 fn record_graphify(root: &Path, options: &Options, steps: &mut Vec<Step>) {

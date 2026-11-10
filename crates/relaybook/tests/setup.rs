@@ -437,7 +437,7 @@ fn setup_merges_the_prompt_hook_without_duplicating_it() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "prompt hook: done (added UserPromptSubmit)",
+            "prompt hook: done (relaybook is not on PATH; the prompt hook stays silent until it is)",
         ));
 
     let value: Value =
@@ -462,9 +462,166 @@ fn setup_merges_the_prompt_hook_without_duplicating_it() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "prompt hook: skipped (UserPromptSubmit already installed)",
+            "prompt hook: done (relaybook is not on PATH; the prompt hook stays silent until it is)",
         ));
     assert_eq!(fs::read(&settings).expect("read"), first);
+}
+
+#[test]
+fn prompt_hook_reports_installed_when_relaybook_is_on_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&bin).expect("mkdir");
+    fs::write(bin.join("relaybook"), "#!/bin/sh\nexit 0\n").expect("write");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "prompt hook: done (added UserPromptSubmit)",
+        ));
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "prompt hook: skipped (UserPromptSubmit already installed)",
+        ));
+}
+
+#[test]
+fn setup_guards_graphify_hooks_and_ignores_local_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings = dir.path().join(".claude").join("settings.json");
+    fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &settings,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash|Grep","hooks":[{"type":"command","command":"/tmp/graphify hook-guard search","timeout":10}]},{"matcher":"Read|Glob","hooks":[{"type":"command","command":"graphify hook-guard read --strict"}]}]}}"#,
+    )
+    .expect("write");
+
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "graphify guards: done (wrapped PreToolUse)",
+        ))
+        .stdout(predicates::str::contains(
+            "gitignore: done (ignored .claude/*.graphify-bak and graphify-out/)",
+        ));
+
+    let value: Value =
+        serde_json::from_str(&fs::read_to_string(&settings).expect("read")).expect("json");
+    assert_eq!(
+        value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "command -v graphify >/dev/null 2>&1 && graphify hook-guard search || true"
+    );
+    assert_eq!(value["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 10);
+    assert_eq!(
+        value["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
+        "command -v graphify >/dev/null 2>&1 && graphify hook-guard read --strict || true"
+    );
+    let ignore = fs::read_to_string(dir.path().join(".gitignore")).expect("gitignore");
+    assert!(ignore.contains(".claude/*.graphify-bak\n"), "{ignore}");
+    assert!(ignore.contains("graphify-out/\n"), "{ignore}");
+
+    let wrapped = value["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .expect("command")
+        .to_string();
+    let printed = Command::new("sh")
+        .arg("-c")
+        .arg(&wrapped)
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("wrapper");
+    assert!(printed.status.success());
+    assert_eq!(printed.stdout, b"");
+
+    let fake = dir.path().join("bin");
+    fs::create_dir_all(&fake).expect("mkdir");
+    fs::write(
+        fake.join("graphify"),
+        "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true}'\n",
+    )
+    .expect("write");
+    let mut permissions = fs::metadata(fake.join("graphify"))
+        .expect("meta")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(fake.join("graphify"), permissions).expect("chmod");
+    let printed = Command::new("sh")
+        .arg("-c")
+        .arg(&wrapped)
+        .env("PATH", format!("{}:/usr/bin:/bin", fake.display()))
+        .output()
+        .expect("wrapper");
+    assert!(printed.status.success());
+    assert_eq!(printed.stdout, b"{\"ok\":true}\n");
+
+    let first = fs::read(&settings).expect("read");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "graphify guards: skipped (PreToolUse already guarded)",
+        ))
+        .stdout(predicates::str::contains(
+            "gitignore: skipped (already ignored)",
+        ));
+    assert_eq!(fs::read(&settings).expect("read"), first);
+}
+
+#[test]
+fn fake_graphify_install_gets_guarded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&bin).expect("mkdir");
+    let script = bin.join("graphify");
+    fs::write(
+        &script,
+        "#!/bin/sh\nif [ \"$1\" = claude ]; then\n  mkdir -p .claude\n  printf '%s\\n' '{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"/opt/graphify hook-guard search\",\"timeout\":10}]}]}}' > .claude/settings.json\nfi\nexit 0\n",
+    )
+    .expect("write");
+    let mut permissions = fs::metadata(&script).expect("meta").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("chmod");
+
+    setup_plain(dir.path(), &["setup", "--no-hooks"])
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "graphify guards: done (wrapped PreToolUse)",
+        ));
+    let value: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join(".claude").join("settings.json")).expect("read"),
+    )
+    .expect("json");
+    assert_eq!(
+        value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "command -v graphify >/dev/null 2>&1 && graphify hook-guard search || true"
+    );
+    assert_eq!(value["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 10);
+}
+
+#[test]
+fn ci_setup_leaves_graphify_output_tracked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(dir.path().join(".gitignore"), "graphify-out/\nkeep\n").expect("write");
+    setup_plain(dir.path(), &["setup", "--ci", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "gitignore: done (graphify-out stays tracked)",
+        ));
+    let ignore = fs::read_to_string(dir.path().join(".gitignore")).expect("gitignore");
+    assert!(
+        !ignore.lines().any(|line| line.trim() == "graphify-out/"),
+        "{ignore}"
+    );
+    assert!(ignore.contains(".claude/*.graphify-bak"), "{ignore}");
+    assert!(ignore.contains("keep"), "{ignore}");
 }
 
 #[test]

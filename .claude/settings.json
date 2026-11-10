@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "graphify hook-guard search",
+            "command": "command -v graphify >/dev/null 2>&1 && graphify hook-guard search || true",
             "timeout": 10
           }
         ]
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "graphify hook-guard read",
+            "command": "command -v graphify >/dev/null 2>&1 && graphify hook-guard read || true",
             "timeout": 10
           }
         ]
