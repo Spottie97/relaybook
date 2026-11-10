@@ -298,6 +298,23 @@ impl Ledger {
         })
     }
 
+    pub fn edit_step(&mut self, slug: &str, position: i64, text: &str) -> Result<Step, Error> {
+        let slug = checked_slug(slug)?;
+        let text = required_text("text", text)?;
+        self.transaction(|conn| {
+            let task = load_task(conn, &slug)?;
+            let step = load_step(conn, task.id, position)?;
+            if step.description == text {
+                return Ok(step);
+            }
+            conn.execute(
+                "UPDATE steps SET description = ?1 WHERE task_id = ?2 AND position = ?3",
+                params![text, task.id, position],
+            )?;
+            load_step(conn, task.id, position)
+        })
+    }
+
     pub fn report_progress(
         &mut self,
         slug: &str,

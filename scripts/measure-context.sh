@@ -105,6 +105,7 @@ measure task-list "$bin" task list
 measure task-list-ready "$bin" task list --ready
 measure write-create "$bin" task create sample --title "Sample task"
 measure write-step "$bin" step add sample "write a test"
+measure write-edit "$bin" step edit sample 1 --text "rewrite the test"
 measure write-claim "$bin" task claim sample --by cursor
 measure write-progress "$bin" progress report sample --note "started"
 measure write-decision "$bin" decision log sample --why "keep the ack short" --by cursor

@@ -176,6 +176,14 @@ enum StepCmd {
     Add { slug: String, description: String },
     /// Mark checklist step n done.
     Check { slug: String, n: i64 },
+    /// Replace the text of checklist step n.
+    Edit {
+        slug: String,
+        n: i64,
+        /// New step text. A leading dash is part of the text.
+        #[arg(long, allow_hyphen_values = true)]
+        text: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -310,6 +318,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Task(TaskCmd::Rename { slug, title }) => rename_task(&cwd, &slug, &title),
         Command::Step(StepCmd::Add { slug, description }) => add_step(&cwd, &slug, &description),
         Command::Step(StepCmd::Check { slug, n }) => check_step(&cwd, &slug, n),
+        Command::Step(StepCmd::Edit { slug, n, text }) => edit_step(&cwd, &slug, n, &text),
         Command::Progress(ProgressCmd::Report { slug, note }) => {
             report_progress(&cwd, &slug, &note)
         }
@@ -442,6 +451,21 @@ fn check_step(cwd: &Path, slug: &str, position: i64) -> Result<Outcome, Fail> {
     let step = ledger.check_step(slug, position)?;
     let human = render::line(&format!("checked step {} on {slug}", step.position));
     json_outcome(step, human)
+}
+
+fn edit_step(cwd: &Path, slug: &str, position: i64, text: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let step = ledger.edit_step(slug, position, text)?;
+    let human = render::line(&format!("edited step {position} on {slug}"));
+    let status = if step.done { "done" } else { "open" };
+    json_outcome(
+        serde_json::json!({
+            "slug": slug,
+            "position": step.position,
+            "status": status,
+        }),
+        human,
+    )
 }
 
 fn report_progress(cwd: &Path, slug: &str, note: &str) -> Result<Outcome, Fail> {

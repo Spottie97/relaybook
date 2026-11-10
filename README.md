@@ -137,6 +137,7 @@ relaybook task rename <slug> --title "..."
 relaybook task done <slug>
 relaybook step add <slug> "..."
 relaybook step check <slug> <n>
+relaybook step edit <slug> <n> --text "..."
 relaybook progress report <slug> --note "..."
 relaybook decision log <slug> --why "..." --by <agent>
 relaybook install --claude --cursor

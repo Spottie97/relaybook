@@ -442,6 +442,69 @@ fn context_hides_done_tasks_until_asked() {
 }
 
 #[test]
+fn edit_step_accepts_a_leading_dash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(dir.path(), ["step", "add", "auth", "hash passwords"])
+        .assert()
+        .success();
+    run(dir.path(), ["step", "check", "auth", "1"])
+        .assert()
+        .success();
+    let edited = json_data(
+        dir.path(),
+        [
+            "step",
+            "edit",
+            "auth",
+            "1",
+            "--text",
+            "--keep the dash",
+            "--json",
+        ],
+    );
+    assert_eq!(edited["slug"], "auth");
+    assert_eq!(edited["position"], 1);
+    assert_eq!(edited["status"], "done");
+    run(
+        dir.path(),
+        ["step", "edit", "auth", "1", "--text", "--keep the dash"],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("edited step 1 on auth"));
+    let ctx = json_data(dir.path(), ["context", "auth", "--json"]);
+    assert_eq!(
+        ctx["tasks"][0]["steps"][0]["description"],
+        "--keep the dash"
+    );
+    run(dir.path(), ["step", "edit", "auth", "1", "--text", "   "])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("text is required"));
+    run(
+        dir.path(),
+        ["step", "edit", "missing", "1", "--text", "text"],
+    )
+    .assert()
+    .failure()
+    .code(1)
+    .stderr(predicate::str::contains("no such task: missing"));
+    run(dir.path(), ["step", "edit", "auth", "9", "--text", "text"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("no such step: 9"));
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");

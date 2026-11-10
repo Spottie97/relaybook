@@ -376,6 +376,49 @@ fn unblock_restores_the_owner_and_ignores_other_statuses() {
     );
 }
 
+#[test]
+fn edit_step_updates_text_and_keeps_a_checked_step() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.create_task("auth", "Add auth").expect("create");
+    ledger.add_step("auth", "hash passwords").expect("step");
+    ledger.check_step("auth", 1).expect("check");
+    let before = ledger.context(Some("auth"), 20).expect("context");
+    let edited = ledger
+        .edit_step("auth", 1, "  hash passwords with argon2  ")
+        .expect("edit");
+    assert!(edited.done);
+    assert_eq!(edited.description, "hash passwords with argon2");
+    let again = ledger
+        .edit_step("auth", 1, "hash passwords with argon2")
+        .expect("noop");
+    assert_eq!(again.description, edited.description);
+    let after = ledger.context(Some("auth"), 20).expect("context");
+    assert_eq!(after.events.len(), before.events.len());
+    assert_eq!(
+        ledger
+            .edit_step("auth", 1, "   ")
+            .expect_err("blank")
+            .to_string(),
+        "text is required"
+    );
+    assert_eq!(
+        ledger
+            .edit_step("missing", 1, "text")
+            .expect_err("task")
+            .to_string(),
+        "no such task: missing"
+    );
+    assert_eq!(
+        ledger
+            .edit_step("auth", 9, "text")
+            .expect_err("step")
+            .to_string(),
+        "no such step: 9"
+    );
+}
+
 fn spawn_claim(
     path: PathBuf,
     by: &'static str,
