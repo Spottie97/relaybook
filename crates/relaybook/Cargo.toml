@@ -3,6 +3,12 @@ name = "relaybook"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Shared coordination ledger for coding agents"
 publish = false
 
@@ -11,7 +17,7 @@ name = "relaybook"
 path = "src/main.rs"
 
 [dependencies]
-relaybook-core = { path = "../core" }
+relaybook-core = { path = "../core", version = "0.1.0" }
 clap = { version = "4.6.7", features = ["derive"] }
 dialoguer = "0.11"
 serde = "1.0.229"

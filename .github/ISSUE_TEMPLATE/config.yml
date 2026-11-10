@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: README
+    url: https://github.com/Spottie97/relaybook#readme
+    about: Setup, the daily workflow, and auto mode are in the README.
+  - name: Discussions
+    url: https://github.com/Spottie97/relaybook/discussions
+    about: Ask a question in Discussions instead of opening an issue.
