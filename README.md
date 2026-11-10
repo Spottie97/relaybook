@@ -192,6 +192,19 @@ another event.
 
 ## Auto mode
 
+### Controls
+
+`/relaybook` in Claude Code or Cursor shows the current status and a menu. With arguments it runs the matching command. In a terminal, `relaybook mode` and `relaybook gates` show an arrow-key list when you leave the value off; Esc cancels.
+
+| Action | Slash command | Terminal |
+|---|---|---|
+| Show status and the menu | `/relaybook` | `relaybook status` |
+| Switch mode | `/relaybook mode auto` or `/relaybook mode manual` | `relaybook mode auto` or `relaybook mode` |
+| Checkpoints | `/relaybook gates none`, `/relaybook gates plan`, or `/relaybook gates plan,review` | `relaybook gates` or `relaybook gates plan` |
+| Start a run | `/relaybook run docs/prd.md` | `relaybook run docs/prd.md` |
+| Approve a checkpoint | `/relaybook approve` | `relaybook approve` |
+| Inbox | `/relaybook inbox` | `relaybook inbox` |
+
 Manual mode is the default. Auto mode spends plan usage: Claude plans and reviews, and Cursor implements, one task at a time, on a branch. Main changes only when you merge the pull request.
 
 Sign in to Claude Code and `cursor-agent` once. Then:
