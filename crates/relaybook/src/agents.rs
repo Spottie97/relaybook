@@ -93,6 +93,10 @@ pub(crate) fn call_claude(
         .arg(role.template())
         .arg("--allowedTools")
         .arg(CLAUDE_TOOLS)
+        .arg("--permission-mode")
+        .arg("default")
+        .arg("--disallowedTools")
+        .arg("Edit,Write,NotebookEdit")
         .env("RELAYBOOK_RUN_ID", run_id.to_string());
     if let Some(budget) = budget {
         command.arg("--max-budget-usd").arg(budget);

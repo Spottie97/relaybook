@@ -113,6 +113,10 @@ if printf '%s' "$*" | grep -q 'PRD:'; then
 else
   if [ __KIND__ = reopen ]; then
     "$RELAYBOOK" task reopen work --reason "try again"
+  elif [ __KIND__ = editdirty ]; then
+    echo more >> extra.txt
+    "$RELAYBOOK" report accept work
+    "$RELAYBOOK" run complete
   else
     "$RELAYBOOK" report accept work
     "$RELAYBOOK" run complete
@@ -140,6 +144,9 @@ case __KIND__ in
     ;;
   extra)
     echo leftover > extra.txt
+    ;;
+  editdirty)
+    echo before > extra.txt
     ;;
   switch)
     git checkout main
@@ -240,6 +247,13 @@ fn hands_off_run_opens_a_pr_and_leaves_main_untouched() {
             || args_contain(dir.path(), "claude.args", "--allowedTools")
     );
     assert!(args_contain(dir.path(), "claude.args", "Bash(relaybook:*)"));
+    assert!(args_contain(dir.path(), "claude.args", "--permission-mode"));
+    assert!(args_contain(dir.path(), "claude.args", "--disallowedTools"));
+    assert!(args_contain(
+        dir.path(),
+        "claude.args",
+        "Edit,Write,NotebookEdit"
+    ));
     assert!(!args_contain(dir.path(), "claude.args", "--max-budget-usd"));
     assert!(args_contain(dir.path(), "cursor.args", "--force"));
     assert!(args_contain(dir.path(), "gh.args", "pr create"));
@@ -417,6 +431,19 @@ fn claude_review_ignores_files_cursor_already_left_untracked() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(text.contains("opened https://example.test/pr/1"), "{text}");
+}
+
+#[test]
+fn review_that_edits_an_already_dirty_file_is_stopped() {
+    let dir = repo();
+    let output = run(dir.path(), "editdirty", &["run", "--prd", "prd.md"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("claude edited the worktree"),
+        "{text} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success());
 }
 
 #[test]
