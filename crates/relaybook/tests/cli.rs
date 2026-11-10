@@ -753,6 +753,62 @@ fn inbox_accepts_reopens_and_stays_out_of_default_context() {
 }
 
 #[test]
+fn hook_prompt_is_one_line_or_silent() {
+    let missing = tempfile::tempdir().expect("tempdir");
+    run(missing.path(), ["hook", "prompt"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["hook", "prompt"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(
+        dir.path(),
+        ["task", "done", "auth", "--changed", "added the hook"],
+    )
+    .assert()
+    .success();
+    run(
+        dir.path(),
+        ["task", "create", "billing", "--title", "Add billing"],
+    )
+    .assert()
+    .success();
+    run(
+        dir.path(),
+        ["task", "done", "billing", "--changed", "added the inbox"],
+    )
+    .assert()
+    .success();
+    run(dir.path(), ["hook", "prompt"])
+        .assert()
+        .success()
+        .stdout("2 new Cursor reports: relaybook inbox\n")
+        .stderr("");
+
+    let broken = dir.path().join(".relaybook").join("ledger.db");
+    fs::write(&broken, "not a sqlite database").expect("write");
+    run(dir.path(), ["hook", "prompt"])
+        .assert()
+        .success()
+        .stdout("")
+        .stderr("");
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");

@@ -30,6 +30,7 @@ impl From<std::io::Error> for Error {
 pub(crate) struct Options {
     pub no_graphify: bool,
     pub no_hooks: bool,
+    pub no_claude_hook: bool,
     pub ci: bool,
 }
 
@@ -50,6 +51,7 @@ pub(crate) fn run(cwd: &Path, options: Options) -> Result<Report, Error> {
     let mut steps = Vec::new();
     record_ledger(&root, &mut steps)?;
     record_docs(&root, &mut steps)?;
+    record_prompt_hook(&root, &options, &mut steps);
     record_graphify(&root, &options, &mut steps);
     record_hooks(&root, &options, &mut steps);
     record_rtk(&mut steps);
@@ -102,6 +104,27 @@ fn record_docs(root: &Path, steps: &mut Vec<Step>) -> Result<(), Error> {
         format!("{claude} CLAUDE.md, {cursor} AGENTS.md"),
     );
     Ok(())
+}
+
+fn record_prompt_hook(root: &Path, options: &Options, steps: &mut Vec<Step>) {
+    if options.no_claude_hook {
+        push(steps, "prompt hook", "skipped", "--no-claude-hook");
+        return;
+    }
+    match crate::claude_hook::install(root) {
+        Ok(crate::claude_hook::Status::Updated) => {
+            push(steps, "prompt hook", "done", "added UserPromptSubmit");
+        }
+        Ok(crate::claude_hook::Status::Unchanged) => {
+            push(
+                steps,
+                "prompt hook",
+                "skipped",
+                "UserPromptSubmit already installed",
+            );
+        }
+        Err(err) => push(steps, "prompt hook", "failed", err.to_string()),
+    }
 }
 
 fn record_graphify(root: &Path, options: &Options, steps: &mut Vec<Step>) {

@@ -422,6 +422,63 @@ fn python_hook_is_left_unchanged() {
     assert_eq!(fs::read_to_string(&rewrite).expect("rewrite"), body);
 }
 
+#[test]
+fn setup_merges_the_prompt_hook_without_duplicating_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let settings = dir.path().join(".claude").join("settings.json");
+    fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &settings,
+        r#"{"keep":true,"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"graphify"}]}]}}"#,
+    )
+    .expect("write");
+
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "prompt hook: done (added UserPromptSubmit)",
+        ));
+
+    let value: Value =
+        serde_json::from_str(&fs::read_to_string(&settings).expect("read")).expect("json");
+    assert_eq!(value["keep"], true);
+    assert_eq!(value["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+    assert_eq!(
+        value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "graphify"
+    );
+    let prompt = value["hooks"]["UserPromptSubmit"]
+        .as_array()
+        .expect("prompt");
+    assert_eq!(prompt.len(), 1);
+    assert_eq!(
+        prompt[0]["hooks"][0]["command"],
+        "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true"
+    );
+
+    let first = fs::read(&settings).expect("read");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "prompt hook: skipped (UserPromptSubmit already installed)",
+        ));
+    assert_eq!(fs::read(&settings).expect("read"), first);
+}
+
+#[test]
+fn no_claude_hook_skips_the_prompt_hook() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    setup_plain(dir.path(), &["setup", "--no-graphify", "--no-claude-hook"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "prompt hook: skipped (--no-claude-hook)",
+        ));
+    assert!(!dir.path().join(".claude").join("settings.json").exists());
+}
+
 fn setup(dir: &Path, bin: &Path, log: &Path, args: &[&str]) -> Command {
     let mut cmd = relaybook(dir);
     cmd.args(args);

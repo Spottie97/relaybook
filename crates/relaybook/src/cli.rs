@@ -115,6 +115,9 @@ enum Command {
         /// Skip git hook installation.
         #[arg(long)]
         no_hooks: bool,
+        /// Skip the Claude Code UserPromptSubmit hook.
+        #[arg(long)]
+        no_claude_hook: bool,
         /// Write the opt-in GitHub Actions workflow and graph.json merge driver.
         #[arg(long)]
         ci: bool,
@@ -426,12 +429,14 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Setup {
             no_graphify,
             no_hooks,
+            no_claude_hook,
             ci,
         } => setup_project(
             &cwd,
             setup::Options {
                 no_graphify,
                 no_hooks,
+                no_claude_hook,
                 ci,
             },
         ),
@@ -615,7 +620,7 @@ fn hook_prompt() {
     let Some(path) = paths::ledger_path(&cwd) else {
         return;
     };
-    let Ok(ledger) = Ledger::open(&path) else {
+    let Ok(ledger) = Ledger::open_readonly(&path) else {
         return;
     };
     let Ok(count) = ledger.unreviewed_count() else {

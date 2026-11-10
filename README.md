@@ -47,6 +47,7 @@ whenever you want: existing instruction blocks and hooks are left as they are.
 
 - `--no-graphify` skips every Graphify command and the pull hooks.
 - `--no-hooks` skips `graphify hook install` and the post-merge / post-rewrite hooks.
+- `--no-claude-hook` skips the project `UserPromptSubmit` hook that tells Claude to run `relaybook inbox`.
   The other Graphify commands still run.
 - `--ci` writes `.github/workflows/graphify-update.yml` and adds
   `graphify-out/graph.json merge=graphify` to `.gitattributes`. An existing workflow
@@ -141,7 +142,7 @@ relaybook step edit <slug> <n> --text "..."
 relaybook progress report <slug> --note "..."
 relaybook decision log <slug> --why "..." --by <agent>
 relaybook install --claude --cursor
-relaybook setup [--no-graphify] [--no-hooks] [--ci]
+relaybook setup [--no-graphify] [--no-hooks] [--no-claude-hook] [--ci]
 ```
 
 Slugs match `[a-z0-9]+(-[a-z0-9]+)*` and stay permanent. `task rename` changes the title
@@ -205,7 +206,8 @@ write acknowledgement exceeds 120 bytes, or an instruction block exceeds 600 byt
 Graphify (Apache-2.0, installed by default) keeps code questions on the graph instead
 of a full-repo read. RTK (Apache-2.0, maintained separately) compacts git, test, build,
 and grep output. Relaybook compacts the work ledger. Skip Graphify with `--no-graphify`.
-Skip the pull hooks with `--no-hooks`. RTK is opt-in:
+Skip the pull hooks with `--no-hooks`. Skip the Claude prompt hook with
+`--no-claude-hook`. RTK is opt-in:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --with-rtk

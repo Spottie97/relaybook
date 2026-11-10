@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 use crate::deps::{self, fill_dependencies};
 use crate::reports::{self, Sections};
@@ -48,6 +48,13 @@ impl Ledger {
         let mut conn = Connection::open(path)?;
         configure(&conn)?;
         migrate(&mut conn)?;
+        Ok(Self { conn })
+    }
+
+    /// Open without migrating. Used by the prompt hook, which must stay read-only.
+    pub fn open_readonly(path: &std::path::Path) -> Result<Self, Error> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        configure(&conn)?;
         Ok(Self { conn })
     }
 
