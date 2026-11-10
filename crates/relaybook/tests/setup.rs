@@ -5,6 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use assert_cmd::prelude::*;
+use predicates::prelude::PredicateBooleanExt;
 use serde_json::Value;
 
 #[test]
@@ -522,15 +523,72 @@ fn no_commands_skips_the_claude_command() {
     setup_plain(dir.path(), &["setup", "--no-graphify", "--no-commands"])
         .assert()
         .success()
-        .stdout(predicates::str::contains(
-            "claude command: skipped (--no-commands)",
-        ));
+        .stdout(
+            predicates::str::contains("claude command: skipped (--no-commands)").and(
+                predicates::str::contains("cursor command: skipped (--no-commands)"),
+            ),
+        );
     assert!(
         !dir.path()
             .join(".claude")
             .join("commands")
             .join("relaybook.md")
             .exists()
+    );
+    assert!(
+        !dir.path()
+            .join(".cursor")
+            .join("commands")
+            .join("relaybook.md")
+            .exists()
+    );
+}
+
+#[test]
+fn setup_installs_and_preserves_the_cursor_command() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir
+        .path()
+        .join(".cursor")
+        .join("commands")
+        .join("relaybook.md");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "cursor command: done (wrote .cursor/commands/relaybook.md)",
+        ));
+    let body = fs::read_to_string(&path).expect("command");
+    assert!(body.contains("relaybook:managed"), "{body}");
+    assert!(body.contains("relaybook status"), "{body}");
+
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "cursor command: skipped (already installed)",
+        ));
+    assert_eq!(fs::read_to_string(&path).expect("command"), body);
+
+    fs::write(&path, body.replace("/relaybook", "/old")).expect("edit");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "cursor command: done (wrote .cursor/commands/relaybook.md)",
+        ));
+    assert_eq!(fs::read_to_string(&path).expect("command"), body);
+
+    fs::write(&path, "custom cursor command\n").expect("custom");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "cursor command: skipped (file has no relaybook:managed marker)",
+        ));
+    assert_eq!(
+        fs::read_to_string(&path).expect("command"),
+        "custom cursor command\n"
     );
 }
 

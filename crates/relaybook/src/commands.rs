@@ -4,6 +4,7 @@ use std::path::Path;
 pub(crate) const MARKER: &str = "relaybook:managed";
 
 const CLAUDE_COMMAND: &str = include_str!("../templates/claude-command.md");
+const CURSOR_COMMAND: &str = include_str!("../templates/cursor-command.md");
 
 pub(crate) enum Status {
     Updated,
@@ -16,6 +17,14 @@ pub(crate) fn install_claude(root: &Path) -> std::io::Result<Status> {
         root,
         Path::new(".claude").join("commands").join("relaybook.md"),
         CLAUDE_COMMAND,
+    )
+}
+
+pub(crate) fn install_cursor(root: &Path) -> std::io::Result<Status> {
+    install(
+        root,
+        Path::new(".cursor").join("commands").join("relaybook.md"),
+        CURSOR_COMMAND,
     )
 }
 

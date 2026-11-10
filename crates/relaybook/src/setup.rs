@@ -113,29 +113,43 @@ fn record_docs(root: &Path, steps: &mut Vec<Step>) -> Result<(), Error> {
 fn record_commands(root: &Path, options: &Options, steps: &mut Vec<Step>) {
     if options.no_commands {
         push(steps, "claude command", "skipped", "--no-commands");
+        push(steps, "cursor command", "skipped", "--no-commands");
         return;
     }
-    match crate::commands::install_claude(root) {
-        Ok(crate::commands::Status::Updated) => {
-            push(
-                steps,
-                "claude command",
-                "done",
-                "wrote .claude/commands/relaybook.md",
-            );
-        }
+    record_one_command(
+        steps,
+        "claude command",
+        ".claude/commands/relaybook.md",
+        crate::commands::install_claude(root),
+    );
+    record_one_command(
+        steps,
+        "cursor command",
+        ".cursor/commands/relaybook.md",
+        crate::commands::install_cursor(root),
+    );
+}
+
+fn record_one_command(
+    steps: &mut Vec<Step>,
+    name: &str,
+    path: &str,
+    result: std::io::Result<crate::commands::Status>,
+) {
+    match result {
+        Ok(crate::commands::Status::Updated) => push(steps, name, "done", format!("wrote {path}")),
         Ok(crate::commands::Status::Unchanged) => {
-            push(steps, "claude command", "skipped", "already installed");
+            push(steps, name, "skipped", "already installed");
         }
         Ok(crate::commands::Status::LeftAlone) => {
             push(
                 steps,
-                "claude command",
+                name,
                 "skipped",
                 "file has no relaybook:managed marker",
             );
         }
-        Err(err) => push(steps, "claude command", "failed", err.to_string()),
+        Err(err) => push(steps, name, "failed", err.to_string()),
     }
 }
 

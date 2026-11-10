@@ -143,12 +143,14 @@ auto_planner=$(wc -c < "$root/crates/relaybook/templates/auto-planner.md" | tr -
 auto_reviewer=$(wc -c < "$root/crates/relaybook/templates/auto-reviewer.md" | tr -d ' ')
 auto_executor=$(wc -c < "$root/crates/relaybook/templates/auto-executor.md" | tr -d ' ')
 claude_command=$(wc -c < "$root/crates/relaybook/templates/claude-command.md" | tr -d ' ')
+cursor_command=$(wc -c < "$root/crates/relaybook/templates/cursor-command.md" | tr -d ' ')
 printf '%-32s %8s bytes %8s est\n' planner-block "$planner" "$((planner / 4))"
 printf '%-32s %8s bytes %8s est\n' executor-block "$executor" "$((executor / 4))"
 printf '%-32s %8s bytes %8s est\n' auto-planner "$auto_planner" "$((auto_planner / 4))"
 printf '%-32s %8s bytes %8s est\n' auto-reviewer "$auto_reviewer" "$((auto_reviewer / 4))"
 printf '%-32s %8s bytes %8s est\n' auto-executor "$auto_executor" "$((auto_executor / 4))"
 printf '%-32s %8s bytes %8s est\n' claude-command "$claude_command" "$((claude_command / 4))"
+printf '%-32s %8s bytes %8s est\n' cursor-command "$cursor_command" "$((cursor_command / 4))"
 
 if [ "$check" -eq 1 ]; then
   if [ "$planner" -gt 600 ] || [ "$executor" -gt 600 ]; then
@@ -161,8 +163,8 @@ if [ "$check" -eq 1 ]; then
       over=1
     fi
   done
-  if [ "$claude_command" -gt 1500 ]; then
-    echo "over budget: the claude command exceeds 1500 bytes" >&2
+  if [ "$claude_command" -gt 1500 ] || [ "$cursor_command" -gt 1500 ]; then
+    echo "over budget: a slash command exceeds 1500 bytes" >&2
     over=1
   fi
   if command -v rtk >/dev/null 2>&1; then
