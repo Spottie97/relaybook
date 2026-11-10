@@ -18,6 +18,8 @@ pub enum Error {
     ReportTooLarge { bytes: usize, limit: usize },
     ChangedRequired,
     ReportOrNone,
+    NotDone,
+    NoUnreviewed(String),
     NoSuchStep(i64),
     AlreadyReported(String),
     DatabaseBusy,
@@ -45,6 +47,8 @@ impl fmt::Display for Error {
             }
             Self::ChangedRequired => formatter.write_str("changed is required"),
             Self::ReportOrNone => formatter.write_str("pass either a report or --no-report"),
+            Self::NotDone => formatter.write_str("task is not done"),
+            Self::NoUnreviewed(target) => write!(formatter, "no unreviewed report: {target}"),
             Self::NoSuchStep(position) => write!(formatter, "no such step: {position}"),
             Self::AlreadyReported(sha) => write!(formatter, "already reported for {sha}"),
             Self::DatabaseBusy => formatter.write_str("database busy"),

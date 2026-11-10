@@ -16,8 +16,9 @@ if [ ! -x "$bin" ]; then
 fi
 
 work=$(mktemp -d)
+inbox_work=$(mktemp -d)
 cleanup() {
-  rm -rf "$work"
+  rm -rf "$work" "$inbox_work"
 }
 trap cleanup EXIT
 
@@ -64,6 +65,7 @@ measure() {
     case $label in
       context) limit=4000 ;;
       task-list) limit=1500 ;;
+      inbox) limit=2500 ;;
       write-*) limit=120 ;;
     esac
     if [ "$limit" -gt 0 ] && [ "$bytes" -gt "$limit" ]; then
@@ -117,6 +119,21 @@ measure write-block "$bin" task block sample --reason "paused"
 measure write-unblock "$bin" task unblock sample --note "resumed"
 # shellcheck disable=SC1010
 measure write-done "$bin" task done --no-report sample
+
+saved=$(pwd)
+cd "$inbox_work"
+"$bin" init >/dev/null
+for slug in one two three; do
+  "$bin" task create "$slug" --title "Report $slug" >/dev/null
+  # shellcheck disable=SC1010
+  "$bin" task done "$slug" \
+    --changed "landed $slug" \
+    --verified "cargo test" \
+    --not-verified "live ci" \
+    --review "read the diff" >/dev/null
+done
+measure inbox "$bin" inbox
+cd "$saved"
 
 planner=$(wc -c < "$root/crates/relaybook/templates/claude.md" | tr -d ' ')
 executor=$(wc -c < "$root/crates/relaybook/templates/agents.md" | tr -d ' ')

@@ -128,6 +128,9 @@ impl Ledger {
         let rows = stmt.query_map(params![status_text], read_task_row)?;
         let mut tasks = collect_tasks(rows)?;
         fill_dependencies(&self.conn, &mut tasks)?;
+        for task in &mut tasks {
+            task.reopened = reports::reopened_reason(&self.conn, task.id)?;
+        }
         if ready {
             tasks.retain(|task| task.status == Status::Open && task.needs.is_empty());
         } else if status.is_none() && !include_done {
@@ -215,6 +218,68 @@ impl Ledger {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
             reports::insert(conn, Some(task.id), "task", &author, &body, &ts)?;
+            load_task(conn, &slug)
+        })
+    }
+
+    pub fn inbox(&self) -> Result<Vec<reports::InboxItem>, Error> {
+        reports::list_unreviewed(&self.conn)
+    }
+
+    pub fn unreviewed_count(&self) -> Result<usize, Error> {
+        reports::count_unreviewed(&self.conn)
+    }
+
+    pub fn accept_report(&mut self, slug: &str) -> Result<usize, Error> {
+        let slug = checked_slug(slug)?;
+        self.transaction(|conn| {
+            let task = load_task(conn, &slug)?;
+            let changed = reports::accept_task(conn, task.id, &now(conn)?)?;
+            if changed == 0 {
+                return Err(Error::NoUnreviewed(slug));
+            }
+            Ok(changed)
+        })
+    }
+
+    pub fn accept_note(&mut self, id: i64) -> Result<(), Error> {
+        self.transaction(|conn| {
+            let changed = reports::accept_note(conn, id, &now(conn)?)?;
+            if changed == 0 {
+                return Err(Error::NoUnreviewed(id.to_string()));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn accept_all_reports(&mut self) -> Result<usize, Error> {
+        self.transaction(|conn| reports::accept_all(conn, &now(conn)?))
+    }
+
+    pub fn reopen_task(&mut self, slug: &str, reason: &str) -> Result<Task, Error> {
+        let slug = checked_slug(slug)?;
+        let reason = required_text("reason", reason)?;
+        self.transaction(|conn| {
+            let task = load_task(conn, &slug)?;
+            if task.status != Status::Done {
+                return Err(Error::NotDone);
+            }
+            let ts = now(conn)?;
+            conn.execute(
+                "UPDATE tasks SET status = 'open', updated_at = ?1 WHERE id = ?2",
+                params![ts, task.id],
+            )?;
+            insert_event(
+                conn,
+                EventKind::StatusChanged,
+                serde_json::json!({
+                    "slug": slug,
+                    "from": "done",
+                    "to": "open",
+                    "reason": reason,
+                }),
+            )?;
+            reports::mark_latest_reopened(conn, task.id, &reason, &ts)?;
             load_task(conn, &slug)
         })
     }
@@ -462,10 +527,22 @@ impl Ledger {
             Some(limit) => self.recent_events(slug.as_deref(), limit)?,
             None => Vec::new(),
         };
+        let unreviewed_reports = reports::count_unreviewed(&self.conn)?;
+        let latest_report = if slug.is_some() {
+            tasks
+                .first()
+                .map(|detail| reports::latest_body(&self.conn, detail.task.id))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
         Ok(Context {
             tasks,
             events,
             hidden_done,
+            unreviewed_reports,
+            latest_report,
         })
     }
 
@@ -622,6 +699,7 @@ fn load_task(conn: &Connection, slug: &str) -> Result<Task, Error> {
     };
     let mut task = into_task(row)?;
     fill_dependencies(conn, std::slice::from_mut(&mut task))?;
+    task.reopened = reports::reopened_reason(conn, task.id)?;
     Ok(task)
 }
 
@@ -700,6 +778,7 @@ fn into_task(row: TaskRow) -> Result<Task, Error> {
         title: row.title,
         status: row.status.parse()?,
         claimed_by: row.claimed_by,
+        reopened: None,
         created_at: row.created_at,
         updated_at: row.updated_at,
         depends_on: Vec::new(),

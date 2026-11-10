@@ -17,4 +17,4 @@ pub use model::{
     Context, Decision, Event, EventKind, RECENT_EVENT_LIMIT, Status, Step, Task, TaskDetail,
 };
 pub use replay::{ReplayedDecision, ReplayedTask, replay};
-pub use reports::Sections;
+pub use reports::{InboxItem, Sections};

@@ -11,12 +11,13 @@ pub(crate) fn tasks(tasks: &[Task]) -> String {
         let by = task.claimed_by.as_deref().unwrap_or("-");
         let _ = writeln!(
             out,
-            "{:<8} {:<24} {:<16} {}{}",
+            "{:<8} {:<24} {:<16} {}{}{}",
             task.status,
             task.slug,
             by,
             task.title,
-            needs_suffix(task)
+            needs_suffix(task),
+            reopened_suffix(task)
         );
     }
     out
@@ -29,6 +30,16 @@ pub(crate) fn context(ctx: &Context, compact: bool, summarize_events: bool) -> S
     }
     for detail in &ctx.tasks {
         write_task(&mut out, detail, compact);
+    }
+    if let Some(report) = &ctx.latest_report {
+        write_report(&mut out, report);
+    }
+    if compact && ctx.unreviewed_reports > 0 {
+        let _ = writeln!(
+            out,
+            "{} unreviewed reports (relaybook inbox)",
+            ctx.unreviewed_reports
+        );
     }
     if compact && ctx.hidden_done > 0 {
         let _ = writeln!(
@@ -60,11 +71,12 @@ fn write_task(out: &mut String, detail: &relaybook_core::TaskDetail, compact: bo
     };
     let _ = writeln!(
         out,
-        "{} [{}] {}{by}{}",
+        "{} [{}] {}{by}{}{}",
         task.slug,
         task.status,
         task.title,
-        needs_suffix(task)
+        needs_suffix(task),
+        reopened_suffix(task)
     );
     if compact {
         write_compact_steps(out, detail);
@@ -147,6 +159,64 @@ pub(crate) fn line(text: &str) -> String {
     format!("{text}\n")
 }
 
+fn reopened_suffix(task: &Task) -> String {
+    match &task.reopened {
+        Some(reason) => format!(" reopened: {reason}"),
+        None => String::new(),
+    }
+}
+
+fn write_report(out: &mut String, report: &serde_json::Value) {
+    for key in [
+        "changed",
+        "verified",
+        "not_verified",
+        "deviations",
+        "review",
+    ] {
+        let Some(lines) = report.get(key).and_then(|value| value.as_array()) else {
+            continue;
+        };
+        if lines.is_empty() {
+            continue;
+        }
+        let _ = writeln!(out, "  {key}:");
+        for line in lines {
+            if let Some(text) = line.as_str() {
+                let _ = writeln!(out, "  - {text}");
+            }
+        }
+    }
+}
+
+pub(crate) fn inbox(items: &[relaybook_core::InboxItem]) -> String {
+    if items.is_empty() {
+        return "inbox empty\n".to_string();
+    }
+    let mut out = String::new();
+    for item in items {
+        match item.kind.as_str() {
+            "note" => {
+                let _ = writeln!(out, "note {} by {}", item.id, item.author);
+                if let Some(text) = item.body.get("text").and_then(|value| value.as_str()) {
+                    let _ = writeln!(out, "  - {text}");
+                }
+            }
+            _ => {
+                let slug = item.slug.as_deref().unwrap_or("-");
+                let title = item.title.as_deref().unwrap_or("");
+                let _ = writeln!(out, "{slug} {title} by {}", item.author);
+                write_report(&mut out, &item.body);
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "relaybook report accept <slug> | relaybook report accept --note <id> | relaybook task reopen <slug> --reason \"...\""
+    );
+    out
+}
+
 fn needs_suffix(task: &Task) -> String {
     if task.needs.is_empty() {
         String::new()
@@ -171,6 +241,7 @@ mod tests {
             updated_at: "t".to_string(),
             depends_on: Vec::new(),
             needs: Vec::new(),
+            reopened: None,
         }
     }
 
@@ -218,6 +289,8 @@ mod tests {
                     payload: serde_json::json!({"slug": "auth"}),
                 }],
                 hidden_done: 0,
+                unreviewed_reports: 0,
+                latest_report: None,
             },
             false,
             false,
@@ -270,6 +343,8 @@ mod tests {
                 }],
                 events: Vec::new(),
                 hidden_done: 2,
+                unreviewed_reports: 0,
+                latest_report: None,
             },
             true,
             false,

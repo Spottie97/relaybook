@@ -618,6 +618,141 @@ fn task_done_stores_a_report_and_rejects_a_long_one() {
 }
 
 #[test]
+fn inbox_accepts_reopens_and_stays_out_of_default_context() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["inbox"])
+        .assert()
+        .success()
+        .stdout("inbox empty\n");
+
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(
+        dir.path(),
+        ["task", "create", "billing", "--title", "Add billing"],
+    )
+    .assert()
+    .success();
+    run(
+        dir.path(),
+        ["task", "done", "auth", "--changed", "added reports"],
+    )
+    .assert()
+    .success();
+    run(
+        dir.path(),
+        ["task", "done", "billing", "--changed", "added inbox"],
+    )
+    .assert()
+    .success();
+    run(
+        dir.path(),
+        ["report", "note", "--by", "cursor", "--text", "spans tasks"],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("noted 3"));
+
+    let inbox = run(dir.path(), ["inbox"]).assert().success();
+    let inbox = String::from_utf8(inbox.get_output().stdout.clone()).expect("utf8");
+    let auth_at = inbox.find("auth Add auth").expect("auth report");
+    let billing_at = inbox.find("billing Add billing").expect("billing report");
+    let note_at = inbox.find("note 3 by cursor").expect("note");
+    assert!(auth_at < billing_at && billing_at < note_at, "{inbox}");
+    assert!(inbox.contains("added reports"), "{inbox}");
+    assert!(inbox.contains("relaybook report accept <slug>"), "{inbox}");
+
+    let overview = run(dir.path(), ["context"]).assert().success();
+    let overview = String::from_utf8(overview.get_output().stdout.clone()).expect("utf8");
+    assert!(
+        overview.contains("3 unreviewed reports (relaybook inbox)"),
+        "{overview}"
+    );
+    assert!(!overview.contains("added reports"), "{overview}");
+
+    let auth = run(dir.path(), ["context", "auth"]).assert().success();
+    let auth = String::from_utf8(auth.get_output().stdout.clone()).expect("utf8");
+    assert!(auth.contains("added reports"), "{auth}");
+
+    let data = json_data(dir.path(), ["context", "--json"]);
+    assert_eq!(data["unreviewed_reports"], 3);
+
+    run(dir.path(), ["report", "accept", "auth"])
+        .assert()
+        .success()
+        .stdout("accepted auth\n");
+    run(dir.path(), ["report", "accept", "--note", "3"])
+        .assert()
+        .success()
+        .stdout("accepted note 3\n");
+    run(dir.path(), ["report", "accept", "--all"])
+        .assert()
+        .success()
+        .stdout("accepted 1\n");
+    run(dir.path(), ["inbox"])
+        .assert()
+        .success()
+        .stdout("inbox empty\n");
+
+    run(
+        dir.path(),
+        [
+            "task",
+            "reopen",
+            "billing",
+            "--reason",
+            "cover the empty inbox",
+        ],
+    )
+    .assert()
+    .success()
+    .stdout("reopened billing\n");
+    run(dir.path(), ["task", "list", "--ready"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("billing"))
+        .stdout(predicate::str::contains("reopened: cover the empty inbox"));
+    run(dir.path(), ["context", "billing"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reopened: cover the empty inbox"));
+    run(
+        dir.path(),
+        ["task", "reopen", "billing", "--reason", "again"],
+    )
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("task is not done"));
+
+    run(
+        dir.path(),
+        [
+            "task",
+            "done",
+            "billing",
+            "--changed",
+            "covered empty inbox",
+        ],
+    )
+    .assert()
+    .success();
+    run(dir.path(), ["task", "list", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reopened:").not());
+    run(dir.path(), ["context", "billing"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("covered empty inbox"))
+        .stdout(predicate::str::contains("reopened:").not());
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");

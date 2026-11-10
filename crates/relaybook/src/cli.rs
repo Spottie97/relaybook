@@ -16,6 +16,10 @@ pub(crate) fn execute() -> ExitCode {
         Err(err) => err.exit(),
     };
     let json = cli.json;
+    if matches!(&cli.command, Command::Hook(HookCmd::Prompt)) {
+        hook_prompt();
+        return ExitCode::SUCCESS;
+    }
     if let Err(err) = announce_legacy_move() {
         if json {
             print!("{}", envelope(false, None, Some(&err.to_string())));
@@ -90,6 +94,10 @@ enum Command {
     Decision(DecisionCmd),
     #[command(subcommand)]
     Report(ReportCmd),
+    /// List unreviewed reports.
+    Inbox,
+    #[command(subcommand)]
+    Hook(HookCmd),
     /// Append coordination instructions to CLAUDE.md and AGENTS.md.
     Install {
         /// Append the planner block to CLAUDE.md.
@@ -153,6 +161,12 @@ enum TaskCmd {
         #[arg(long)]
         by: String,
     },
+    /// Send a done task back to the ready list.
+    Reopen {
+        slug: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Mark a task done and attach a short report.
     Done {
         slug: String,
@@ -196,7 +210,23 @@ enum TaskCmd {
 }
 
 #[derive(Subcommand)]
+enum HookCmd {
+    /// Print one line when unreviewed reports are waiting. Always exits 0.
+    Prompt,
+}
+
+#[derive(Subcommand)]
 enum ReportCmd {
+    /// Mark a task report reviewed.
+    Accept {
+        slug: Option<String>,
+        /// Accept a session note by id.
+        #[arg(long)]
+        note: Option<i64>,
+        /// Accept every unreviewed report.
+        #[arg(long)]
+        all: bool,
+    },
     /// Record a short note that is not tied to one task.
     Note {
         #[arg(long)]
@@ -347,6 +377,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Task(TaskCmd::Depend { slug, on }) => depend(&cwd, &slug, &on),
         Command::Task(TaskCmd::Undepend { slug, on }) => undepend(&cwd, &slug, &on),
         Command::Task(TaskCmd::Claim { slug, by }) => claim_task(&cwd, &slug, &by),
+        Command::Task(TaskCmd::Reopen { slug, reason }) => reopen_task(&cwd, &slug, &reason),
         Command::Task(TaskCmd::Done {
             slug,
             changed,
@@ -380,7 +411,17 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Decision(DecisionCmd::Log { slug, why, by }) => {
             log_decision(&cwd, &slug, &why, &by)
         }
+        Command::Report(ReportCmd::Accept { slug, note, all }) => {
+            accept_report(&cwd, slug.as_deref(), note, all)
+        }
         Command::Report(ReportCmd::Note { by, text }) => add_note(&cwd, &by, text),
+        Command::Inbox => show_inbox(&cwd),
+        Command::Hook(HookCmd::Prompt) => Ok(Outcome {
+            human: String::new(),
+            data: serde_json::json!({}),
+            error: None,
+            code: 0,
+        }),
         Command::Install { claude, cursor } => install_docs(&cwd, claude, cursor),
         Command::Setup {
             no_graphify,
@@ -520,6 +561,69 @@ fn complete_task(
     let task = ledger.finish_task(slug, sections)?;
     let human = render::line(&format!("done {}", task.slug));
     json_outcome(task_ack(&task), human)
+}
+
+fn reopen_task(cwd: &Path, slug: &str, reason: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let task = ledger.reopen_task(slug, reason)?;
+    let human = render::line(&format!("reopened {}", task.slug));
+    json_outcome(task_ack(&task), human)
+}
+
+fn show_inbox(cwd: &Path) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let items = ledger.inbox()?;
+    let human = render::inbox(&items);
+    json_outcome(serde_json::json!({ "reports": items }), human)
+}
+
+fn accept_report(
+    cwd: &Path,
+    slug: Option<&str>,
+    note: Option<i64>,
+    all: bool,
+) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    if all {
+        let count = ledger.accept_all_reports()?;
+        return json_outcome(
+            serde_json::json!({ "accepted": count }),
+            render::line(&format!("accepted {count}")),
+        );
+    }
+    if let Some(id) = note {
+        ledger.accept_note(id)?;
+        return json_outcome(
+            serde_json::json!({ "id": id, "verdict": "accepted" }),
+            render::line(&format!("accepted note {id}")),
+        );
+    }
+    let Some(slug) = slug else {
+        return Err(Fail::Usage("pass a slug, --note, or --all".to_string()));
+    };
+    ledger.accept_report(slug)?;
+    json_outcome(
+        serde_json::json!({ "slug": slug, "verdict": "accepted" }),
+        render::line(&format!("accepted {slug}")),
+    )
+}
+
+fn hook_prompt() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Some(path) = paths::ledger_path(&cwd) else {
+        return;
+    };
+    let Ok(ledger) = Ledger::open(&path) else {
+        return;
+    };
+    let Ok(count) = ledger.unreviewed_count() else {
+        return;
+    };
+    if count > 0 {
+        println!("{count} new Cursor reports: relaybook inbox");
+    }
 }
 
 fn kept_lines(lines: &[String]) -> Vec<String> {

@@ -103,6 +103,7 @@ pub struct Task {
     pub title: String,
     pub status: Status,
     pub claimed_by: Option<String>,
+    pub reopened: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub depends_on: Vec<String>,
@@ -148,6 +149,8 @@ pub struct Context {
     pub tasks: Vec<TaskDetail>,
     pub events: Vec<Event>,
     pub hidden_done: usize,
+    pub unreviewed_reports: usize,
+    pub latest_report: Option<serde_json::Value>,
 }
 
 pub(crate) fn checked_slug(slug: &str) -> Result<String, Error> {
