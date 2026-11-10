@@ -10,3 +10,4 @@ and update it as you go.
 4. If reality forces a deviation from the plan: `relaybook decision log <slug> --why
    "..." --by cursor` before continuing.
 5. `relaybook task done <slug>` when the checklist is complete.
+6. `relaybook task unblock <slug>` when the blocking reason is resolved.

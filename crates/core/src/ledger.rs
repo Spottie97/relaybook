@@ -200,6 +200,41 @@ impl Ledger {
         })
     }
 
+    pub fn unblock_task(&mut self, slug: &str, note: Option<&str>) -> Result<Task, Error> {
+        let slug = checked_slug(slug)?;
+        let note = match note {
+            Some(value) => Some(required_text("note", value)?),
+            None => None,
+        };
+        self.transaction(|conn| {
+            let task = load_task(conn, &slug)?;
+            if task.status != Status::Blocked {
+                return Ok(task);
+            }
+            let to = if task.claimed_by.is_some() {
+                "claimed"
+            } else {
+                "open"
+            };
+            let ts = now(conn)?;
+            conn.execute(
+                "UPDATE tasks SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![to, ts, task.id],
+            )?;
+            insert_event(
+                conn,
+                EventKind::StatusChanged,
+                serde_json::json!({
+                    "slug": slug,
+                    "from": "blocked",
+                    "to": to,
+                    "note": note,
+                }),
+            )?;
+            load_task(conn, &slug)
+        })
+    }
+
     pub fn rename_task(&mut self, slug: &str, title: &str) -> Result<Task, Error> {
         let slug = checked_slug(slug)?;
         let title = required_text("title", title)?;

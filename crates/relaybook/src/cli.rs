@@ -148,6 +148,12 @@ enum TaskCmd {
         #[arg(long)]
         reason: String,
     },
+    /// Return a blocked task to open, or to claimed when it still has an owner.
+    Unblock {
+        slug: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
     /// Change a task's title. The slug stays the same.
     Rename {
         slug: String,
@@ -290,6 +296,9 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Task(TaskCmd::Claim { slug, by }) => claim_task(&cwd, &slug, &by),
         Command::Task(TaskCmd::Done { slug }) => complete_task(&cwd, &slug),
         Command::Task(TaskCmd::Block { slug, reason }) => block_task(&cwd, &slug, &reason),
+        Command::Task(TaskCmd::Unblock { slug, note }) => {
+            unblock_task(&cwd, &slug, note.as_deref())
+        }
         Command::Task(TaskCmd::Rename { slug, title }) => rename_task(&cwd, &slug, &title),
         Command::Step(StepCmd::Add { slug, description }) => add_step(&cwd, &slug, &description),
         Command::Step(StepCmd::Check { slug, n }) => check_step(&cwd, &slug, n),
@@ -389,6 +398,13 @@ fn block_task(cwd: &Path, slug: &str, reason: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.block_task(slug, reason)?;
     let human = render::line(&format!("blocked {}: {reason}", task.slug));
+    json_outcome(task, human)
+}
+
+fn unblock_task(cwd: &Path, slug: &str, note: Option<&str>) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let task = ledger.unblock_task(slug, note)?;
+    let human = render::line(&format!("unblocked {}", task.slug));
     json_outcome(task, human)
 }
 

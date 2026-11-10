@@ -358,6 +358,50 @@ fn rename_keeps_the_slug_and_shows_the_new_title() {
 }
 
 #[test]
+fn unblock_returns_claimed_or_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success();
+    run(dir.path(), ["task", "block", "auth", "--reason", "waiting"])
+        .assert()
+        .success();
+    let task = json_data(
+        dir.path(),
+        ["task", "unblock", "auth", "--note", "ready", "--json"],
+    );
+    assert_eq!(task["status"], "claimed");
+    assert_eq!(task["slug"], "auth");
+    let held = json_data(dir.path(), ["context", "auth", "--json"]);
+    assert_eq!(held["tasks"][0]["claimed_by"], "cursor");
+    run(dir.path(), ["task", "unblock", "auth"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unblocked auth"));
+
+    run(dir.path(), ["task", "create", "other", "--title", "Other"])
+        .assert()
+        .success();
+    run(dir.path(), ["task", "block", "other", "--reason", "stuck"])
+        .assert()
+        .success();
+    let opened = json_data(dir.path(), ["task", "unblock", "other", "--json"]);
+    assert_eq!(opened["status"], "open");
+    run(dir.path(), ["task", "unblock", "missing"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("no such task: missing"));
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");

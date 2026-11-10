@@ -326,6 +326,56 @@ fn rename_updates_any_status_and_skips_an_unchanged_title() {
     assert_eq!(done.title, "Add login later");
 }
 
+#[test]
+fn unblock_restores_the_owner_and_ignores_other_statuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+
+    ledger.create_task("auth", "Add auth").expect("create");
+    ledger.claim_task("auth", "cursor").expect("claim");
+    ledger.block_task("auth", "waiting").expect("block");
+    let restored = ledger
+        .unblock_task("auth", Some("schema landed"))
+        .expect("unblock");
+    assert_eq!(restored.status, Status::Claimed);
+    assert_eq!(restored.claimed_by.as_deref(), Some("cursor"));
+    let ctx = ledger.context(Some("auth"), 20).expect("context");
+    let change = ctx
+        .events
+        .iter()
+        .find(|event| event.payload["to"] == "claimed")
+        .expect("event");
+    assert_eq!(change.payload["from"], "blocked");
+    assert_eq!(change.payload["note"], "schema landed");
+    let replayed = replay(&ctx.events).expect("replay");
+    assert_eq!(replayed[0].status, Status::Claimed);
+
+    let again = ledger.unblock_task("auth", None).expect("noop");
+    assert_eq!(again.status, Status::Claimed);
+    let after = ledger.context(Some("auth"), 20).expect("context");
+    let claimed_changes = after
+        .events
+        .iter()
+        .filter(|event| event.payload["to"] == "claimed")
+        .count();
+    assert_eq!(claimed_changes, 1);
+
+    ledger.create_task("open", "Open").expect("create");
+    ledger.block_task("open", "stuck").expect("block");
+    let opened = ledger.unblock_task("open", None).expect("open");
+    assert_eq!(opened.status, Status::Open);
+    assert!(opened.claimed_by.is_none());
+
+    assert_eq!(
+        ledger
+            .unblock_task("missing", None)
+            .expect_err("missing")
+            .to_string(),
+        "no such task: missing"
+    );
+}
+
 fn spawn_claim(
     path: PathBuf,
     by: &'static str,

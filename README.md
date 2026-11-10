@@ -132,6 +132,7 @@ relaybook task depend <slug> --on <slug>
 relaybook task undepend <slug> --on <slug>
 relaybook task claim <slug> --by <agent>
 relaybook task block <slug> --reason "..."
+relaybook task unblock <slug> [--note "..."]
 relaybook task rename <slug> --title "..."
 relaybook task done <slug>
 relaybook step add <slug> "..."
