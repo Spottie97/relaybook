@@ -167,7 +167,7 @@ pub(crate) fn required_text(field: &'static str, value: &str) -> Result<String, 
 
 #[cfg(test)]
 mod tests {
-    use super::checked_slug;
+    use super::{EventKind, Status, checked_slug, required_text};
 
     #[test]
     fn accepts_lowercase_slugs() {
@@ -189,5 +189,37 @@ mod tests {
         ] {
             assert!(checked_slug(slug).is_err(), "{slug}");
         }
+    }
+
+    #[test]
+    fn status_and_kind_roundtrip() {
+        for status in [Status::Open, Status::Claimed, Status::Done, Status::Blocked] {
+            let parsed: Status = status.as_str().parse().expect("status");
+            assert_eq!(parsed, status);
+        }
+        assert!("nope".parse::<Status>().is_err());
+        for kind in [
+            EventKind::TaskCreated,
+            EventKind::Claimed,
+            EventKind::Progress,
+            EventKind::Decision,
+            EventKind::StatusChanged,
+        ] {
+            let parsed: EventKind = kind.as_str().parse().expect("kind");
+            assert_eq!(parsed, kind);
+        }
+        assert!("nope".parse::<EventKind>().is_err());
+    }
+
+    #[test]
+    fn required_text_trims_and_rejects_blank() {
+        assert_eq!(
+            required_text("title", "  Add auth  ").expect("title"),
+            "Add auth"
+        );
+        assert_eq!(
+            required_text("note", " \n").expect_err("blank").to_string(),
+            "note is required"
+        );
     }
 }

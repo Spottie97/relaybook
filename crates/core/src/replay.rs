@@ -91,3 +91,119 @@ fn required_str(payload: &serde_json::Value, key: &str) -> Result<String, Error>
         .map(ToOwned::to_owned)
         .ok_or_else(|| Error::BadEvent(format!("missing {key}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{EventKind, Status, replay};
+    use crate::model::Event;
+    use serde_json::json;
+
+    fn event(id: i64, kind: EventKind, payload: serde_json::Value) -> Event {
+        Event {
+            id,
+            ts: "2026-01-01T00:00:00.000Z".to_string(),
+            kind,
+            payload,
+        }
+    }
+
+    #[test]
+    fn folds_in_id_order_and_ignores_progress() {
+        let events = vec![
+            event(
+                3,
+                EventKind::Progress,
+                json!({"slug": "auth", "note": "half", "commit": "abc"}),
+            ),
+            event(
+                1,
+                EventKind::TaskCreated,
+                json!({"slug": "auth", "title": "Add auth"}),
+            ),
+            event(
+                4,
+                EventKind::StatusChanged,
+                json!({"slug": "auth", "from": "claimed", "to": "done"}),
+            ),
+            event(
+                2,
+                EventKind::Claimed,
+                json!({"slug": "auth", "by": "cursor"}),
+            ),
+            event(
+                5,
+                EventKind::Decision,
+                json!({"slug": "auth", "why": "use argon2", "by": "claude-code"}),
+            ),
+        ];
+        let tasks = replay(&events).expect("replay");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Add auth");
+        assert_eq!(tasks[0].status, Status::Done);
+        assert_eq!(tasks[0].claimed_by.as_deref(), Some("cursor"));
+        assert_eq!(tasks[0].decisions[0].rationale, "use argon2");
+        assert_eq!(tasks[0].decisions[0].provenance, "claude-code");
+    }
+
+    #[test]
+    fn progress_does_not_create_a_task() {
+        let events = vec![event(
+            1,
+            EventKind::Progress,
+            json!({"slug": "auth", "note": "note", "commit": null}),
+        )];
+        assert!(replay(&events).expect("replay").is_empty());
+    }
+
+    #[test]
+    fn duplicate_create_and_unknown_claim_fail() {
+        let created = event(
+            1,
+            EventKind::TaskCreated,
+            json!({"slug": "auth", "title": "Add auth"}),
+        );
+        let duplicate = event(
+            2,
+            EventKind::TaskCreated,
+            json!({"slug": "auth", "title": "Again"}),
+        );
+        assert!(replay(&[created.clone(), duplicate]).is_err());
+        let claim = event(
+            2,
+            EventKind::Claimed,
+            json!({"slug": "missing", "by": "cursor"}),
+        );
+        assert!(replay(&[claim]).is_err());
+    }
+
+    #[test]
+    fn missing_or_empty_fields_fail() {
+        let missing = event(1, EventKind::TaskCreated, json!({"slug": "auth"}));
+        assert!(replay(&[missing]).is_err());
+        let empty = event(
+            1,
+            EventKind::TaskCreated,
+            json!({"slug": "auth", "title": ""}),
+        );
+        assert!(replay(&[empty]).is_err());
+    }
+
+    #[test]
+    fn status_can_move_to_blocked() {
+        let events = [
+            event(
+                1,
+                EventKind::TaskCreated,
+                json!({"slug": "auth", "title": "Add auth"}),
+            ),
+            event(
+                2,
+                EventKind::StatusChanged,
+                json!({"slug": "auth", "from": "open", "to": "blocked"}),
+            ),
+        ];
+        let tasks = replay(&events).expect("replay");
+        assert_eq!(tasks[0].status, Status::Blocked);
+        assert_eq!(tasks[0].claimed_by, None);
+    }
+}

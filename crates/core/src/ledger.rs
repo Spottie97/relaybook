@@ -514,3 +514,119 @@ fn constraint_message(err: &rusqlite::Error) -> Option<&str> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Ledger;
+    use crate::model::{EventKind, Status};
+
+    fn open_ledger() -> (tempfile::TempDir, Ledger) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::initialize(&dir.path().join("ledger.db")).expect("init");
+        (dir, ledger)
+    }
+
+    #[test]
+    fn rejects_bad_slug_and_blank_title() {
+        let (_dir, mut ledger) = open_ledger();
+        assert_eq!(
+            ledger
+                .create_task("Auth", "Add auth")
+                .expect_err("slug")
+                .to_string(),
+            "invalid slug: Auth"
+        );
+        assert_eq!(
+            ledger
+                .create_task("auth", "  ")
+                .expect_err("title")
+                .to_string(),
+            "title is required"
+        );
+    }
+
+    #[test]
+    fn duplicate_slug_names_the_task() {
+        let (_dir, mut ledger) = open_ledger();
+        ledger.create_task("auth", "Add auth").expect("create");
+        assert_eq!(
+            ledger
+                .create_task("auth", "Again")
+                .expect_err("dup")
+                .to_string(),
+            "task already exists: auth"
+        );
+    }
+
+    #[test]
+    fn missing_claim_and_second_claim_use_distinct_errors() {
+        let (_dir, mut ledger) = open_ledger();
+        assert_eq!(
+            ledger
+                .claim_task("auth", "cursor")
+                .expect_err("missing")
+                .to_string(),
+            "no such task: auth"
+        );
+        ledger.create_task("auth", "Add auth").expect("create");
+        ledger.claim_task("auth", "cursor").expect("claim");
+        assert_eq!(
+            ledger
+                .claim_task("auth", "other")
+                .expect_err("taken")
+                .to_string(),
+            "already claimed"
+        );
+    }
+
+    #[test]
+    fn steps_start_at_one_and_unknown_positions_fail() {
+        let (_dir, mut ledger) = open_ledger();
+        ledger.create_task("auth", "Add auth").expect("create");
+        let first = ledger.add_step("auth", "hash passwords").expect("step");
+        let second = ledger.add_step("auth", "write tests").expect("step");
+        assert_eq!(first.position, 1);
+        assert_eq!(second.position, 2);
+        assert!(!first.done);
+        let checked = ledger.check_step("auth", 1).expect("check");
+        assert!(checked.done);
+        assert_eq!(
+            ledger
+                .check_step("auth", 9)
+                .expect_err("missing")
+                .to_string(),
+            "no such step: 9"
+        );
+    }
+
+    #[test]
+    fn list_filters_status_and_done_is_idempotent() {
+        let (_dir, mut ledger) = open_ledger();
+        ledger.create_task("auth", "Add auth").expect("create");
+        ledger
+            .create_task("ledger", "Open the ledger")
+            .expect("create");
+        ledger.claim_task("auth", "cursor").expect("claim");
+        let open = ledger.list_tasks(Some(Status::Open)).expect("list");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].slug, "ledger");
+        ledger.complete_task("auth").expect("done");
+        let before = ledger.context(Some("auth"), 20).expect("context");
+        let status_events = before
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::StatusChanged)
+            .count();
+        ledger.complete_task("auth").expect("done again");
+        let after = ledger.context(Some("auth"), 20).expect("context");
+        assert_eq!(
+            after
+                .events
+                .iter()
+                .filter(|event| event.kind == EventKind::StatusChanged)
+                .count(),
+            status_events
+        );
+        assert_eq!(after.tasks[0].task.status, Status::Done);
+    }
+}

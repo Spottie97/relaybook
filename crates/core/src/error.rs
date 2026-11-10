@@ -66,3 +66,36 @@ impl From<std::io::Error> for Error {
         Self::Io(err)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn messages_match_the_cli_contract() {
+        assert_eq!(Error::AlreadyClaimed.to_string(), "already claimed");
+        assert_eq!(
+            Error::AlreadyReported("abc".to_string()).to_string(),
+            "already reported for abc"
+        );
+        assert_eq!(
+            Error::NoSuchTask("auth".to_string()).to_string(),
+            "no such task: auth"
+        );
+        assert_eq!(Error::NoSuchStep(2).to_string(), "no such step: 2");
+        assert_eq!(
+            Error::InvalidSlug("Auth".to_string()).to_string(),
+            "invalid slug: Auth"
+        );
+        assert_eq!(Error::EmptyField("title").to_string(), "title is required");
+        assert_eq!(
+            Error::TaskExists("auth".to_string()).to_string(),
+            "task already exists: auth"
+        );
+        assert_eq!(Error::DatabaseBusy.to_string(), "database busy");
+        assert_eq!(
+            Error::BadStatus("nope".to_string()).to_string(),
+            "invalid status: nope"
+        );
+    }
+}

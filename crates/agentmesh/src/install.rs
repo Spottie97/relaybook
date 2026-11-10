@@ -86,3 +86,41 @@ fn append_block(existing: &str, body: &str) -> String {
     out.push('\n');
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{InstallState, MARKER_START, PLANNER_HEADING, apply};
+
+    #[test]
+    fn appends_once_and_keeps_text_without_a_trailing_newline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("CLAUDE.md");
+        std::fs::write(&path, "hello").expect("write");
+
+        let first = apply(dir.path(), true, false).expect("install");
+        assert_eq!(first.claude, Some(InstallState::Updated));
+        assert_eq!(first.cursor, None);
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.starts_with("hello\n"), "{text}");
+        assert_eq!(text.matches(MARKER_START).count(), 1);
+        assert!(text.contains(PLANNER_HEADING));
+
+        let second = apply(dir.path(), true, false).expect("install");
+        assert_eq!(second.claude, Some(InstallState::Unchanged));
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), text);
+    }
+
+    #[test]
+    fn existing_heading_is_left_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("AGENTS.md");
+        let original = format!("{}\ncustom\n", super::EXECUTOR_HEADING);
+        std::fs::write(&path, &original).expect("write");
+
+        let outcome = apply(dir.path(), false, true).expect("install");
+        assert_eq!(outcome.cursor, Some(InstallState::Unchanged));
+        assert_eq!(outcome.claude, None);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), original);
+    }
+}
