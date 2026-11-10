@@ -20,15 +20,17 @@ on:
       - "graphify-out/**"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   update:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
       - name: install graphify
         run: uv tool install graphifyy
       - name: put uv tools on PATH
@@ -50,7 +52,7 @@ jobs:
           else
             graphify update .
           fi
-      - uses: peter-evans/create-pull-request@v7
+      - uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7.0.11
         with:
           token: ${{ secrets.GRAPHIFY_PR_TOKEN || github.token }}
           commit-message: "chore: refresh graphify graph"
