@@ -135,7 +135,14 @@ relaybook task claim <slug> --by <agent>
 relaybook task block <slug> --reason "..."
 relaybook task unblock <slug> [--note "..."]
 relaybook task rename <slug> --title "..."
-relaybook task done <slug>
+relaybook task done <slug> --changed "..." [--verified "..."] [--not-verified "..."] [--deviations "..."] [--review "..."] [--no-report]
+relaybook task reopen <slug> --reason "..."
+relaybook report note --by <agent> [--text "..."]
+relaybook report accept <slug>
+relaybook report accept --note <id>
+relaybook report accept --all
+relaybook inbox
+relaybook hook prompt
 relaybook step add <slug> "..."
 relaybook step check <slug> <n>
 relaybook step edit <slug> <n> --text "..."
@@ -182,6 +189,34 @@ in the event payload. A second report for the same task and commit fails with
 `already reported for <sha>`. Outside a git checkout the commit is null, and each report
 is appended. `task done` on a task that is already done succeeds and does not write
 another event.
+
+## Hand-back loop
+
+The executor finishes a task with a short report. Claude's project prompt hook reads
+it, and the planner accepts the work or sends it back.
+
+1. The executor claims the task, then finishes with short bullets under 1,500 bytes:
+
+```sh
+relaybook task done auth \
+  --changed "store the report in the same transaction as the status change" \
+  --verified "cargo test" \
+  --not-verified "a clean macOS install" \
+  --review "inbox order"
+```
+
+A cross-task note uses `relaybook report note --by cursor --text "..."`. A trivial
+task can use `task done <slug> --no-report`, which still stores an empty report.
+Doing a task that is already done does nothing and does not store a second report.
+
+2. On the next prompt, `UserPromptSubmit` runs `relaybook hook prompt`. When reports
+are waiting it prints one line, `N new Cursor reports: relaybook inbox`. Otherwise
+it prints nothing.
+
+3. The planner runs `relaybook inbox`, then `relaybook report accept <slug>` or
+`relaybook task reopen <slug> --reason "..."`. A reopened task returns to
+`relaybook task list --ready` with `reopened: <reason>` until it is done again.
+A larger problem becomes a new task.
 
 ## Context cost
 
