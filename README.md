@@ -1,12 +1,44 @@
-# Relaybook
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="Relaybook" src="assets/logo-light.svg" width="420">
+  </picture>
+</p>
 
-**Relaybook is a shared coordination layer for coding agents.** A single Rust binary
-that keeps tasks, progress, and decisions in one SQLite ledger, so agents working in
-the same repo stop stepping on each other.
+<p align="center">Shared work ledger for coding agents.</p>
 
-Graphify maps the code — the "what is this and where" (the map). Relaybook tracks the
-work — the "who is doing what and why" (the bus). Use Graphify for structure, Relaybook
-for state.
+<p align="center">
+  <a href="https://github.com/Spottie97/relaybook/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Spottie97/relaybook/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Spottie97/relaybook/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/Spottie97/relaybook"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <img alt="Platforms: macOS arm64 and Linux x86_64" src="https://img.shields.io/badge/platforms-macOS%20arm64%20%7C%20Linux%20x86__64-lightgrey">
+</p>
+
+<p align="center">
+  <a href="#quick-start">Install</a>
+  · <a href="#how-it-works">How it works</a>
+  · <a href="#auto-mode">Auto mode</a>
+  · <a href="#docs">Docs</a>
+  · <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+## What it is
+
+Relaybook is a shared coordination layer for coding agents. One Rust binary keeps tasks, progress, and decisions in a SQLite ledger, so agents in the same repo stop stepping on each other.
+
+Graphify maps the code. Relaybook tracks the work. Use Graphify for structure and Relaybook for state.
+
+## Why
+
+Agents step on the same task, re-explain state every session, and pay context cost for work that is already finished. The ledger is the hand-off. One agent plans, another executes, and the report comes back through an inbox. Finished work stays behind a command.
+
+## Features
+
+- Tasks, an atomic claim, dependencies, and an append-only event log
+- A short report on `relaybook task done`, and `relaybook inbox` for the planner
+- Auto mode: Claude plans and reviews, Cursor implements, one task at a time
+- `/relaybook` in Claude Code and Cursor
+- Compact `relaybook context` by default, with the full history one flag away
 
 ## Quick start
 
@@ -26,290 +58,76 @@ Upgrade an existing install with:
 curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --upgrade
 ```
 
-Any agent that can run a shell command can join. No protocol, no server, no lock-in.
+Any agent that can run a shell command can join. There is no server and no protocol.
 
-## Daily workflow
+<img alt="Demo: setup, claim a task, file a report, and read the inbox" src="docs/demo.gif" width="720">
 
-```text
-relaybook task list --ready
-relaybook task claim auth --by cursor
-relaybook progress report auth --note "..."
-relaybook task done auth
+## How it works
+
+```mermaid
+flowchart LR
+  planner[Planner] --> ledger[Ledger]
+  ledger --> executor[Executor]
+  executor --> report[Report]
+  report --> inbox[Inbox]
+  inbox --> review[Review]
 ```
-
-## Setup
-
-`relaybook setup` creates the ledger when it is missing, appends the planner block to
-`CLAUDE.md` and the executor block to `AGENTS.md`, then runs `graphify claude install`,
-`graphify cursor install`, `graphify hook install`, and `graphify update .` when
-`graphify` is on `PATH`. The update is AST-only and does not call an LLM. Run it again
-whenever you want: existing instruction blocks and hooks are left as they are.
-
-- `--no-graphify` skips every Graphify command and the pull hooks.
-- `--no-hooks` skips `graphify hook install` and the post-merge / post-rewrite hooks.
-- `--no-claude-hook` skips the project `UserPromptSubmit` hook that tells Claude to run `relaybook inbox`.
-  The other Graphify commands still run.
-- `--ci` writes `.github/workflows/graphify-update.yml` and adds
-  `graphify-out/graph.json merge=graphify` to `.gitattributes`. An existing workflow
-  file is left untouched. The workflow opens a pull request instead of pushing to
-  `main`. It runs `graphify extract` only when one of these GitHub secrets is set:
-  `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-  `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`, or `AZURE_OPENAI_API_KEY` (with
-  `AZURE_OPENAI_ENDPOINT`). Extract sends repository text to that provider and spends
-  API credits. With no secret, the job runs `graphify update`.
-
-## How the graph stays current
-
-Local hooks are the default. `graphify hook install` refreshes the graph after a
-commit and a checkout. `relaybook setup` adds post-merge and post-rewrite hooks that
-run `graphify update .` in the background, so `git pull` and `git pull --rebase`
-return immediately. `relaybook setup --no-hooks` leaves those hooks out.
-
-`relaybook setup --ci` is the opt-in GitHub Actions path for teams that want the graph
-committed. Pushes that only change `graphify-out/` do not start another run. Delete
-`.github/workflows/graphify-update.yml` to turn that job off.
-
-The workflow opens a pull request, which needs Settings > Actions > General >
-Allow GitHub Actions to create and approve pull requests. A pull request opened
-with `GITHUB_TOKEN` does not trigger other workflows, so required checks will not
-run on `graphify/update`. Set the `GRAPHIFY_PR_TOKEN` secret to a fine-grained PAT
-or GitHub App token with contents and pull-requests write when those checks must
-run. Without that secret the workflow uses `GITHUB_TOKEN`.
-
-## Troubleshooting
-
-- The installer supports linux x86_64 and macos aarch64. On another machine, use
-  `cargo build --release`.
-- If `~/.local/bin` is not on `PATH`, the installer still finishes, then prints the
-  `export PATH=...` line to add to `~/.zshrc` or `~/.bashrc`. `RELAYBOOK_INSTALL_DIR`
-  chooses a different directory. A plain re-run skips an existing binary. Update it
-  with `--upgrade`.
-- If Graphify is missing, install [uv](https://docs.astral.sh/uv/) and run
-  `uv tool install graphifyy`. `pipx install graphifyy` is the fallback. Setup still
-  finishes and skips the Graphify steps. Skip Graphify during install with
-  `curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --no-graphify`.
-- If `core.hooksPath` is set, or the repo uses Husky or Lefthook, setup does not write
-  `.git/hooks`. It prints where to add post-merge and post-rewrite commands that run
-  `graphify update .` in the background.
-
-## Build
 
 ```sh
-cargo build --release
-```
-
-The binary is `target/release/relaybook`. It is a single static executable: SQLite is
-compiled in via `rusqlite` with the `bundled` feature. There is no server and no daemon.
-
-## Ledger
-
-`relaybook init` creates `.relaybook/ledger.db` at the git repository root (or in the
-current directory when you are not in a work tree). Later commands walk up from the
-working directory until they find that file.
-
-The database runs in WAL mode with a 5 second busy timeout. Tasks, steps, and decisions
-are the current projection. The `events` table is append-only (`task_created`, `claimed`,
-`progress`, `decision`, `status_changed`, `dependency_changed`, `task_renamed`); Relaybook
-never updates or deletes a row there.
-`relaybook task block <slug> --reason "..."` sets `status=blocked` on an open or claimed
-task and records why. Blocking a task that is already blocked succeeds and writes no new
-event. A done task cannot be blocked.
-
-WAL sidecar files (`.db-wal`, `.db-shm`) are gitignored. The ledger file itself is safe to
-commit after a command exits; each write checkpoints so the `.db` file holds the data.
-
-## Commands
-
-Every command prints plain text by default. Add `--json` for a single JSON envelope on
-stdout. Exit `0` on success, `1` on an operational failure, and `2` on a usage error or
-when the ledger is missing.
-
-```text
-relaybook init
-relaybook context [slug]
-relaybook task create <slug> --title "..." [--depends-on <slug>]
-relaybook task list [--status open|claimed|done|blocked] [--ready] [--all]
-relaybook task depend <slug> --on <slug>
-relaybook task undepend <slug> --on <slug>
-relaybook task claim <slug> --by <agent>
-relaybook task block <slug> --reason "..."
-relaybook task unblock <slug> [--note "..."]
-relaybook task rename <slug> --title "..."
-relaybook task done <slug> --changed "..." [--verified "..."] [--not-verified "..."] [--deviations "..."] [--review "..."] [--no-report]
-relaybook task reopen <slug> --reason "..."
-relaybook report note --by <agent> [--text "..."]
-relaybook report accept <slug>
-relaybook report accept --note <id>
-relaybook report accept --all
+relaybook task list --ready
+relaybook task claim greet --by cursor
+relaybook task done greet --changed "said hello" --verified "cargo test"
 relaybook inbox
-relaybook hook prompt
-relaybook step add <slug> "..."
-relaybook step check <slug> <n>
-relaybook step edit <slug> <n> --text "..."
-relaybook progress report <slug> --note "..."
-relaybook decision log <slug> --why "..." --by <agent>
-relaybook install --claude --cursor
-relaybook setup [--no-graphify] [--no-hooks] [--no-claude-hook] [--ci]
 ```
 
-Slugs match `[a-z0-9]+(-[a-z0-9]+)*` and stay permanent. `task rename` changes the title
-only, and writes a `task_renamed` event. The same title again succeeds and writes nothing.
-A missing slug fails with `no such task: <slug>`. Checklist positions start at 1.
-`install` appends the planner block to `CLAUDE.md` (`--claude`) and the executor block
-to `AGENTS.md` (`--cursor`). A second run does not change a file that already has the
-Relaybook markers or the coordination heading. Text outside the block is kept.
-
-## JSON
-
-Success and failure both use one envelope:
-
-```json
-{"ok": true, "data": {}, "error": null}
-{"ok": false, "data": null, "error": "already claimed"}
-```
-
-`--json` writes that object to stdout and nothing else. Human-readable errors go to stderr.
-
-## Claims and progress
-
-`task claim` takes a write lock and runs `UPDATE ... WHERE status='open'`. One agent
-wins. A missing slug fails with `no such task: <slug>`. Any other status, including a
-claim that lost the race, fails with `already claimed` and exit code 1. A task whose
-dependencies are not done fails with `waiting on: <slug>, <slug>` and stays open.
-`blocked` is separate: it means someone marked the work stuck. A dependency clears
-itself when the prerequisite is done.
-
-`task list --ready` shows open tasks whose dependencies are all done. Human output
-appends `needs: a, b` for unfinished dependencies. JSON tasks include a `depends_on`
-array of every link. Adding a link that already exists, or removing one that does not,
-succeeds and writes no event. A self-link or a cycle is rejected.
-
-`progress report` reads `git rev-parse HEAD` when that succeeds and stores the commit
-in the event payload. A second report for the same task and commit fails with
-`already reported for <sha>`. Outside a git checkout the commit is null, and each report
-is appended. `task done` on a task that is already done succeeds and does not write
-another event.
+The executor claims a ready task and finishes with a report under 1,500 bytes. The planner runs `relaybook inbox`, then `relaybook report accept greet` or `relaybook task reopen greet --reason "needs a test"`. A reopened task returns to `relaybook task list --ready`.
 
 ## Auto mode
 
-### Controls
-
-`/relaybook` in Claude Code or Cursor shows the current status and a menu. With arguments it runs the matching command. In a terminal, `relaybook mode` and `relaybook gates` show an arrow-key list when you leave the value off; Esc cancels.
+Manual mode is the default. `/relaybook` shows the current status and a menu. `/relaybook mode` prints the current mode. `/relaybook mode manual` and `/relaybook mode auto` set it. `/relaybook gates` prints the checkpoints. `/relaybook gates none`, `/relaybook gates plan`, and `/relaybook gates plan,review` set them. The terminal commands do the same: `relaybook mode` and `relaybook gates` print the current value, and a value sets it.
 
 | Action | Slash command | Terminal |
-|---|---|---|
-| Show status and the menu | `/relaybook` | `relaybook status` |
-| Switch mode | `/relaybook mode auto` or `/relaybook mode manual` | `relaybook mode auto` or `relaybook mode` |
-| Checkpoints | `/relaybook gates none`, `/relaybook gates plan`, or `/relaybook gates plan,review` | `relaybook gates` or `relaybook gates plan` |
+| --- | --- | --- |
+| Status and the menu | `/relaybook` | `relaybook status` |
+| Mode | `/relaybook mode` or `/relaybook mode auto` | `relaybook mode` or `relaybook mode auto` |
+| Checkpoints | `/relaybook gates` or `/relaybook gates plan` | `relaybook gates` or `relaybook gates plan` |
 | Start a run | `/relaybook run docs/prd.md` | `relaybook run docs/prd.md` |
 | Approve a checkpoint | `/relaybook approve` | `relaybook approve` |
 | Inbox | `/relaybook inbox` | `relaybook inbox` |
 
-Manual mode is the default. Auto mode spends plan usage: Claude plans and reviews, and Cursor implements, one task at a time, on a branch. Main changes only when you merge the pull request.
-
-Sign in to Claude Code and `cursor-agent` once. Then:
-
 ```sh
 relaybook mode auto
-relaybook config set gates plan
-relaybook run --prd docs/prd.md
+relaybook gates plan
+relaybook run docs/prd.md
 ```
 
-`gates` chooses the checkpoints:
+`plan` pauses after planning. Continue with `relaybook approve`. Limits, safety checks, and a PRD template are in [docs/auto-mode.md](docs/auto-mode.md).
 
-- `none` runs until the reviewer says the PRD is covered.
-- `plan` pauses after planning. Continue with `relaybook approve`.
-- `plan,review` also pauses after every review.
+## Token savings
 
-Stop at the next safe boundary with `relaybook mode manual`. A stopped or paused run continues with `relaybook run --resume`. `relaybook run stop` ends it. `relaybook status` shows the mode, the call count, and whether the run is waiting on approval or a usage limit.
+On a 40-done fixture, `relaybook context` fell from 4567 bytes (about 1141 tokens) to 1482 bytes (about 370 tokens). Done tasks stay behind `relaybook context --all`. Before that change, a real ledger's context was about 7.5k tokens, and about two thirds of it was finished work.
 
-The primary limits are cycles (20), agent calls (60), reopens per task (2), and the Cursor timeout (30 minutes). Override them on a run with `--max-cycles`, `--max-agent-calls`, `--max-reopens`, and `--cursor-timeout-min`. Dollars Claude reports are API-equivalent estimates. `est_cost_cap_usd` is optional and is mainly for API-key users; it is unset unless you set it. Hitting a plan usage limit pauses the run instead of failing it.
+Graphify answers where the code lives. RTK compacts command output. Relaybook compacts the work ledger. The always-loaded planner and executor blocks are 520 and 544 bytes. `scripts/measure-context.sh --check` guards those budgets.
 
-Cursor runs with `--force` on the run branch only. Relaybook checks git before and after every agent call. A push to main, a tag, a branch switch, or a code edit by Claude stops the run. Transcripts are in `.relaybook/runs/<id>/` and are gitignored.
+## FAQ
 
-A useful PRD states the goal, what is in scope, what is out of scope, and the acceptance checks. Clear checks mean fewer reopens and less plan usage.
+**Where does the data live?** In `.relaybook/ledger.db` at the git root. SQLite is compiled into the binary. There is no daemon.
 
-```md
-# Goal
-What the change should make true.
+**What if two agents claim the same task?** One `relaybook task claim` wins. The other exits 1 with `already claimed`.
 
-# In scope
-The commands or files this run may add.
+**Which machines can install a release?** macOS arm64 and Linux x86_64. On another machine, run `cargo build --release`.
 
-# Out of scope
-What the run must leave alone.
+## Docs
 
-# Acceptance checks
-The commands or tests that show the goal is met.
-```
+- [Commands](docs/commands.md)
+- [Configuration](docs/configuration.md)
+- [Auto mode](docs/auto-mode.md)
+- [Ledger](docs/ledger.md)
+- [Troubleshooting](docs/troubleshooting.md)
 
-## Hand-back loop
+## Contributing
 
-The executor finishes a task with a short report. Claude's project prompt hook reads
-it, and the planner accepts the work or sends it back.
-
-1. The executor claims the task, then finishes with short bullets under 1,500 bytes:
-
-```sh
-relaybook task done auth \
-  --changed "store the report in the same transaction as the status change" \
-  --verified "cargo test" \
-  --not-verified "a clean macOS install" \
-  --review "inbox order"
-```
-
-A cross-task note uses `relaybook report note --by cursor --text "..."`. A trivial
-task can use `task done <slug> --no-report`, which still stores an empty report.
-Doing a task that is already done does nothing and does not store a second report.
-
-2. On the next prompt, `UserPromptSubmit` runs `relaybook hook prompt`. When reports
-are waiting it prints one line, `N new Cursor reports: relaybook inbox`. Otherwise
-it prints nothing.
-
-3. The planner runs `relaybook inbox`, then `relaybook report accept <slug>` or
-`relaybook task reopen <slug> --reason "..."`. A reopened task returns to
-`relaybook task list --ready` with `reopened: <reason>` until it is done again.
-A larger problem becomes a new task.
-
-## Context cost
-
-`relaybook context` shows active tasks only. Checked steps collapse to `n/m done`,
-older decisions stay behind `relaybook context <slug>`, and finished tasks stay behind
-`relaybook context --all`. Events stay behind `relaybook context --events N`. On a
-40-done fixture, context fell from 4567 bytes (~1141 tokens) to 1482 bytes (~370 tokens).
-A planning burst of one create, five steps, and a decision fell from 232 bytes to 152.
-Write commands answer with an id, slug, and status. Read commands still return the
-full record.
-
-Graphify answers where the code lives. Relaybook answers who is doing the work. Both
-default to a small answer and name the command that restores the rest. The pull hooks
-run `graphify update .` in the background and print nothing. Graphify's editor hook
-does not rewrite `relaybook` commands.
-
-`scripts/measure-context.sh --check` fails when fixture context exceeds 4000 bytes, a
-write acknowledgement exceeds 120 bytes, or an instruction block exceeds 600 bytes.
-
-## Token savings stack
-
-Graphify (Apache-2.0, installed by default) keeps code questions on the graph instead
-of a full-repo read. RTK (Apache-2.0, maintained separately) compacts git, test, build,
-and grep output. Relaybook compacts the work ledger. Skip Graphify with `--no-graphify`.
-Skip the pull hooks with `--no-hooks`. Skip the Claude prompt hook with
-`--no-claude-hook`. RTK is opt-in:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --with-rtk
-```
-
-`--yes` also runs `rtk init -g` without the y/N prompt. Without a terminal and without
-`--yes`, the installer prints `rtk init -g` instead of editing `~/.claude/settings.json`.
-`relaybook setup` never installs RTK and never edits that global file.
-
-## Library
-
-`relaybook-core` owns the ledger. A future MCP adapter, or any other front end, should
-call that crate. It should not invent a second protocol or a second store. The `relaybook`
-binary is only the CLI over the same API.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
