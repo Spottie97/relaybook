@@ -2,7 +2,7 @@
 ///
 /// `events_progress_once` rejects a second progress event for the same task
 /// and commit. A null commit (no git HEAD) is not covered, so those reports append.
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
@@ -63,6 +63,34 @@ ON events (
 )
 WHERE kind = 'progress'
   AND json_extract(payload, '$.commit') IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER REFERENCES tasks(id),
+    kind TEXT NOT NULL CHECK (kind IN ('task', 'note')),
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    verdict TEXT CHECK (verdict IS NULL OR verdict IN ('accepted', 'reopened')),
+    review_note TEXT
+);
+";
+
+pub(crate) const MIGRATE_V2_TO_V3: &str = "
+CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER REFERENCES tasks(id),
+    kind TEXT NOT NULL CHECK (kind IN ('task', 'note')),
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    verdict TEXT CHECK (verdict IS NULL OR verdict IN ('accepted', 'reopened')),
+    review_note TEXT
+);
 ";
 
 /// Rebuild used when opening a v1 ledger. Copies every event row unchanged.

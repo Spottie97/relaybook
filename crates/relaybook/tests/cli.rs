@@ -86,7 +86,9 @@ fn events_are_append_only() {
     )
     .assert()
     .success();
-    run(dir.path(), ["task", "done", "auth"]).assert().success();
+    run(dir.path(), ["task", "done", "--no-report", "auth"])
+        .assert()
+        .success();
 
     let first = event_rows(dir.path());
     run(dir.path(), ["task", "list"]).assert().success();
@@ -208,7 +210,9 @@ fn block_sets_status_and_rejects_a_done_task() {
     run(dir.path(), ["task", "create", "ship", "--title", "Ship it"])
         .assert()
         .success();
-    run(dir.path(), ["task", "done", "ship"]).assert().success();
+    run(dir.path(), ["task", "done", "--no-report", "ship"])
+        .assert()
+        .success();
     run(
         dir.path(),
         ["task", "block", "ship", "--reason", "too late"],
@@ -266,7 +270,9 @@ fn dependencies_show_in_json_and_ready_list() {
         .code(1)
         .stderr(predicate::str::contains("waiting on: base"));
 
-    run(dir.path(), ["task", "done", "base"]).assert().success();
+    run(dir.path(), ["task", "done", "--no-report", "base"])
+        .assert()
+        .success();
     run(dir.path(), ["task", "list", "--ready"])
         .assert()
         .success()
@@ -334,7 +340,9 @@ fn rename_keeps_the_slug_and_shows_the_new_title() {
         .success()
         .stdout(predicate::str::contains("auth [open] Add login"));
 
-    run(dir.path(), ["task", "done", "auth"]).assert().success();
+    run(dir.path(), ["task", "done", "--no-report", "auth"])
+        .assert()
+        .success();
     run(
         dir.path(),
         ["task", "rename", "auth", "--title", "Add login later"],
@@ -411,7 +419,9 @@ fn context_hides_done_tasks_until_asked() {
     run(dir.path(), ["task", "create", "old", "--title", "Old"])
         .assert()
         .success();
-    run(dir.path(), ["task", "done", "old"]).assert().success();
+    run(dir.path(), ["task", "done", "--no-report", "old"])
+        .assert()
+        .success();
     run(dir.path(), ["task", "create", "now", "--title", "Now"])
         .assert()
         .success();
@@ -511,7 +521,9 @@ fn task_list_hides_done_tasks_until_asked() {
     run(dir.path(), ["task", "create", "old", "--title", "Old"])
         .assert()
         .success();
-    run(dir.path(), ["task", "done", "old"]).assert().success();
+    run(dir.path(), ["task", "done", "--no-report", "old"])
+        .assert()
+        .success();
     run(dir.path(), ["task", "create", "now", "--title", "Now"])
         .assert()
         .success();
@@ -542,6 +554,67 @@ fn task_list_hides_done_tasks_until_asked() {
     let data = json_data(dir.path(), ["task", "list", "--json"]);
     assert_eq!(data["hidden_done"], 1);
     assert_eq!(data["tasks"].as_array().expect("tasks").len(), 1);
+}
+
+#[test]
+fn task_done_stores_a_report_and_rejects_a_long_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(dir.path(), ["task", "done", "auth"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("changed is required"));
+    run(
+        dir.path(),
+        [
+            "task",
+            "done",
+            "auth",
+            "--changed",
+            "added reports",
+            "--verified",
+            "cargo test",
+            "--not-verified",
+            "linux install",
+            "--deviations",
+            "none",
+            "--review",
+            "inbox ordering",
+        ],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("done auth"));
+    run(dir.path(), ["task", "done", "auth", "--changed", "again"])
+        .assert()
+        .success();
+    let huge = "x".repeat(1600);
+    run(dir.path(), ["task", "create", "big", "--title", "Big"])
+        .assert()
+        .success();
+    command(dir.path())
+        .args(["task", "done", "big", "--changed", &huge])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("limit 1500"));
+    let still = json_data(dir.path(), ["context", "big", "--json"]);
+    assert_eq!(still["tasks"][0]["status"], "open");
+
+    run(
+        dir.path(),
+        ["report", "note", "--by", "cursor", "--text", "spans tasks"],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("noted"));
 }
 
 #[test]

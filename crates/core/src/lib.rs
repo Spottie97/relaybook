@@ -7,6 +7,7 @@ pub mod legacy;
 mod migrate;
 mod model;
 mod replay;
+mod reports;
 mod schema;
 
 pub use error::Error;
@@ -16,3 +17,4 @@ pub use model::{
     Context, Decision, Event, EventKind, RECENT_EVENT_LIMIT, Status, Step, Task, TaskDetail,
 };
 pub use replay::{ReplayedDecision, ReplayedTask, replay};
+pub use reports::Sections;

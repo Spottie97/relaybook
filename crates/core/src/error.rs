@@ -15,6 +15,9 @@ pub enum Error {
     SelfDependency,
     DependencyCycle(String),
     WaitingOn(String),
+    ReportTooLarge { bytes: usize, limit: usize },
+    ChangedRequired,
+    ReportOrNone,
     NoSuchStep(i64),
     AlreadyReported(String),
     DatabaseBusy,
@@ -37,6 +40,11 @@ impl fmt::Display for Error {
             Self::SelfDependency => formatter.write_str("cannot depend on itself"),
             Self::DependencyCycle(path) => write!(formatter, "dependency cycle: {path}"),
             Self::WaitingOn(slugs) => write!(formatter, "waiting on: {slugs}"),
+            Self::ReportTooLarge { bytes, limit } => {
+                write!(formatter, "report is {bytes} bytes; limit {limit}")
+            }
+            Self::ChangedRequired => formatter.write_str("changed is required"),
+            Self::ReportOrNone => formatter.write_str("pass either a report or --no-report"),
             Self::NoSuchStep(position) => write!(formatter, "no such step: {position}"),
             Self::AlreadyReported(sha) => write!(formatter, "already reported for {sha}"),
             Self::DatabaseBusy => formatter.write_str("database busy"),

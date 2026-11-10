@@ -3,6 +3,17 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::deps::{self, fill_dependencies};
+use crate::reports::{self, Sections};
+
+fn empty_sections() -> Sections {
+    Sections {
+        changed: Vec::new(),
+        verified: Vec::new(),
+        not_verified: Vec::new(),
+        deviations: Vec::new(),
+        review: Vec::new(),
+    }
+}
 use crate::error::Error;
 use crate::migrate::migrate;
 use crate::model::{
@@ -174,6 +185,47 @@ impl Ledger {
                 serde_json::json!({ "slug": slug, "from": from, "to": "done" }),
             )?;
             load_task(conn, &slug)
+        })
+    }
+
+    pub fn finish_task(&mut self, slug: &str, sections: Option<Sections>) -> Result<Task, Error> {
+        let slug = checked_slug(slug)?;
+        self.transaction(|conn| {
+            let task = load_task(conn, &slug)?;
+            if task.status == Status::Done {
+                return Ok(task);
+            }
+            let body = match &sections {
+                Some(sections) => reports::task_body(sections)?,
+                None => reports::task_body(&empty_sections())?,
+            };
+            let from = task.status.as_str();
+            let ts = now(conn)?;
+            conn.execute(
+                "UPDATE tasks SET status = 'done', updated_at = ?1 WHERE id = ?2",
+                params![ts, task.id],
+            )?;
+            insert_event(
+                conn,
+                EventKind::StatusChanged,
+                serde_json::json!({ "slug": slug, "from": from, "to": "done" }),
+            )?;
+            let author = task
+                .claimed_by
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            reports::insert(conn, Some(task.id), "task", &author, &body, &ts)?;
+            load_task(conn, &slug)
+        })
+    }
+
+    pub fn add_note(&mut self, author: &str, text: &str) -> Result<i64, Error> {
+        let author = required_text("by", author)?;
+        let text = required_text("text", text)?;
+        let body = reports::note_body(&text)?;
+        self.transaction(|conn| {
+            let ts = now(conn)?;
+            reports::insert(conn, None, "note", &author, &body, &ts)
         })
     }
 
@@ -896,7 +948,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let deps: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_deps'",
@@ -912,12 +964,57 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let stored_again: String = conn
             .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
                 row.get(0)
             })
             .expect("payload");
         assert_eq!(stored_again, payload);
+    }
+
+    #[test]
+    fn v2_ledger_gains_reports_without_touching_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        let payload = r#"{"slug":"auth","from":"open","to":"done"}"#;
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                ",
+            )
+            .expect("schema");
+            conn.pragma_update(None, "user_version", 2)
+                .expect("version");
+            conn.execute(
+                "INSERT INTO events (id, ts, kind, payload) VALUES (3, '2026-01-01T00:00:00.000Z', 'status_changed', ?1)",
+                rusqlite::params![payload],
+            )
+            .expect("insert");
+        }
+        let ledger = Ledger::open(&path).expect("migrate");
+        drop(ledger);
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        let stored: String = conn
+            .query_row("SELECT payload FROM events WHERE id = 3", [], |row| {
+                row.get(0)
+            })
+            .expect("payload");
+        assert_eq!(stored, payload);
+        let reports: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'reports'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("reports");
+        assert_eq!(reports, 1);
     }
 }

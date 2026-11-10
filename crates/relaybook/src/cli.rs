@@ -88,6 +88,8 @@ enum Command {
     Progress(ProgressCmd),
     #[command(subcommand)]
     Decision(DecisionCmd),
+    #[command(subcommand)]
+    Report(ReportCmd),
     /// Append coordination instructions to CLAUDE.md and AGENTS.md.
     Install {
         /// Append the planner block to CLAUDE.md.
@@ -151,8 +153,28 @@ enum TaskCmd {
         #[arg(long)]
         by: String,
     },
-    /// Mark a task done.
-    Done { slug: String },
+    /// Mark a task done and attach a short report.
+    Done {
+        slug: String,
+        /// What changed. Repeat for more than one line. At least one is required.
+        #[arg(long)]
+        changed: Vec<String>,
+        /// What was verified.
+        #[arg(long)]
+        verified: Vec<String>,
+        /// What was not verified.
+        #[arg(long = "not-verified")]
+        not_verified: Vec<String>,
+        /// Where the work left the plan.
+        #[arg(long)]
+        deviations: Vec<String>,
+        /// What the planner should look at.
+        #[arg(long)]
+        review: Vec<String>,
+        /// Finish without section text. An empty report is still stored.
+        #[arg(long)]
+        no_report: bool,
+    },
     /// Mark an open or claimed task blocked.
     Block {
         slug: String,
@@ -170,6 +192,18 @@ enum TaskCmd {
         slug: String,
         #[arg(long)]
         title: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReportCmd {
+    /// Record a short note that is not tied to one task.
+    Note {
+        #[arg(long)]
+        by: String,
+        /// Note text. Omit this to read the note from stdin.
+        #[arg(long)]
+        text: Option<String>,
     },
 }
 
@@ -313,7 +347,25 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Task(TaskCmd::Depend { slug, on }) => depend(&cwd, &slug, &on),
         Command::Task(TaskCmd::Undepend { slug, on }) => undepend(&cwd, &slug, &on),
         Command::Task(TaskCmd::Claim { slug, by }) => claim_task(&cwd, &slug, &by),
-        Command::Task(TaskCmd::Done { slug }) => complete_task(&cwd, &slug),
+        Command::Task(TaskCmd::Done {
+            slug,
+            changed,
+            verified,
+            not_verified,
+            deviations,
+            review,
+            no_report,
+        }) => {
+            let sections = report_sections(
+                &changed,
+                &verified,
+                &not_verified,
+                &deviations,
+                &review,
+                no_report,
+            )?;
+            complete_task(&cwd, &slug, sections)
+        }
         Command::Task(TaskCmd::Block { slug, reason }) => block_task(&cwd, &slug, &reason),
         Command::Task(TaskCmd::Unblock { slug, note }) => {
             unblock_task(&cwd, &slug, note.as_deref())
@@ -328,6 +380,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Decision(DecisionCmd::Log { slug, why, by }) => {
             log_decision(&cwd, &slug, &why, &by)
         }
+        Command::Report(ReportCmd::Note { by, text }) => add_note(&cwd, &by, text),
         Command::Install { claude, cursor } => install_docs(&cwd, claude, cursor),
         Command::Setup {
             no_graphify,
@@ -424,11 +477,72 @@ fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
     json_outcome(task_ack(&task), human)
 }
 
-fn complete_task(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
+fn report_sections(
+    changed: &[String],
+    verified: &[String],
+    not_verified: &[String],
+    deviations: &[String],
+    review: &[String],
+    no_report: bool,
+) -> Result<Option<relaybook_core::Sections>, Fail> {
+    let sections = if no_report {
+        if !changed.is_empty()
+            || !verified.is_empty()
+            || !not_verified.is_empty()
+            || !deviations.is_empty()
+            || !review.is_empty()
+        {
+            return Err(Fail::Core(relaybook_core::Error::ReportOrNone));
+        }
+        None
+    } else {
+        let changed = kept_lines(changed);
+        if changed.is_empty() {
+            return Err(Fail::Core(relaybook_core::Error::ChangedRequired));
+        }
+        Some(relaybook_core::Sections {
+            changed,
+            verified: kept_lines(verified),
+            not_verified: kept_lines(not_verified),
+            deviations: kept_lines(deviations),
+            review: kept_lines(review),
+        })
+    };
+    Ok(sections)
+}
+
+fn complete_task(
+    cwd: &Path,
+    slug: &str,
+    sections: Option<relaybook_core::Sections>,
+) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let task = ledger.complete_task(slug)?;
+    let task = ledger.finish_task(slug, sections)?;
     let human = render::line(&format!("done {}", task.slug));
     json_outcome(task_ack(&task), human)
+}
+
+fn kept_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn add_note(cwd: &Path, author: &str, text: Option<String>) -> Result<Outcome, Fail> {
+    let text = match text {
+        Some(text) => text,
+        None => {
+            let mut buffer = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+            buffer
+        }
+    };
+    let mut ledger = open_ledger(cwd)?;
+    let id = ledger.add_note(author, &text)?;
+    let human = render::line(&format!("noted {id}"));
+    json_outcome(serde_json::json!({ "id": id, "kind": "note" }), human)
 }
 
 fn block_task(cwd: &Path, slug: &str, reason: &str) -> Result<Outcome, Fail> {

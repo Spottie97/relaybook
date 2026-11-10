@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
-use relaybook_core::{EventKind, Ledger, Status, replay};
+use relaybook_core::{EventKind, Ledger, Sections, Status, replay};
 
 #[test]
 fn replay_matches_projection_and_progress_is_once_per_commit() {
@@ -417,6 +417,56 @@ fn edit_step_updates_text_and_keeps_a_checked_step() {
             .to_string(),
         "no such step: 9"
     );
+}
+
+#[test]
+fn oversized_report_rolls_back_the_done_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.create_task("auth", "Add auth").expect("create");
+    let huge = "x".repeat(1600);
+    let err = ledger
+        .finish_task(
+            "auth",
+            Some(Sections {
+                changed: vec![huge],
+                verified: Vec::new(),
+                not_verified: Vec::new(),
+                deviations: Vec::new(),
+                review: Vec::new(),
+            }),
+        )
+        .expect_err("cap");
+    assert!(err.to_string().starts_with("report is "));
+    assert!(err.to_string().contains("limit 1500"));
+    let task = ledger.context(Some("auth"), 5).expect("context");
+    assert_eq!(task.tasks[0].task.status, Status::Open);
+
+    ledger
+        .finish_task(
+            "auth",
+            Some(Sections {
+                changed: vec!["shipped the report".to_string()],
+                verified: vec!["cargo test".to_string()],
+                not_verified: Vec::new(),
+                deviations: Vec::new(),
+                review: vec!["check the inbox".to_string()],
+            }),
+        )
+        .expect("done");
+    let again = ledger.finish_task("auth", None).expect("already done");
+    assert_eq!(again.status, Status::Done);
+    let conn = rusqlite::Connection::open(&path).expect("open");
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(count, 1);
+
+    let note = ledger.add_note("cursor", "repo is private").expect("note");
+    assert!(note > 0);
+    let too_long = "n".repeat(500);
+    assert!(ledger.add_note("cursor", &too_long).is_err());
 }
 
 fn spawn_claim(

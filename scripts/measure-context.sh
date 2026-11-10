@@ -28,7 +28,7 @@ i=1
 while [ "$i" -le 40 ]; do
   "$bin" task create "done-$i" --title "Done task $i" >/dev/null
   # shellcheck disable=SC1010
-  "$bin" task done "done-$i" >/dev/null
+  "$bin" task done --no-report "done-$i" >/dev/null
   i=$((i + 1))
 done
 
@@ -116,7 +116,7 @@ measure write-rename "$bin" task rename sample --title "Sample renamed"
 measure write-block "$bin" task block sample --reason "paused"
 measure write-unblock "$bin" task unblock sample --note "resumed"
 # shellcheck disable=SC1010
-measure write-done "$bin" task done sample
+measure write-done "$bin" task done --no-report sample
 
 planner=$(wc -c < "$root/crates/relaybook/templates/claude.md" | tr -d ' ')
 executor=$(wc -c < "$root/crates/relaybook/templates/agents.md" | tr -d ' ')
