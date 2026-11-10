@@ -18,11 +18,18 @@ pub(crate) fn execute() -> ExitCode {
     match dispatch(cli) {
         Ok(outcome) => {
             if json {
-                print!("{}", envelope(true, Some(&outcome.data), None));
+                print!(
+                    "{}",
+                    envelope(
+                        outcome.code == 0,
+                        Some(&outcome.data),
+                        outcome.error.as_deref()
+                    )
+                );
             } else {
                 print!("{}", outcome.human);
             }
-            ExitCode::SUCCESS
+            ExitCode::from(outcome.code)
         }
         Err(err) => {
             if json {
@@ -82,11 +89,29 @@ enum TaskCmd {
         slug: String,
         #[arg(long)]
         title: String,
+        /// Slug this task must wait for. Repeat the flag for more than one.
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
     },
     /// List tasks, optionally filtered by status.
     List {
         #[arg(long)]
         status: Option<StatusOpt>,
+        /// Open tasks whose dependencies are all done.
+        #[arg(long)]
+        ready: bool,
+    },
+    /// Record that a task waits for another task.
+    Depend {
+        slug: String,
+        #[arg(long)]
+        on: String,
+    },
+    /// Remove a dependency link.
+    Undepend {
+        slug: String,
+        #[arg(long)]
+        on: String,
     },
     /// Claim an open task. Fails when another agent already holds it.
     Claim {
@@ -101,6 +126,12 @@ enum TaskCmd {
         slug: String,
         #[arg(long)]
         reason: String,
+    },
+    /// Change a task's title. The slug stays the same.
+    Rename {
+        slug: String,
+        #[arg(long)]
+        title: String,
     },
 }
 
@@ -156,6 +187,8 @@ impl StatusOpt {
 struct Outcome {
     data: serde_json::Value,
     human: String,
+    code: u8,
+    error: Option<String>,
 }
 
 enum Fail {
@@ -202,11 +235,20 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
     match cli.command {
         Command::Init => init_ledger(&cwd),
         Command::Context { slug } => show_context(&cwd, slug.as_deref()),
-        Command::Task(TaskCmd::Create { slug, title }) => create_task(&cwd, &slug, &title),
-        Command::Task(TaskCmd::List { status }) => list_tasks(&cwd, status.map(StatusOpt::status)),
+        Command::Task(TaskCmd::Create {
+            slug,
+            title,
+            depends_on,
+        }) => create_task(&cwd, &slug, &title, &depends_on),
+        Command::Task(TaskCmd::List { status, ready }) => {
+            list_tasks(&cwd, status.map(StatusOpt::status), ready)
+        }
+        Command::Task(TaskCmd::Depend { slug, on }) => depend(&cwd, &slug, &on),
+        Command::Task(TaskCmd::Undepend { slug, on }) => undepend(&cwd, &slug, &on),
         Command::Task(TaskCmd::Claim { slug, by }) => claim_task(&cwd, &slug, &by),
         Command::Task(TaskCmd::Done { slug }) => complete_task(&cwd, &slug),
         Command::Task(TaskCmd::Block { slug, reason }) => block_task(&cwd, &slug, &reason),
+        Command::Task(TaskCmd::Rename { slug, title }) => rename_task(&cwd, &slug, &title),
         Command::Step(StepCmd::Add { slug, description }) => add_step(&cwd, &slug, &description),
         Command::Step(StepCmd::Check { slug, n }) => check_step(&cwd, &slug, n),
         Command::Progress(ProgressCmd::Report { slug, note }) => {
@@ -233,19 +275,43 @@ fn init_ledger(cwd: &Path) -> Result<Outcome, Fail> {
     } else {
         render::line(&format!("ledger already exists at {}", path.display()))
     };
-    Ok(Outcome { data, human })
+    Ok(Outcome {
+        data,
+        human,
+        code: 0,
+        error: None,
+    })
 }
 
-fn create_task(cwd: &Path, slug: &str, title: &str) -> Result<Outcome, Fail> {
+fn create_task(
+    cwd: &Path,
+    slug: &str,
+    title: &str,
+    depends_on: &[String],
+) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let task = ledger.create_task(slug, title)?;
+    let task = ledger.create_task_depending(slug, title, depends_on)?;
     let human = render::line(&format!("created {}: {}", task.slug, task.title));
     json_outcome(task, human)
 }
 
-fn list_tasks(cwd: &Path, status: Option<Status>) -> Result<Outcome, Fail> {
+fn depend(cwd: &Path, slug: &str, on: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let task = ledger.add_dependency(slug, on)?;
+    let human = render::line(&format!("{slug} depends on {on}"));
+    json_outcome(task, human)
+}
+
+fn undepend(cwd: &Path, slug: &str, on: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let task = ledger.remove_dependency(slug, on)?;
+    let human = render::line(&format!("{slug} no longer depends on {on}"));
+    json_outcome(task, human)
+}
+
+fn list_tasks(cwd: &Path, status: Option<Status>, ready: bool) -> Result<Outcome, Fail> {
     let ledger = open_ledger(cwd)?;
-    let tasks = ledger.list_tasks(status)?;
+    let tasks = ledger.list_tasks(status, ready)?;
     let human = render::tasks(&tasks);
     json_outcome(tasks, human)
 }
@@ -269,6 +335,13 @@ fn block_task(cwd: &Path, slug: &str, reason: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let task = ledger.block_task(slug, reason)?;
     let human = render::line(&format!("blocked {}: {reason}", task.slug));
+    json_outcome(task, human)
+}
+
+fn rename_task(cwd: &Path, slug: &str, title: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let task = ledger.rename_task(slug, title)?;
+    let human = render::line(&format!("renamed {}: {}", task.slug, task.title));
     json_outcome(task, human)
 }
 
@@ -335,6 +408,8 @@ fn install_docs(cwd: &Path, claude: bool, cursor: bool) -> Result<Outcome, Fail>
     Ok(Outcome {
         data: serde_json::Value::Object(data),
         human,
+        code: 0,
+        error: None,
     })
 }
 
@@ -346,7 +421,12 @@ fn open_ledger(cwd: &Path) -> Result<Ledger, Fail> {
 fn json_outcome(value: impl serde::Serialize, human: String) -> Result<Outcome, Fail> {
     let data =
         serde_json::to_value(value).map_err(|err| Fail::Core(Error::Json(err.to_string())))?;
-    Ok(Outcome { data, human })
+    Ok(Outcome {
+        data,
+        human,
+        code: 0,
+        error: None,
+    })
 }
 
 fn envelope(ok: bool, data: Option<&serde_json::Value>, error: Option<&str>) -> String {

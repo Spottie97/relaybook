@@ -226,6 +226,138 @@ fn block_sets_status_and_rejects_a_done_task() {
 }
 
 #[test]
+fn dependencies_show_in_json_and_ready_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["task", "create", "base", "--title", "Base"])
+        .assert()
+        .success();
+    let created = json_data(
+        dir.path(),
+        [
+            "task",
+            "create",
+            "feature",
+            "--title",
+            "Feature",
+            "--depends-on",
+            "base",
+            "--json",
+        ],
+    );
+    assert_eq!(created["depends_on"][0], "base");
+
+    run(dir.path(), ["task", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("needs: base"));
+
+    run(dir.path(), ["task", "list", "--ready"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("base"))
+        .stdout(predicate::str::contains("feature").not());
+
+    run(dir.path(), ["task", "claim", "feature", "--by", "cursor"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("waiting on: base"));
+
+    run(dir.path(), ["task", "done", "base"]).assert().success();
+    run(dir.path(), ["task", "list", "--ready"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("feature"));
+    run(dir.path(), ["task", "claim", "feature", "--by", "cursor"])
+        .assert()
+        .success();
+
+    run(dir.path(), ["task", "depend", "base", "--on", "feature"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("dependency cycle:"));
+
+    run(dir.path(), ["task", "undepend", "feature", "--on", "base"])
+        .assert()
+        .success();
+    let after = json_data(dir.path(), ["context", "feature", "--json"]);
+    assert!(
+        after["tasks"][0]["depends_on"]
+            .as_array()
+            .expect("deps")
+            .is_empty()
+    );
+}
+
+#[test]
+fn rename_keeps_the_slug_and_shows_the_new_title() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+
+    run(
+        dir.path(),
+        ["task", "rename", "auth", "--title", "Add login"],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("renamed auth: Add login"));
+
+    let task = json_data(
+        dir.path(),
+        ["task", "rename", "auth", "--title", "Add login", "--json"],
+    );
+    assert_eq!(task["slug"], "auth");
+    assert_eq!(task["title"], "Add login");
+    let renamed = event_rows(dir.path())
+        .into_iter()
+        .filter(|row| row.1 == "task_renamed")
+        .count();
+    assert_eq!(renamed, 1);
+
+    run(dir.path(), ["task", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Add login"));
+    run(dir.path(), ["context", "auth"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("auth [open] Add login"));
+
+    run(dir.path(), ["task", "done", "auth"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "rename", "auth", "--title", "Add login later"],
+    )
+    .assert()
+    .success();
+    let done = json_data(dir.path(), ["context", "auth", "--json"]);
+    assert_eq!(done["tasks"][0]["status"], "done");
+    assert_eq!(done["tasks"][0]["title"], "Add login later");
+
+    run(dir.path(), ["task", "rename", "auth", "--title", "   "])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("title is required"));
+    run(
+        dir.path(),
+        ["task", "rename", "missing", "--title", "Title"],
+    )
+    .assert()
+    .failure()
+    .code(1)
+    .stderr(predicate::str::contains("no such task: missing"));
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");

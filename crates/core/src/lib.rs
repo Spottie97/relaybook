@@ -1,7 +1,9 @@
 //! AgentMesh ledger: tasks, steps, decisions, and an append-only event log.
 
+mod deps;
 mod error;
 mod ledger;
+mod migrate;
 mod model;
 mod replay;
 mod schema;

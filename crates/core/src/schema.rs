@@ -1,7 +1,9 @@
-/// Projection tables plus an insert-only event log.
+/// Current ledger schema. `initialize` applies this to a new database.
 ///
 /// `events_progress_once` rejects a second progress event for the same task
 /// and commit. A null commit (no git HEAD) is not covered, so those reports append.
+pub(crate) const SCHEMA_VERSION: i64 = 2;
+
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY,
@@ -30,16 +32,73 @@ CREATE TABLE IF NOT EXISTS decisions (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_deps (
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    depends_on_id INTEGER NOT NULL REFERENCES tasks(id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_id)
+);
+
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (
-        kind IN ('task_created', 'claimed', 'progress', 'decision', 'status_changed')
+        kind IN (
+            'task_created',
+            'claimed',
+            'progress',
+            'decision',
+            'status_changed',
+            'dependency_changed',
+            'task_renamed'
+        )
     ),
     payload TEXT NOT NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS events_progress_once
+ON events (
+    json_extract(payload, '$.slug'),
+    json_extract(payload, '$.commit')
+)
+WHERE kind = 'progress'
+  AND json_extract(payload, '$.commit') IS NOT NULL;
+";
+
+/// Rebuild used when opening a v1 ledger. Copies every event row unchanged.
+pub(crate) const MIGRATE_V1_TO_V2: &str = "
+CREATE TABLE IF NOT EXISTS task_deps (
+    task_id INTEGER NOT NULL REFERENCES tasks(id),
+    depends_on_id INTEGER NOT NULL REFERENCES tasks(id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_id)
+);
+
+CREATE TABLE events_v2 (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (
+        kind IN (
+            'task_created',
+            'claimed',
+            'progress',
+            'decision',
+            'status_changed',
+            'dependency_changed',
+            'task_renamed'
+        )
+    ),
+    payload TEXT NOT NULL
+);
+
+INSERT INTO events_v2 (id, ts, kind, payload)
+SELECT id, ts, kind, payload FROM events;
+
+DROP TABLE events;
+
+ALTER TABLE events_v2 RENAME TO events;
+
+CREATE UNIQUE INDEX events_progress_once
 ON events (
     json_extract(payload, '$.slug'),
     json_extract(payload, '$.commit')

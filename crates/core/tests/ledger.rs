@@ -168,6 +168,164 @@ fn block_task_from_open_or_claimed_and_rejects_done() {
     );
 }
 
+#[test]
+fn dependencies_gate_claims_and_reject_cycles() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+
+    ledger.create_task("base", "Base").expect("create");
+    ledger.create_task("other", "Other").expect("create");
+    let feature = ledger
+        .create_task_depending(
+            "feature",
+            "Feature",
+            &["base".to_string(), "other".to_string()],
+        )
+        .expect("create");
+    assert_eq!(
+        feature.depends_on,
+        vec!["base".to_string(), "other".to_string()]
+    );
+    assert_eq!(
+        ledger
+            .claim_task("feature", "cursor")
+            .expect_err("waiting")
+            .to_string(),
+        "waiting on: base, other"
+    );
+
+    ledger.complete_task("base").expect("done");
+    assert_eq!(
+        ledger
+            .claim_task("feature", "cursor")
+            .expect_err("still waiting")
+            .to_string(),
+        "waiting on: other"
+    );
+    ledger.complete_task("other").expect("done");
+    let claimed = ledger.claim_task("feature", "cursor").expect("claim");
+    assert_eq!(claimed.status, Status::Claimed);
+    assert!(claimed.needs.is_empty());
+
+    ledger.add_dependency("base", "other").expect("link");
+    assert_eq!(
+        ledger
+            .add_dependency("other", "base")
+            .expect_err("cycle")
+            .to_string(),
+        "dependency cycle: other -> base -> other"
+    );
+    assert_eq!(
+        ledger
+            .add_dependency("base", "base")
+            .expect_err("self")
+            .to_string(),
+        "cannot depend on itself"
+    );
+    assert_eq!(
+        ledger
+            .add_dependency("base", "missing")
+            .expect_err("missing")
+            .to_string(),
+        "no such task: missing"
+    );
+
+    let again = ledger.add_dependency("base", "other").expect("repeat");
+    assert_eq!(again.depends_on, vec!["other".to_string()]);
+    ledger
+        .remove_dependency("base", "missing-link")
+        .expect_err("missing task");
+    ledger
+        .remove_dependency("base", "feature")
+        .expect("missing link");
+    let unlinked = ledger.remove_dependency("base", "other").expect("unlink");
+    assert!(unlinked.depends_on.is_empty());
+
+    let ctx = ledger.context(Some("feature"), 20).expect("context");
+    let replayed = replay(&ctx.events).expect("replay");
+    let feature_state = replayed
+        .iter()
+        .find(|task| task.slug == "feature")
+        .expect("feature");
+    assert_eq!(
+        feature_state.depends_on,
+        vec!["base".to_string(), "other".to_string()]
+    );
+    let ready = ledger.list_tasks(None, true).expect("ready");
+    assert!(ready.iter().all(|task| task.slug != "feature"));
+
+    assert_eq!(
+        ledger
+            .create_task_depending("loop", "Loop", &["missing".to_string()])
+            .expect_err("missing dep")
+            .to_string(),
+        "no such task: missing"
+    );
+    assert_eq!(
+        ledger
+            .context(Some("loop"), 1)
+            .expect_err("rolled back")
+            .to_string(),
+        "no such task: loop"
+    );
+}
+
+#[test]
+fn rename_updates_any_status_and_skips_an_unchanged_title() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+
+    ledger.create_task("auth", "Add auth").expect("create");
+    let renamed = ledger.rename_task("auth", "  Add login  ").expect("rename");
+    assert_eq!(renamed.slug, "auth");
+    assert_eq!(renamed.title, "Add login");
+    let ctx = ledger.context(Some("auth"), 20).expect("context");
+    let renames = ctx
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::TaskRenamed)
+        .count();
+    assert_eq!(renames, 1);
+    assert_eq!(ctx.events[0].payload["from"], "Add auth");
+    assert_eq!(ctx.events[0].payload["to"], "Add login");
+    let replayed = replay(&ctx.events).expect("replay");
+    assert_eq!(replayed[0].title, "Add login");
+
+    let again = ledger.rename_task("auth", "Add login").expect("same title");
+    assert_eq!(again.title, "Add login");
+    let after = ledger.context(Some("auth"), 20).expect("context");
+    let renames_after = after
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::TaskRenamed)
+        .count();
+    assert_eq!(renames_after, 1);
+
+    assert_eq!(
+        ledger
+            .rename_task("auth", "   ")
+            .expect_err("blank")
+            .to_string(),
+        "title is required"
+    );
+    assert_eq!(
+        ledger
+            .rename_task("missing", "Title")
+            .expect_err("missing")
+            .to_string(),
+        "no such task: missing"
+    );
+
+    ledger.complete_task("auth").expect("done");
+    let done = ledger
+        .rename_task("auth", "Add login later")
+        .expect("rename done");
+    assert_eq!(done.status, Status::Done);
+    assert_eq!(done.title, "Add login later");
+}
+
 fn spawn_claim(
     path: PathBuf,
     by: &'static str,

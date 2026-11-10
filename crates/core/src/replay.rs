@@ -9,6 +9,7 @@ pub struct ReplayedTask {
     pub status: Status,
     pub claimed_by: Option<String>,
     pub decisions: Vec<ReplayedDecision>,
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +43,7 @@ fn apply(tasks: &mut Vec<ReplayedTask>, event: &Event) -> Result<(), Error> {
                 status: Status::Open,
                 claimed_by: None,
                 decisions: Vec::new(),
+                depends_on: Vec::new(),
             });
             Ok(())
         }
@@ -71,6 +73,32 @@ fn apply(tasks: &mut Vec<ReplayedTask>, event: &Event) -> Result<(), Error> {
             let status = to.parse::<Status>()?;
             let task = find_mut(tasks, &slug)?;
             task.status = status;
+            Ok(())
+        }
+        EventKind::DependencyChanged => {
+            let slug = required_str(&event.payload, "slug")?;
+            let on = required_str(&event.payload, "on")?;
+            let action = required_str(&event.payload, "action")?;
+            let task = find_mut(tasks, &slug)?;
+            match action.as_str() {
+                "added" => {
+                    if !task.depends_on.contains(&on) {
+                        task.depends_on.push(on);
+                    }
+                    Ok(())
+                }
+                "removed" => {
+                    task.depends_on.retain(|dependency| dependency != &on);
+                    Ok(())
+                }
+                other => Err(Error::BadEvent(format!("unknown action {other}"))),
+            }
+        }
+        EventKind::TaskRenamed => {
+            let slug = required_str(&event.payload, "slug")?;
+            let to = required_str(&event.payload, "to")?;
+            let task = find_mut(tasks, &slug)?;
+            task.title = to;
             Ok(())
         }
     }
@@ -205,5 +233,24 @@ mod tests {
         let tasks = replay(&events).expect("replay");
         assert_eq!(tasks[0].status, Status::Blocked);
         assert_eq!(tasks[0].claimed_by, None);
+    }
+
+    #[test]
+    fn rename_replaces_the_title_and_keeps_the_slug() {
+        let events = [
+            event(
+                1,
+                EventKind::TaskCreated,
+                json!({"slug": "auth", "title": "Add auth"}),
+            ),
+            event(
+                2,
+                EventKind::TaskRenamed,
+                json!({"slug": "auth", "from": "Add auth", "to": "Add login"}),
+            ),
+        ];
+        let tasks = replay(&events).expect("replay");
+        assert_eq!(tasks[0].slug, "auth");
+        assert_eq!(tasks[0].title, "Add login");
     }
 }

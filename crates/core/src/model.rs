@@ -55,6 +55,8 @@ pub enum EventKind {
     Progress,
     Decision,
     StatusChanged,
+    DependencyChanged,
+    TaskRenamed,
 }
 
 impl EventKind {
@@ -65,6 +67,8 @@ impl EventKind {
             Self::Progress => "progress",
             Self::Decision => "decision",
             Self::StatusChanged => "status_changed",
+            Self::DependencyChanged => "dependency_changed",
+            Self::TaskRenamed => "task_renamed",
         }
     }
 }
@@ -85,6 +89,8 @@ impl std::str::FromStr for EventKind {
             "progress" => Ok(Self::Progress),
             "decision" => Ok(Self::Decision),
             "status_changed" => Ok(Self::StatusChanged),
+            "dependency_changed" => Ok(Self::DependencyChanged),
+            "task_renamed" => Ok(Self::TaskRenamed),
             other => Err(Error::BadEvent(format!("unknown kind {other}"))),
         }
     }
@@ -99,6 +105,8 @@ pub struct Task {
     pub claimed_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub depends_on: Vec<String>,
+    pub needs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -204,6 +212,8 @@ mod tests {
             EventKind::Progress,
             EventKind::Decision,
             EventKind::StatusChanged,
+            EventKind::DependencyChanged,
+            EventKind::TaskRenamed,
         ] {
             let parsed: EventKind = kind.as_str().parse().expect("kind");
             assert_eq!(parsed, kind);

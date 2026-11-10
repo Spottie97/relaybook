@@ -11,8 +11,12 @@ pub(crate) fn tasks(tasks: &[Task]) -> String {
         let by = task.claimed_by.as_deref().unwrap_or("-");
         let _ = writeln!(
             out,
-            "{:<8} {:<24} {:<16} {}",
-            task.status, task.slug, by, task.title
+            "{:<8} {:<24} {:<16} {}{}",
+            task.status,
+            task.slug,
+            by,
+            task.title,
+            needs_suffix(task)
         );
     }
     out
@@ -29,7 +33,14 @@ pub(crate) fn context(ctx: &Context) -> String {
             Some(agent) => format!(" by {agent}"),
             None => String::new(),
         };
-        let _ = writeln!(out, "{} [{}] {}{by}", task.slug, task.status, task.title);
+        let _ = writeln!(
+            out,
+            "{} [{}] {}{by}{}",
+            task.slug,
+            task.status,
+            task.title,
+            needs_suffix(task)
+        );
         for step in &detail.steps {
             let mark = if step.done { "x" } else { " " };
             let _ = writeln!(out, "  {}. [{mark}] {}", step.position, step.description);
@@ -55,6 +66,14 @@ pub(crate) fn line(text: &str) -> String {
     format!("{text}\n")
 }
 
+fn needs_suffix(task: &Task) -> String {
+    if task.needs.is_empty() {
+        String::new()
+    } else {
+        format!(" needs: {}", task.needs.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{context, line, tasks};
@@ -69,6 +88,8 @@ mod tests {
             claimed_by: claimed_by.map(str::to_string),
             created_at: "t".to_string(),
             updated_at: "t".to_string(),
+            depends_on: Vec::new(),
+            needs: Vec::new(),
         }
     }
 

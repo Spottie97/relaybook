@@ -12,6 +12,9 @@ pub enum Error {
     NoSuchTask(String),
     AlreadyClaimed,
     CannotBlockDone,
+    SelfDependency,
+    DependencyCycle(String),
+    WaitingOn(String),
     NoSuchStep(i64),
     AlreadyReported(String),
     DatabaseBusy,
@@ -31,6 +34,9 @@ impl fmt::Display for Error {
             Self::NoSuchTask(slug) => write!(formatter, "no such task: {slug}"),
             Self::AlreadyClaimed => formatter.write_str("already claimed"),
             Self::CannotBlockDone => formatter.write_str("cannot block a done task"),
+            Self::SelfDependency => formatter.write_str("cannot depend on itself"),
+            Self::DependencyCycle(path) => write!(formatter, "dependency cycle: {path}"),
+            Self::WaitingOn(slugs) => write!(formatter, "waiting on: {slugs}"),
             Self::NoSuchStep(position) => write!(formatter, "no such step: {position}"),
             Self::AlreadyReported(sha) => write!(formatter, "already reported for {sha}"),
             Self::DatabaseBusy => formatter.write_str("database busy"),
@@ -79,6 +85,15 @@ mod tests {
         assert_eq!(
             Error::CannotBlockDone.to_string(),
             "cannot block a done task"
+        );
+        assert_eq!(Error::SelfDependency.to_string(), "cannot depend on itself");
+        assert_eq!(
+            Error::DependencyCycle("a -> b -> a".to_string()).to_string(),
+            "dependency cycle: a -> b -> a"
+        );
+        assert_eq!(
+            Error::WaitingOn("auth, ledger".to_string()).to_string(),
+            "waiting on: auth, ledger"
         );
         assert_eq!(
             Error::AlreadyReported("abc".to_string()).to_string(),

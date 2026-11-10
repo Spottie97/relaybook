@@ -2,12 +2,14 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
+use crate::deps::{self, fill_dependencies};
 use crate::error::Error;
+use crate::migrate::migrate;
 use crate::model::{
     Context, Decision, Event, EventKind, Status, Step, Task, TaskDetail, checked_slug,
     required_text,
 };
-use crate::schema::SCHEMA;
+use crate::schema::{SCHEMA, SCHEMA_VERSION};
 
 /// Open SQLite ledger. Projection tables hold current state; `events` is insert-only.
 pub struct Ledger {
@@ -19,23 +21,41 @@ impl Ledger {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
+        let fresh = !path.exists();
+        let mut conn = Connection::open(path)?;
         configure(&conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "user_version", 1)?;
-        conn.execute_batch(SCHEMA)?;
+        if fresh {
+            conn.execute_batch(SCHEMA)?;
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        migrate(&mut conn)?;
         Ok(Self { conn })
     }
 
     pub fn open(path: &std::path::Path) -> Result<Self, Error> {
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         configure(&conn)?;
+        migrate(&mut conn)?;
         Ok(Self { conn })
     }
 
     pub fn create_task(&mut self, slug: &str, title: &str) -> Result<Task, Error> {
+        self.create_task_depending(slug, title, &[])
+    }
+
+    pub fn create_task_depending(
+        &mut self,
+        slug: &str,
+        title: &str,
+        depends_on: &[String],
+    ) -> Result<Task, Error> {
         let slug = checked_slug(slug)?;
         let title = required_text("title", title)?;
+        let mut dependencies = Vec::with_capacity(depends_on.len());
+        for dependency in depends_on {
+            dependencies.push(checked_slug(dependency)?);
+        }
         self.transaction(|conn| {
             let ts = now(conn)?;
             match conn.execute(
@@ -56,11 +76,32 @@ impl Ledger {
                 EventKind::TaskCreated,
                 serde_json::json!({ "slug": slug, "title": title }),
             )?;
+            for dependency in &dependencies {
+                deps::add_link(conn, &slug, dependency)?;
+            }
             load_task(conn, &slug)
         })
     }
 
-    pub fn list_tasks(&self, status: Option<Status>) -> Result<Vec<Task>, Error> {
+    pub fn add_dependency(&mut self, slug: &str, on: &str) -> Result<Task, Error> {
+        let slug = checked_slug(slug)?;
+        let on = checked_slug(on)?;
+        self.transaction(|conn| {
+            deps::add_link(conn, &slug, &on)?;
+            load_task(conn, &slug)
+        })
+    }
+
+    pub fn remove_dependency(&mut self, slug: &str, on: &str) -> Result<Task, Error> {
+        let slug = checked_slug(slug)?;
+        let on = checked_slug(on)?;
+        self.transaction(|conn| {
+            deps::remove_link(conn, &slug, &on)?;
+            load_task(conn, &slug)
+        })
+    }
+
+    pub fn list_tasks(&self, status: Option<Status>, ready: bool) -> Result<Vec<Task>, Error> {
         let mut stmt = self.conn.prepare(
             "SELECT id, slug, title, status, claimed_by, created_at, updated_at
              FROM tasks
@@ -69,7 +110,12 @@ impl Ledger {
         )?;
         let status_text = status.map(|value| value.as_str().to_string());
         let rows = stmt.query_map(params![status_text], read_task_row)?;
-        collect_tasks(rows)
+        let mut tasks = collect_tasks(rows)?;
+        fill_dependencies(&self.conn, &mut tasks)?;
+        if ready {
+            tasks.retain(|task| task.status == Status::Open && task.needs.is_empty());
+        }
+        Ok(tasks)
     }
 
     pub fn claim_task(&mut self, slug: &str, by: &str) -> Result<Task, Error> {
@@ -79,6 +125,9 @@ impl Ledger {
             let task = load_task(conn, &slug)?;
             if task.status != Status::Open {
                 return Err(Error::AlreadyClaimed);
+            }
+            if !task.needs.is_empty() {
+                return Err(Error::WaitingOn(task.needs.join(", ")));
             }
             let ts = now(conn)?;
             let changed = conn.execute(
@@ -146,6 +195,29 @@ impl Ledger {
                     "to": "blocked",
                     "reason": reason,
                 }),
+            )?;
+            load_task(conn, &slug)
+        })
+    }
+
+    pub fn rename_task(&mut self, slug: &str, title: &str) -> Result<Task, Error> {
+        let slug = checked_slug(slug)?;
+        let title = required_text("title", title)?;
+        self.transaction(|conn| {
+            let task = load_task(conn, &slug)?;
+            if task.title == title {
+                return Ok(task);
+            }
+            let from = task.title.clone();
+            let ts = now(conn)?;
+            conn.execute(
+                "UPDATE tasks SET title = ?1, updated_at = ?2 WHERE id = ?3",
+                params![title, ts, task.id],
+            )?;
+            insert_event(
+                conn,
+                EventKind::TaskRenamed,
+                serde_json::json!({ "slug": slug, "from": from, "to": title }),
             )?;
             load_task(conn, &slug)
         })
@@ -273,7 +345,7 @@ impl Ledger {
         let tasks = if let Some(slug) = slug {
             vec![load_task(&self.conn, slug)?]
         } else {
-            self.list_tasks(None)?
+            self.list_tasks(None, false)?
         };
         let mut details = Vec::with_capacity(tasks.len());
         for task in tasks {
@@ -337,6 +409,18 @@ fn configure(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+pub(crate) fn timestamp(conn: &Connection) -> Result<String, Error> {
+    now(conn)
+}
+
+pub(crate) fn record_event(
+    conn: &Connection,
+    kind: EventKind,
+    payload: serde_json::Value,
+) -> Result<Event, Error> {
+    insert_event(conn, kind, payload)
+}
+
 fn now(conn: &Connection) -> Result<String, Error> {
     let ts = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
         row.get(0)
@@ -388,10 +472,12 @@ fn load_task(conn: &Connection, slug: &str) -> Result<Task, Error> {
             read_task_row,
         )
         .optional()?;
-    match row {
-        Some(row) => into_task(row),
-        None => Err(Error::NoSuchTask(slug.to_string())),
-    }
+    let Some(row) = row else {
+        return Err(Error::NoSuchTask(slug.to_string()));
+    };
+    let mut task = into_task(row)?;
+    fill_dependencies(conn, std::slice::from_mut(&mut task))?;
+    Ok(task)
 }
 
 fn load_step(conn: &Connection, task_id: i64, position: i64) -> Result<Step, Error> {
@@ -471,6 +557,8 @@ fn into_task(row: TaskRow) -> Result<Task, Error> {
         claimed_by: row.claimed_by,
         created_at: row.created_at,
         updated_at: row.updated_at,
+        depends_on: Vec::new(),
+        needs: Vec::new(),
     })
 }
 
@@ -637,7 +725,7 @@ mod tests {
             .create_task("ledger", "Open the ledger")
             .expect("create");
         ledger.claim_task("auth", "cursor").expect("claim");
-        let open = ledger.list_tasks(Some(Status::Open)).expect("list");
+        let open = ledger.list_tasks(Some(Status::Open), false).expect("list");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].slug, "ledger");
         ledger.complete_task("auth").expect("done");
@@ -658,5 +746,83 @@ mod tests {
             status_events
         );
         assert_eq!(after.tasks[0].task.status, Status::Done);
+    }
+
+    #[test]
+    fn v1_ledger_keeps_event_bytes_and_init_does_not_downgrade() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        let payload = r#"{"slug":"auth","title":"Add auth"}"#;
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "
+                CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY,
+                    slug TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    claimed_by TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    ts TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (
+                        kind IN ('task_created', 'claimed', 'progress', 'decision', 'status_changed')
+                    ),
+                    payload TEXT NOT NULL
+                );
+                ",
+            )
+            .expect("v1 schema");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("version");
+            conn.execute(
+                "INSERT INTO events (id, ts, kind, payload) VALUES (7, '2026-01-01T00:00:00.000Z', 'task_created', ?1)",
+                rusqlite::params![payload],
+            )
+            .expect("insert");
+        }
+
+        let ledger = Ledger::open(&path).expect("migrate");
+        drop(ledger);
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        let stored: (i64, String, String, String) = conn
+            .query_row("SELECT id, ts, kind, payload FROM events", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("event");
+        assert_eq!(stored.0, 7);
+        assert_eq!(stored.1, "2026-01-01T00:00:00.000Z");
+        assert_eq!(stored.2, "task_created");
+        assert_eq!(stored.3, payload);
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 2);
+        let deps: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_deps'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("task_deps");
+        assert_eq!(deps, 1);
+
+        drop(conn);
+        Ledger::initialize(&path).expect("init existing");
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 2);
+        let stored_again: String = conn
+            .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
+                row.get(0)
+            })
+            .expect("payload");
+        assert_eq!(stored_again, payload);
     }
 }
