@@ -190,6 +190,46 @@ in the event payload. A second report for the same task and commit fails with
 is appended. `task done` on a task that is already done succeeds and does not write
 another event.
 
+## Auto mode
+
+Manual mode is the default. Auto mode spends plan usage: Claude plans and reviews, and Cursor implements, one task at a time, on a branch. Main changes only when you merge the pull request.
+
+Sign in to Claude Code and `cursor-agent` once. Then:
+
+```sh
+relaybook mode auto
+relaybook config set gates plan
+relaybook run --prd docs/prd.md
+```
+
+`gates` chooses the checkpoints:
+
+- `none` runs until the reviewer says the PRD is covered.
+- `plan` pauses after planning. Continue with `relaybook approve`.
+- `plan,review` also pauses after every review.
+
+Stop at the next safe boundary with `relaybook mode manual`. A stopped or paused run continues with `relaybook run --resume`. `relaybook run stop` ends it. `relaybook status` shows the mode, the call count, and whether the run is waiting on approval or a usage limit.
+
+The primary limits are cycles (20), agent calls (60), reopens per task (2), and the Cursor timeout (30 minutes). Override them on a run with `--max-cycles`, `--max-agent-calls`, `--max-reopens`, and `--cursor-timeout-min`. Dollars Claude reports are API-equivalent estimates. `est_cost_cap_usd` is optional and is mainly for API-key users; it is unset unless you set it. Hitting a plan usage limit pauses the run instead of failing it.
+
+Cursor runs with `--force` on the run branch only. Relaybook checks git before and after every agent call. A push to main, a tag, a branch switch, or a code edit by Claude stops the run. Transcripts are in `.relaybook/runs/<id>/` and are gitignored.
+
+A useful PRD states the goal, what is in scope, what is out of scope, and the acceptance checks. Clear checks mean fewer reopens and less plan usage.
+
+```md
+# Goal
+What the change should make true.
+
+# In scope
+The commands or files this run may add.
+
+# Out of scope
+What the run must leave alone.
+
+# Acceptance checks
+The commands or tests that show the goal is met.
+```
+
 ## Hand-back loop
 
 The executor finishes a task with a short report. Claude's project prompt hook reads
