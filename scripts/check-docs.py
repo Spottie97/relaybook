@@ -6,9 +6,20 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
-BIN = ROOT / "target" / "debug" / "relaybook"
+
+
+def binary() -> Optional[Path]:
+    debug = ROOT / "target" / "debug"
+    for name in ("relaybook", "relaybook.exe"):
+        path = debug / name
+        if path.is_file():
+            return path
+    return None
+
+
 FILES = [ROOT / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
 FENCE = re.compile(r"^```")
 INLINE = re.compile(r"`(relaybook(?:\s[^`]*)?)`")
@@ -41,8 +52,10 @@ def commands(text: str) -> list[str]:
 
 
 def main() -> int:
-    if not BIN.is_file():
-        print(f"missing {BIN}; run cargo build --bin relaybook", file=sys.stderr)
+    bin_path = binary()
+    if bin_path is None:
+        missing = ROOT / "target" / "debug" / "relaybook"
+        print(f"missing {missing}; run cargo build --bin relaybook", file=sys.stderr)
         return 1
     failed = 0
     seen = 0
@@ -60,7 +73,7 @@ def main() -> int:
                 failed += 1
                 continue
             result = subprocess.run(
-                [str(BIN), *args[1:], "--help"],
+                [str(bin_path), *args[1:], "--help"],
                 check=False,
                 capture_output=True,
                 text=True,
