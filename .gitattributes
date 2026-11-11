@@ -1,3 +1,4 @@
 graphify-out/graph.json merge=graphify
 *.sh text eol=lf
 install.sh text eol=lf
+crates/relaybook/templates/** text eol=lf
