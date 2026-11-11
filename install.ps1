@@ -95,7 +95,7 @@ function Write-InstallManifest {
     [System.IO.File]::WriteAllText($path, $json, $utf8)
 }
 
-function Get-UserPathItems {
+function Get-UserPathEntry {
     $user = [Environment]::GetEnvironmentVariable("Path", "User")
     if ([string]::IsNullOrEmpty($user)) {
         return @()
@@ -115,7 +115,7 @@ function Test-SamePath {
 
 function Add-UserPath {
     param([string]$Dir)
-    $items = @(Get-UserPathItems)
+    $items = @(Get-UserPathEntry)
     foreach ($item in $items) {
         if (Test-SamePath $item $Dir) {
             return $false
@@ -132,7 +132,7 @@ function Add-UserPath {
 
 function Remove-UserPath {
     param([string]$Dir)
-    $items = @(Get-UserPathItems)
+    $items = @(Get-UserPathEntry)
     $kept = @()
     $found = $false
     foreach ($item in $items) {

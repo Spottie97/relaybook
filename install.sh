@@ -223,6 +223,7 @@ PY
 modify_user_path() {
   action=$1
   dir=$2
+  # shellcheck disable=SC2016
   RELAYBOOK_PATH_ACTION=$action RELAYBOOK_PATH_DIR=$dir powershell.exe -NoProfile -Command '
     $dir = $env:RELAYBOOK_PATH_DIR
     $action = $env:RELAYBOOK_PATH_ACTION
