@@ -116,14 +116,13 @@ jobs:
           file "$bin" | grep -Eq 'statically linked|static-pie linked'
           set +e
           ldd_out=$(ldd "$bin" 2>&1)
-          ldd_status=$?
           set -e
           printf '%s\n' "$ldd_out"
-          if [ "$ldd_status" -eq 0 ]; then
-            echo "binary is dynamically linked" >&2
+          printf '%s\n' "$ldd_out" | grep -Eq 'statically linked|not a dynamic executable'
+          if printf '%s\n' "$ldd_out" | grep -q '\.so'; then
+            echo "binary links shared libraries" >&2
             exit 1
           fi
-          printf '%s\n' "$ldd_out" | grep -q 'not a dynamic executable'
       - name: package
         shell: bash
         run: |
