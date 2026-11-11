@@ -100,7 +100,9 @@ fn claude(args: &[String]) {
     let joined = args.join(" ");
     if kind() == "stop" && joined.contains("PRD:") {
         relay(&["run", "stop"]);
-        println!(r#"{{"session_id":"sess-1","total_cost_usd":0.20}}"#);
+        emit_stream(
+            r#"{"type":"result","session_id":"sess-1","total_cost_usd":0.20,"result":"stopped"}"#,
+        );
         return;
     }
     if kind() == "depend" && joined.contains("PRD:") {
@@ -113,7 +115,9 @@ fn claude(args: &[String]) {
             "--depends-on",
             "login",
         ]);
-        println!(r#"{{"session_id":"sess-1","total_cost_usd":0.20}}"#);
+        emit_stream(
+            r#"{"type":"result","session_id":"sess-1","total_cost_usd":0.20,"result":"planned"}"#,
+        );
         return;
     }
     if joined.contains("PRD:") {
@@ -140,7 +144,9 @@ fn claude(args: &[String]) {
         relay(&["report", "accept", "work"]);
         relay(&["run", "complete"]);
     }
-    println!(r#"{{"session_id":"sess-1","total_cost_usd":0.20}}"#);
+    emit_stream(
+        r#"{"type":"result","session_id":"sess-1","total_cost_usd":0.20,"result":"reviewed"}"#,
+    );
 }
 
 fn cursor(args: &[String]) {
@@ -192,7 +198,7 @@ fn cursor(args: &[String]) {
         "depend" => {
             let slug = task_slug(args).unwrap_or_else(|| "uploads".to_string());
             finish_slug(&slug);
-            println!(r#"{{"ok":true}}"#);
+            emit_stream(r#"{"type":"result","subtype":"success","ok":true}"#);
             return;
         }
         _ => {}
@@ -217,7 +223,23 @@ fn cursor(args: &[String]) {
     if kind() == "pushmain" {
         git(&["push", "origin", "HEAD:main"]);
     }
-    println!(r#"{{"ok":true}}"#);
+    emit_stream(r#"{"type":"result","subtype":"success","ok":true}"#);
+}
+
+fn emit_stream(result: &str) {
+    println!(
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Planning the next step."}}]}}}}"#
+    );
+    println!(
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Read","input":{{"file_path":"src/x.rs"}}}}]}}}}"#
+    );
+    println!(
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Edit","input":{{"file_path":"src/y.rs"}}}}]}}}}"#
+    );
+    println!(
+        r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"command":"cargo test"}}}}]}}}}"#
+    );
+    println!("{result}");
 }
 
 fn task_slug(args: &[String]) -> Option<String> {

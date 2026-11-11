@@ -317,6 +317,10 @@ impl Ledger {
         crate::runs::active(&self.conn)
     }
 
+    pub fn latest_run(&self) -> Result<Option<crate::runs::Run>, Error> {
+        crate::runs::latest(&self.conn)
+    }
+
     pub fn resumable_run(&self) -> Result<Option<crate::runs::Run>, Error> {
         crate::runs::resumable(&self.conn)
     }

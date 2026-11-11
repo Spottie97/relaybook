@@ -141,6 +141,9 @@ enum Command {
         /// Leave tasks that already exist out of this run.
         #[arg(long)]
         new_only: bool,
+        /// Print phase headers and the closing summary only.
+        #[arg(long)]
+        quiet: bool,
         #[command(subcommand)]
         action: Option<RunAction>,
     },
@@ -293,6 +296,8 @@ enum RunAction {
     Complete,
     /// Link unfinished tasks to the active run.
     Add { slug: Vec<String> },
+    /// Print the live log and follow it until the run pauses or ends.
+    Watch,
 }
 
 #[derive(Subcommand)]
@@ -548,6 +553,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             est_cost_cap_usd,
             gates,
             new_only,
+            quiet,
             action,
         } => {
             let prd = match (prd, prd_path) {
@@ -557,11 +563,12 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                 (Some(path), None) | (None, Some(path)) => Some(path),
                 (None, None) => None,
             };
-            let (stop, complete, add) = match action {
-                Some(RunAction::Stop) => (true, false, Vec::new()),
-                Some(RunAction::Complete) => (false, true, Vec::new()),
-                Some(RunAction::Add { slug }) => (false, false, slug),
-                None => (false, false, Vec::new()),
+            let (stop, complete, watch, add) = match action {
+                Some(RunAction::Stop) => (true, false, false, Vec::new()),
+                Some(RunAction::Complete) => (false, true, false, Vec::new()),
+                Some(RunAction::Watch) => (false, false, true, Vec::new()),
+                Some(RunAction::Add { slug }) => (false, false, false, slug),
+                None => (false, false, false, Vec::new()),
             };
             run_auto(
                 &cwd,
@@ -573,6 +580,8 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                     complete,
                     add,
                     new_only,
+                    quiet,
+                    watch,
                     max_cycles,
                     max_agent_calls,
                     max_reopens,
@@ -592,6 +601,8 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                 complete: false,
                 add: Vec::new(),
                 new_only: false,
+                quiet: false,
+                watch: false,
                 max_cycles: None,
                 max_agent_calls: None,
                 max_reopens: None,
@@ -936,7 +947,18 @@ fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
 fn show_status(cwd: &Path) -> Result<Outcome, Fail> {
     let ledger = open_ledger(cwd)?;
     let view = ledger.status_view()?;
-    json_outcome(view.clone(), relaybook_core::format_status(&view))
+    let mut human = relaybook_core::format_status(&view);
+    if let Some(run) = &view.run {
+        let lines = crate::live::tail(cwd, run.id, 5);
+        if !lines.is_empty() {
+            human.push_str("live:\n");
+            for line in lines {
+                human.push_str(&line);
+                human.push('\n');
+            }
+        }
+    }
+    json_outcome(view.clone(), human)
 }
 
 fn kept_lines(lines: &[String]) -> Vec<String> {

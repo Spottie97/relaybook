@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use relaybook_core::{Ledger, Run};
 
@@ -14,6 +15,8 @@ pub(crate) struct Launch {
     pub complete: bool,
     pub add: Vec<String>,
     pub new_only: bool,
+    pub quiet: bool,
+    pub watch: bool,
     pub max_cycles: Option<i64>,
     pub max_agent_calls: Option<i64>,
     pub max_reopens: Option<i64>,
@@ -37,6 +40,9 @@ pub(crate) fn execute(cwd: &Path, launch: Launch) -> RunOutput {
     if launch.stop {
         return stop_requested(&db);
     }
+    if launch.watch {
+        return watch_run(cwd);
+    }
     if !launch.add.is_empty() {
         return add_to_run(&db, &launch.add);
     }
@@ -50,7 +56,7 @@ pub(crate) fn execute(cwd: &Path, launch: Launch) -> RunOutput {
     } else if let Err(err) = begin_run(&db, cwd, launch.prd.as_deref(), launch.new_only) {
         return fail(&err);
     }
-    drive(&db, cwd)
+    drive(&db, cwd, launch.quiet)
 }
 
 fn complete_run(db: &Path) -> RunOutput {
@@ -227,6 +233,53 @@ fn absorb_after_plan(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> Option<R
     }
 }
 
+fn watch_run(cwd: &Path) -> RunOutput {
+    let Some(db) = paths::ledger_path(cwd) else {
+        return fail("no ledger found (run `relaybook init`)");
+    };
+    let run_id = {
+        let Ok(ledger) = Ledger::open(&db) else {
+            return fail("no ledger found (run `relaybook init`)");
+        };
+        match ledger.latest_run() {
+            Ok(Some(run)) => run.id,
+            Ok(None) => return fail("no run to watch"),
+            Err(err) => return fail(&err.to_string()),
+        }
+    };
+    let path = crate::live::log_path(cwd, run_id);
+    match crate::live::follow(&path, || watch_message(&db, run_id)) {
+        Ok(()) => ok(""),
+        Err(err) => fail(&err.to_string()),
+    }
+}
+
+fn watch_message(db: &Path, run_id: i64) -> Option<String> {
+    let Ok(ledger) = Ledger::open(db) else {
+        return Some("halted: no ledger".to_string());
+    };
+    let Ok(Some(run)) = ledger.latest_run() else {
+        return Some("finished".to_string());
+    };
+    if run.id != run_id {
+        return Some("finished".to_string());
+    }
+    match run.status.as_str() {
+        "active" => None,
+        "waiting" => Some("checkpoint: waiting for approval".to_string()),
+        "paused" => Some(format!(
+            "paused: {}",
+            run.stop_reason.unwrap_or_else(|| "usage limit".to_string())
+        )),
+        "stopped" => Some(format!(
+            "halted: {}",
+            run.stop_reason.unwrap_or_else(|| "stopped".to_string())
+        )),
+        "complete" => Some("finished".to_string()),
+        other => Some(format!("finished: {other}")),
+    }
+}
+
 fn add_to_run(db: &Path, slugs: &[String]) -> RunOutput {
     let mut ledger = match Ledger::open(db) {
         Ok(ledger) => ledger,
@@ -273,8 +326,9 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn drive(db: &Path, cwd: &Path) -> RunOutput {
+fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
     let mut transcript = 1_u32;
+    let mut session = None;
     loop {
         let mut ledger = match Ledger::open(db) {
             Ok(ledger) => ledger,
@@ -340,8 +394,12 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
                 Ok(before) => before,
                 Err(err) => return fail(&err),
             };
+            let live = live_session(&mut session, cwd, run_id, quiet);
+            live.begin("● Planning (claude)");
+            let started = Instant::now();
             let result =
-                agents::call_claude(cwd, Role::Planner, &prompt, budget.as_deref(), run_id);
+                agents::call_claude(cwd, Role::Planner, &prompt, budget.as_deref(), run_id, live);
+            let elapsed = started.elapsed();
             let _ = agents::write_transcript(
                 cwd,
                 run_id,
@@ -351,13 +409,24 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
             );
             transcript += 1;
             if let Err(err) = guard_claude(cwd, &before) {
+                close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
                 return halt_db(db, cwd, &err);
             }
             if let Some(output) = take_agent(db, cwd, &result, "claude") {
+                close_live(
+                    &mut session,
+                    cwd,
+                    run_id,
+                    quiet,
+                    elapsed,
+                    &result,
+                    agent_outcome(&result),
+                );
                 return output;
             }
             if matches!(result, AgentResult::Failed { .. }) {
-                return bump_failure(db, cwd);
+                close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "failed");
+                return bump_failure(db, cwd, quiet);
             }
             let mut ledger = match Ledger::open(db) {
                 Ok(ledger) => ledger,
@@ -371,6 +440,7 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
             };
             note_cost(&mut run, &result);
             if let Some(output) = absorb_after_plan(cwd, &mut ledger, &mut run) {
+                close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
                 return output;
             }
             let gates = ledger.settings().map(|item| item.gates).unwrap_or_default();
@@ -379,6 +449,12 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
             } else {
                 "execute".to_string()
             };
+            let outcome = if run.stage == "gate_plan" {
+                "paused at checkpoint"
+            } else {
+                "planned"
+            };
+            close_live(&mut session, cwd, run_id, quiet, elapsed, &result, outcome);
             println!("{}", plan_line(&run));
             if run.stage == "gate_plan" {
                 run.status = "waiting".to_string();
@@ -413,8 +489,18 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
                 Ok(before) => before,
                 Err(err) => return fail(&err),
             };
-            let result =
-                agents::call_claude(cwd, Role::Reviewer, &prompt, budget.as_deref(), run_id);
+            let live = live_session(&mut session, cwd, run_id, quiet);
+            live.begin(&format!("● Reviewing {slug} (claude)"));
+            let started = Instant::now();
+            let result = agents::call_claude(
+                cwd,
+                Role::Reviewer,
+                &prompt,
+                budget.as_deref(),
+                run_id,
+                live,
+            );
+            let elapsed = started.elapsed();
             let _ = agents::write_transcript(
                 cwd,
                 run_id,
@@ -424,13 +510,24 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
             );
             transcript += 1;
             if let Err(err) = guard_claude(cwd, &before) {
+                close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
                 return halt_db(db, cwd, &err);
             }
             if let Some(output) = take_agent(db, cwd, &result, "claude") {
+                close_live(
+                    &mut session,
+                    cwd,
+                    run_id,
+                    quiet,
+                    elapsed,
+                    &result,
+                    agent_outcome(&result),
+                );
                 return output;
             }
             if matches!(result, AgentResult::Failed { .. }) {
-                return bump_failure(db, cwd);
+                close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "failed");
+                return bump_failure(db, cwd, quiet);
             }
             let mut ledger = match Ledger::open(db) {
                 Ok(ledger) => ledger,
@@ -450,10 +547,19 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
                     if let Err(err) = ledger.save_run(&run) {
                         return fail(&err.to_string());
                     }
-                    return bump_failure(db, cwd);
+                    close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "failed");
+                    return bump_failure(db, cwd, quiet);
                 }
             };
             run.failure_streak = 0;
+            let outcome = if verdict == "reopened" {
+                "reopened"
+            } else if gates == "plan,review" {
+                "paused at checkpoint"
+            } else {
+                "accepted"
+            };
+            close_live(&mut session, cwd, run_id, quiet, elapsed, &result, outcome);
             println!("{}", review_line(&run, &slug, &verdict, &gates));
             run.stage = format!("gate_review:{verdict}");
             if gates == "plan,review" {
@@ -539,7 +645,12 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
             Ok(before) => before,
             Err(err) => return fail(&err),
         };
-        let result = agents::call_cursor(cwd, &prompt, timeout, run_id);
+        let cycle = run.cycle;
+        let live = live_session(&mut session, cwd, run_id, quiet);
+        live.begin(&format!("● Task {slug} (cursor), cycle {cycle}"));
+        let started = Instant::now();
+        let result = agents::call_cursor(cwd, &prompt, timeout, run_id, live);
+        let elapsed = started.elapsed();
         let _ = agents::write_transcript(
             cwd,
             run_id,
@@ -549,9 +660,19 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
         );
         transcript += 1;
         if let Err(err) = guard_cursor(cwd, &before, &branch) {
+            close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
             return halt_db(db, cwd, &err);
         }
         if let Some(output) = take_agent(db, cwd, &result, "cursor") {
+            close_live(
+                &mut session,
+                cwd,
+                run_id,
+                quiet,
+                elapsed,
+                &result,
+                agent_outcome(&result),
+            );
             return output;
         }
         let mut ledger = match Ledger::open(db) {
@@ -574,6 +695,15 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
             .flatten()
             .map(|(bytes, _)| bytes);
         if blocked {
+            close_live(
+                &mut session,
+                cwd,
+                run_id,
+                quiet,
+                elapsed,
+                &result,
+                "blocked",
+            );
             println!(
                 "{}",
                 cursor_line(&run, &slug, "blocked", 0, &settings.est_cost_cap_usd)
@@ -581,6 +711,7 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
             return halt(cwd, &mut ledger, &mut run, &format!("blocked: {slug}"));
         }
         if !done || report_bytes.is_none() {
+            close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "failed");
             run.failure_streak += 1;
             if let Err(err) = ledger.save_run(&run) {
                 return fail(&err.to_string());
@@ -592,6 +723,7 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
         }
         run.failure_streak = 0;
         run.stage = "review".to_string();
+        close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "done");
         println!(
             "{}",
             cursor_line(
@@ -708,7 +840,7 @@ fn halt_db(db: &Path, cwd: &Path, reason: &str) -> RunOutput {
     halt(cwd, &mut ledger, &mut run, reason)
 }
 
-fn bump_failure(db: &Path, cwd: &Path) -> RunOutput {
+fn bump_failure(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
     let Ok(mut ledger) = Ledger::open(db) else {
         return fail("no ledger");
     };
@@ -727,7 +859,7 @@ fn bump_failure(db: &Path, cwd: &Path) -> RunOutput {
     if let Err(err) = ledger.save_run(&run) {
         return fail(&err.to_string());
     }
-    drive(db, cwd)
+    drive(db, cwd, quiet)
 }
 
 fn take_agent(db: &Path, cwd: &Path, result: &AgentResult, cli: &str) -> Option<RunOutput> {
@@ -775,6 +907,47 @@ fn result_text(result: &AgentResult) -> String {
         | AgentResult::Failed { output } => output.clone(),
         AgentResult::TimedOut => "timeout".to_string(),
     }
+}
+
+fn live_session<'a>(
+    slot: &'a mut Option<crate::live::Session>,
+    cwd: &Path,
+    run_id: i64,
+    quiet: bool,
+) -> &'a mut crate::live::Session {
+    if slot.is_none() {
+        *slot = Some(crate::live::Session::open(cwd, run_id, quiet));
+    }
+    slot.as_mut().expect("live session")
+}
+
+fn close_live(
+    slot: &mut Option<crate::live::Session>,
+    cwd: &Path,
+    run_id: i64,
+    quiet: bool,
+    elapsed: Duration,
+    result: &AgentResult,
+    outcome: &str,
+) {
+    live_session(slot, cwd, run_id, quiet).end(&close_line(elapsed, result, outcome));
+}
+
+fn agent_outcome(result: &AgentResult) -> &'static str {
+    match result {
+        AgentResult::UsageLimit { .. } => "paused",
+        AgentResult::TimedOut => "timed out",
+        AgentResult::Failed { .. } => "failed",
+        AgentResult::Finished { .. } => "done",
+    }
+}
+
+fn close_line(elapsed: Duration, result: &AgentResult, outcome: &str) -> String {
+    let cost = match result {
+        AgentResult::Finished { est_cost_usd, .. } => *est_cost_usd,
+        _ => 0.0,
+    };
+    format!("  {outcome} in {}s, est ${cost:.2}", elapsed.as_secs())
 }
 
 fn plan_line(run: &Run) -> String {

@@ -8,7 +8,7 @@ If the user passed arguments, run `relaybook` with those arguments and reply in 
 If there are no arguments, run `relaybook status` and list only the choices that apply:
 - Switch mode: `relaybook mode manual` or `relaybook mode auto`
 - Change checkpoints: `relaybook gates none`, `relaybook gates plan`, or `relaybook gates plan,review`
-- Start a run: ask for the PRD path, then run `relaybook run <prd>`
+- Start a run: ask for the PRD path, then run `relaybook run <prd>` in the background. Tell the user to follow it with `relaybook run watch`. `relaybook status` shows the latest lines.
 - Approve, only when a run is waiting: `relaybook approve`
 - Inbox, only when reports are unreviewed: `relaybook inbox`
 

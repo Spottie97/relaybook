@@ -90,11 +90,13 @@ The planner runs `relaybook inbox`, then `relaybook report accept greet` or `rel
 ```sh
 relaybook run docs/prd.md
 relaybook run --new-only docs/prd.md
+relaybook run --quiet docs/prd.md
 relaybook run add login
+relaybook run watch
 relaybook run stop
 ```
 
-`relaybook run` adopts open and claimed tasks that have no run. `--new-only` skips that. `relaybook run add` links unfinished tasks to the active run. A done task is rejected.
+`relaybook run` adopts open and claimed tasks that have no run. `--new-only` skips that. `relaybook run add` links unfinished tasks to the active run. A done task is rejected. `--quiet` prints phase headers and the closing summary. `relaybook run watch` prints `.relaybook/runs/<id>/live.log` and follows it until the run pauses or ends. `relaybook status` appends the latest live lines while a run is active.
 
 ## Install and setup
 

@@ -21,6 +21,21 @@ pub struct Run {
     pub complete_requested: bool,
 }
 
+pub fn latest(conn: &Connection) -> Result<Option<Run>, Error> {
+    let row = conn
+        .query_row(
+            "SELECT id, prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd,
+                    status, stop_reason, started_at, failure_streak, current_slug, complete_requested
+             FROM runs
+             ORDER BY id DESC
+             LIMIT 1",
+            [],
+            read_run,
+        )
+        .optional()?;
+    Ok(row)
+}
+
 pub fn active(conn: &Connection) -> Result<Option<Run>, Error> {
     let row = conn
         .query_row(

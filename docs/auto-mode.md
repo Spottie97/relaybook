@@ -31,6 +31,7 @@ relaybook run add login
 | Mode | `/relaybook mode` or `/relaybook mode auto` | `relaybook mode` or `relaybook mode auto` |
 | Checkpoints | `/relaybook gates` or `/relaybook gates plan` | `relaybook gates` or `relaybook gates plan` |
 | Start a run | `/relaybook run docs/prd.md` | `relaybook run docs/prd.md` |
+| Follow a run | `/relaybook run watch` | `relaybook run watch` |
 | Approve a checkpoint | `/relaybook approve` | `relaybook approve` |
 | Inbox | `/relaybook inbox` | `relaybook inbox` |
 
@@ -46,6 +47,15 @@ relaybook approve
 - `none` runs until the reviewer says the PRD is covered.
 - `plan` pauses after planning. Continue with `relaybook approve`.
 - `plan,review` also pauses after every review.
+
+The terminal prints each phase as it happens: `● Planning (claude)`, `● Task greet (cursor), cycle 3`, and `● Reviewing greet (claude)`. Tool calls and the first line of the agent's text print under the phase. The closing line gives the duration, the estimated cost, and the outcome (`done`, `reopened`, `accepted`, or `paused at checkpoint`). `relaybook run --quiet docs/prd.md` prints the phase headers and the closing summary only. The same lines are appended to `.relaybook/runs/<id>/live.log`.
+
+```sh
+relaybook run watch
+relaybook run --quiet docs/prd.md
+```
+
+`relaybook run watch` prints the log so far and follows it until the run leaves `active`. A checkpoint prints `checkpoint: waiting for approval`. A usage limit prints `paused:`. A stop prints `halted:`. A finished run prints `finished`. `relaybook status` includes the latest live lines while a run is active, waiting, or paused.
 
 Stop at the next safe boundary with `relaybook mode manual`. A stopped or paused run continues with `relaybook run --resume`. `relaybook run stop` ends it. `relaybook run complete` marks the PRD covered, and the loop opens the pull request when nothing is still open. `relaybook status` shows the mode, the call count, and whether the run is waiting on approval or a usage limit.
 

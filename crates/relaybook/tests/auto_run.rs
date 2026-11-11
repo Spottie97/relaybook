@@ -208,6 +208,103 @@ fn positional_prd_starts_a_run() {
 }
 
 #[test]
+fn live_output_is_logged_and_watch_stops_at_a_checkpoint() {
+    let dir = repo();
+    relaybook(dir.path())
+        .args(["config", "set", "gates", "plan"])
+        .assert()
+        .success();
+    let output = run(dir.path(), "happy", &["run", "--prd", "prd.md"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("● Planning (claude)"), "{text}");
+    assert!(text.contains("  ⎿ Read src/x.rs"), "{text}");
+    assert!(text.contains("  ⎿ Edit src/y.rs"), "{text}");
+    assert!(text.contains("  ⎿ Bash cargo test"), "{text}");
+    assert!(text.contains("Planning the next step."), "{text}");
+    assert!(text.contains("paused at checkpoint"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text}");
+    assert!(args_contain(dir.path(), "claude.args", "stream-json"));
+    assert!(args_contain(dir.path(), "claude.args", "--verbose"));
+    let log = live_log(dir.path());
+    assert!(log.contains("● Planning (claude)"), "{log}");
+    assert!(log.contains("Read src/x.rs"), "{log}");
+    let status = relaybook(dir.path())
+        .arg("status")
+        .output()
+        .expect("status");
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("live:"), "{status}");
+    assert!(status.contains("Planning"), "{status}");
+    let output = run(dir.path(), "happy", &["run", "watch"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("● Planning (claude)"), "{text}");
+    assert!(text.contains("checkpoint: waiting for approval"), "{text}");
+}
+
+#[test]
+fn watch_exits_when_the_run_has_finished() {
+    let dir = repo();
+    let output = run(dir.path(), "happy", &["run", "--prd", "prd.md"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = run(dir.path(), "happy", &["run", "watch"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("● Task work (cursor), cycle 1"), "{text}");
+    assert!(text.contains("  done in "), "{text}");
+    assert!(text.contains("finished"), "{text}");
+    assert!(!text.contains("checkpoint:"), "{text}");
+}
+
+#[test]
+fn quiet_run_prints_headers_and_still_writes_the_log() {
+    let dir = repo();
+    relaybook(dir.path())
+        .args(["config", "set", "gates", "plan"])
+        .assert()
+        .success();
+    let output = run(dir.path(), "happy", &["run", "--quiet", "--prd", "prd.md"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("● Planning (claude)"), "{text}");
+    assert!(text.contains("paused at checkpoint"), "{text}");
+    assert!(!text.contains("src/x.rs"), "{text}");
+    assert!(!text.contains("Planning the next step."), "{text}");
+    let log = live_log(dir.path());
+    assert!(log.contains("Read src/x.rs"), "{log}");
+    assert!(log.contains("Planning the next step."), "{log}");
+}
+
+fn live_log(dir: &Path) -> String {
+    let runs = dir.join(".relaybook").join("runs");
+    let mut text = String::new();
+    let Ok(entries) = fs::read_dir(runs) else {
+        return text;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path().join("live.log");
+        if let Ok(body) = fs::read_to_string(path) {
+            text.push_str(&body);
+        }
+    }
+    text
+}
+
+#[test]
 fn plan_gate_waits_and_approve_finishes() {
     let dir = repo();
     relaybook(dir.path())

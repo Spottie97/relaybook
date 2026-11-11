@@ -581,6 +581,7 @@ fn setup_installs_and_preserves_the_claude_command() {
     );
     assert!(body.contains("AskUserQuestion"), "{body}");
     assert!(body.contains("run_in_background"), "{body}");
+    assert!(body.contains("relaybook run watch"), "{body}");
 
     setup_plain(dir.path(), &["setup", "--no-graphify"])
         .assert()

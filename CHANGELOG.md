@@ -4,6 +4,10 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 
 ## [Unreleased]
 
+### Added
+
+- Auto runs print each phase, tool call, and the first line of agent text as they happen, and append the same lines to `.relaybook/runs/<id>/live.log`. `relaybook run watch` follows that log until the run pauses or ends. `relaybook run --quiet` prints the phase headers and the closing summary. `relaybook status` shows the latest live lines.
+
 ### Fixed
 
 - `relaybook setup` writes `.gitignore` and `.gitattributes` entries in a `# relaybook:start` block. A trailing `# relaybook` comment is not valid git syntax, so those ignore rules and the Graphify merge driver never took effect. Every setup repairs an old attribute line, including `setup` without `--ci`.

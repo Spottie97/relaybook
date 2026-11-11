@@ -102,6 +102,7 @@ Manual mode is the default. `/relaybook` shows the current status and a menu. `/
 | Mode | `/relaybook mode` or `/relaybook mode auto` | `relaybook mode` or `relaybook mode auto` |
 | Checkpoints | `/relaybook gates` or `/relaybook gates plan` | `relaybook gates` or `relaybook gates plan` |
 | Start a run | `/relaybook run docs/prd.md` | `relaybook run docs/prd.md` |
+| Follow a run | `/relaybook run watch` | `relaybook run watch` |
 | Approve a checkpoint | `/relaybook approve` | `relaybook approve` |
 | Inbox | `/relaybook inbox` | `relaybook inbox` |
 
@@ -111,7 +112,7 @@ relaybook gates plan
 relaybook run docs/prd.md
 ```
 
-`plan` pauses after planning. Continue with `relaybook approve`. Limits, safety checks, and a PRD template are in [docs/auto-mode.md](docs/auto-mode.md).
+`plan` pauses after planning. Continue with `relaybook approve`. The terminal shows each phase as it happens, and `relaybook run watch` follows a run that was started in the background. `relaybook run --quiet docs/prd.md` prints only the phase headers and the closing summary. Limits, safety checks, and a PRD template are in [docs/auto-mode.md](docs/auto-mode.md).
 
 ## Token savings
 

@@ -1,7 +1,11 @@
-use std::io::Write as _;
+use std::io::{BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+use crate::live::Session;
+use crate::stream;
 
 const PLANNER: &str = include_str!("../templates/auto-planner.md");
 const REVIEWER: &str = include_str!("../templates/auto-reviewer.md");
@@ -104,6 +108,7 @@ pub(crate) fn call_claude(
     prompt: &str,
     budget: Option<&str>,
     run_id: i64,
+    live: &mut Session,
 ) -> AgentResult {
     let Some(program) = crate::exe::Program::resolve("claude") else {
         return AgentResult::Failed {
@@ -116,7 +121,8 @@ pub(crate) fn call_claude(
         .arg("-p")
         .arg(prompt)
         .arg("--output-format")
-        .arg("json")
+        .arg("stream-json")
+        .arg("--verbose")
         .arg("--append-system-prompt")
         .arg(role.template())
         .arg("--allowedTools")
@@ -125,28 +131,44 @@ pub(crate) fn call_claude(
         .arg("default")
         .arg("--disallowedTools")
         .arg("Edit,Write,NotebookEdit")
-        .env("RELAYBOOK_RUN_ID", run_id.to_string());
+        .env("RELAYBOOK_RUN_ID", run_id.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     if let Some(budget) = budget {
         command.arg("--max-budget-usd").arg(budget);
     }
-    let output = command.output();
-    finish("claude", output)
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return AgentResult::Failed {
+                output: err.to_string(),
+            };
+        }
+    };
+    drive(child, None, "claude", live)
 }
 
-pub(crate) fn call_cursor(cwd: &Path, prompt: &str, timeout: Duration, run_id: i64) -> AgentResult {
+pub(crate) fn call_cursor(
+    cwd: &Path,
+    prompt: &str,
+    timeout: Duration,
+    run_id: i64,
+    live: &mut Session,
+) -> AgentResult {
     let Some(program) = crate::exe::resolve_cursor() else {
         return AgentResult::Failed {
             output: "cursor: not on PATH; install Cursor CLI (`cursor-agent` or `agent`)"
                 .to_string(),
         };
     };
-    let mut child = match program
+    let child = match program
         .command()
         .current_dir(cwd)
         .arg("-p")
         .arg("--force")
         .arg("--output-format")
-        .arg("json")
+        .arg("stream-json")
+        .arg("--stream-partial-output")
         .arg(prompt)
         .env("RELAYBOOK_RUN_ID", run_id.to_string())
         .stdout(Stdio::piped())
@@ -160,29 +182,93 @@ pub(crate) fn call_cursor(cwd: &Path, prompt: &str, timeout: Duration, run_id: i
             };
         }
     };
+    drive(child, Some(timeout), "cursor", live)
+}
+
+fn drive(
+    mut child: std::process::Child,
+    timeout: Option<Duration>,
+    cli: &str,
+    live: &mut Session,
+) -> AgentResult {
+    let Some(stdout) = child.stdout.take() else {
+        return AgentResult::Failed {
+            output: "missing stdout".to_string(),
+        };
+    };
+    let Some(stderr) = child.stderr.take() else {
+        return AgentResult::Failed {
+            output: "missing stderr".to_string(),
+        };
+    };
+    let (tx, rx) = mpsc::channel();
+    let stdout_thread = std::thread::spawn(move || {
+        stream::read_lines(BufReader::new(stdout), |line| {
+            let _ = tx.send(line.to_string());
+        });
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut text = String::new();
+        stream::read_lines(BufReader::new(stderr), |line| {
+            text.push_str(line);
+            text.push('\n');
+        });
+        text
+    });
     let started = Instant::now();
+    let mut raw = String::new();
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stdout);
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                raw.push_str(&line);
+                raw.push('\n');
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    for piece in stream::pieces(&value) {
+                        live.observe(&piece);
+                    }
                 }
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = std::io::Read::read_to_string(&mut pipe, &mut stderr);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_thread.join();
+                    let _ = stderr_thread.join();
+                    return AgentResult::TimedOut;
                 }
-                return classify("cursor", status.success(), &stdout, &stderr);
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        while let Ok(line) = rx.try_recv() {
+                            raw.push_str(&line);
+                            raw.push('\n');
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                                for piece in stream::pieces(&value) {
+                                    live.observe(&piece);
+                                }
+                            }
+                        }
+                        let _ = stdout_thread.join();
+                        let stderr = stderr_thread.join().unwrap_or_default();
+                        return classify(cli, status.success(), &raw, &stderr);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = child.kill();
+                        return AgentResult::Failed {
+                            output: err.to_string(),
+                        };
+                    }
+                }
             }
-            Ok(None) if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return AgentResult::TimedOut;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(err) => {
-                return AgentResult::Failed {
-                    output: err.to_string(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let status = child.wait();
+                let _ = stdout_thread.join();
+                let stderr = stderr_thread.join().unwrap_or_default();
+                return match status {
+                    Ok(status) => classify(cli, status.success(), &raw, &stderr),
+                    Err(err) => AgentResult::Failed {
+                        output: err.to_string(),
+                    },
                 };
             }
         }
@@ -218,20 +304,6 @@ pub(crate) fn cursor_timeout(minutes: i64) -> Duration {
         return Duration::from_secs(seconds);
     }
     Duration::from_secs(u64::try_from(minutes.max(1)).unwrap_or(60) * 60)
-}
-
-fn finish(cli: &str, output: std::io::Result<std::process::Output>) -> AgentResult {
-    match output {
-        Ok(output) => classify(
-            cli,
-            output.status.success(),
-            &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
-        ),
-        Err(err) => AgentResult::Failed {
-            output: err.to_string(),
-        },
-    }
 }
 
 pub(crate) fn classify(cli: &str, ok: bool, stdout: &str, stderr: &str) -> AgentResult {
