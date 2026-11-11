@@ -78,3 +78,47 @@ curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh
 `--yes` also runs `rtk init -g` without the y/N prompt. Without a terminal and without `--yes`, the installer prints `rtk init -g` instead of editing `~/.claude/settings.json`. `relaybook setup` never installs RTK and never edits that global file. The pull hooks run `graphify update .` in the background and print nothing. Graphify's editor hook does not rewrite `relaybook` commands.
 
 `scripts/measure-context.sh --check` fails when fixture context exceeds 4000 bytes, a write acknowledgement exceeds 120 bytes, or an instruction block exceeds 600 bytes. Role prompts stay under 1200 bytes. Slash commands stay under 1500 bytes.
+
+## Uninstall
+
+`relaybook uninstall` reverses what `relaybook setup` added. It prints one line per item, then asks `y/N`. `--yes` skips the question. `--dry-run` prints the list and changes nothing.
+
+```sh
+relaybook uninstall --dry-run
+relaybook uninstall --yes
+relaybook uninstall --yes --purge
+relaybook uninstall --yes --graphify
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--dry-run` | Show what would change. Write nothing |
+| `--yes` | Apply without asking |
+| `--purge` | Also delete `.relaybook/` and `graphify-out/`. Asks `y/N` unless `--yes` is set |
+| `--graphify` | Also run `graphify claude uninstall`, `graphify cursor uninstall`, and `graphify hook uninstall` |
+
+What it removes, and only inside Relaybook's markers or the setup manifest:
+
+- The Relaybook blocks in `CLAUDE.md` and `AGENTS.md`. A file that becomes empty is deleted. Other text stays.
+- `.claude/commands/relaybook.md` and `.cursor/commands/relaybook.md` when they still contain `relaybook:managed`. An edited command file is kept.
+- The `UserPromptSubmit` hook that runs `relaybook hook prompt`.
+- The `command -v graphify` guards wrapped around Graphify's `PreToolUse` hooks. Graphify's own hooks stay.
+- The post-merge and post-rewrite blocks between the relaybook hook markers.
+- `.gitignore` and `.gitattributes` lines marked `# relaybook`.
+- `.github/workflows/graphify-update.yml` when it still matches the template, the graphify merge attribute, and `merge.graphify.name` / `merge.graphify.driver`.
+
+What it keeps unless you pass `--purge`:
+
+- `.relaybook/`, including the ledger. That is project data.
+- `graphify-out/`.
+- Graphify and RTK themselves. `--graphify` only calls Graphify's project uninstall commands.
+
+Uninstall refuses while an auto run is active. Stop it with `relaybook run stop` first. Running uninstall again is safe.
+
+The machine installer is separate:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --uninstall
+```
+
+That removes the `relaybook` binary the installer wrote. Graphify and RTK are removed only when the installer added them, and only after a `y/N` for each tool (`--yes` skips the questions). Tools that were already installed are kept. If another `relaybook` remains on `PATH` from `~/.cargo/bin`, the installer prints `cargo uninstall relaybook` instead of deleting it. Run `relaybook uninstall` in each project before removing the binary.

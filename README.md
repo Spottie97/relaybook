@@ -60,6 +60,16 @@ curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh
 
 Any agent that can run a shell command can join. There is no server and no protocol.
 
+## Uninstall
+
+In a project, `relaybook uninstall` removes the files and hooks setup added. The ledger stays. `relaybook uninstall --purge` deletes `.relaybook/` too.
+
+On a machine:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --uninstall
+```
+
 <img alt="Demo: setup, claim a task, file a report, and read the inbox" src="docs/demo.gif" width="720">
 
 ## How it works

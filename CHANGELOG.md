@@ -16,6 +16,7 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 - A one-line installer with `--upgrade`.
 - Auto mode: Claude plans and reviews, Cursor implements, with checkpoints and usage limits.
 - `/relaybook` in Claude Code and Cursor, and terminal pickers for `mode` and `gates`.
+- `relaybook uninstall` removes what `relaybook setup` added to a project. `install.sh --uninstall` removes the binary and, when the installer added them, Graphify and RTK.
 
 ### Changed
 
