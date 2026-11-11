@@ -60,7 +60,7 @@ def main() -> int:
     failed = 0
     seen = 0
     for path in FILES:
-        for command in commands(path.read_text()):
+        for command in commands(path.read_text(encoding="utf-8")):
             seen += 1
             try:
                 args = shlex.split(command)
@@ -77,6 +77,7 @@ def main() -> int:
                 check=False,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
             )
             if result.returncode != 0:
                 print(f"{path.name}: {command}", file=sys.stderr)
