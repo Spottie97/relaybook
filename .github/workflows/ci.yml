@@ -108,7 +108,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: relaybook-linux-x86_64
             binary: relaybook
