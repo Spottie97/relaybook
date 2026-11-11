@@ -58,6 +58,7 @@ pub(crate) fn run(cwd: &Path, options: Options) -> Result<Report, Error> {
     record_graphify(&root, &options, &mut steps);
     record_graphify_guards(&root, &mut steps);
     record_ignore(&root, &options, &mut steps)?;
+    record_attribute_repair(&root, &mut steps)?;
     record_hooks(&root, &options, &mut steps);
     record_rtk(&mut steps);
     if options.ci {
@@ -227,6 +228,31 @@ fn record_ignore(root: &Path, options: &Options, steps: &mut Vec<Step>) -> Resul
         };
         push(steps, "gitignore", "skipped", detail);
     }
+    Ok(())
+}
+
+fn record_attribute_repair(root: &Path, steps: &mut Vec<Step>) -> Result<(), Error> {
+    let path = root.join(".gitattributes");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let original = std::fs::read_to_string(&path)?;
+    let next = crate::managed::repair_attributes(&original);
+    if next == original {
+        return Ok(());
+    }
+    if next.is_empty() {
+        std::fs::remove_file(&path)?;
+    } else {
+        std::fs::write(&path, next)?;
+    }
+    crate::workflow::register_driver(root);
+    push(
+        steps,
+        "gitattributes",
+        "done",
+        "repaired the merge attribute",
+    );
     Ok(())
 }
 

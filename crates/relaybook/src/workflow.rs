@@ -77,7 +77,7 @@ fn has_driver(text: &str) -> bool {
     })
 }
 
-fn register_driver(root: &Path) {
+pub(crate) fn register_driver(root: &Path) {
     let _ = Command::new("git")
         .arg("-C")
         .arg(root)

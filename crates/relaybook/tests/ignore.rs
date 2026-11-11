@@ -155,6 +155,44 @@ fn uninstall_removes_each_attribute_form() {
     }
 }
 
+#[test]
+fn setup_repairs_old_attribute_lines_without_ci() {
+    for original in [
+        "keep text=auto\ngraphify-out/graph.json merge=graphify # relaybook\n",
+        "keep text=auto\n# relaybook\ngraphify-out/graph.json merge=graphify\n",
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_init(dir.path());
+        fs::write(dir.path().join(".gitattributes"), original).expect("write");
+        setup(dir.path(), &["setup", "--no-graphify"]);
+        let attributes = fs::read_to_string(dir.path().join(".gitattributes")).expect("attributes");
+        assert!(attributes.contains("# relaybook:start\n"), "{attributes}");
+        assert!(
+            attributes.contains("graphify-out/graph.json merge=graphify\n"),
+            "{attributes}"
+        );
+        assert!(
+            !attributes.lines().any(|line| line.contains(" # relaybook")),
+            "{attributes}"
+        );
+        assert!(attributes.contains("keep text=auto"), "{attributes}");
+        let output = git(
+            dir.path(),
+            &["check-attr", "merge", "graphify-out/graph.json"],
+        );
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stderr).expect("stderr"), "");
+        let stdout = String::from_utf8(output.stdout).expect("stdout");
+        assert!(stdout.contains("merge: graphify"), "{stdout}");
+        let again = attributes.clone();
+        setup(dir.path(), &["setup", "--no-graphify"]);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".gitattributes")).expect("attributes"),
+            again
+        );
+    }
+}
+
 fn setup(dir: &Path, args: &[&str]) {
     relaybook(dir).args(args).assert().success();
 }

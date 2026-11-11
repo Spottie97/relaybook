@@ -32,6 +32,22 @@ pub(crate) fn rewrite_attributes(original: &str) -> String {
     rewrite_marked(original, &[ATTRIBUTE_ENTRY], &[])
 }
 
+pub(crate) fn repair_attributes(original: &str) -> String {
+    if !attribute_needs_repair(original) {
+        return original.to_string();
+    }
+    rewrite_attributes(original)
+}
+
+fn attribute_needs_repair(text: &str) -> bool {
+    let trailing = format!("{ATTRIBUTE_ENTRY} # relaybook");
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    lines.iter().enumerate().any(|(index, line)| {
+        *line == trailing
+            || (*line == MARK && lines.get(index + 1).copied() == Some(ATTRIBUTE_ENTRY))
+    })
+}
+
 pub(crate) fn strip_ignore(original: &str) -> String {
     strip_marked(original, IGNORE_ENTRIES)
 }
