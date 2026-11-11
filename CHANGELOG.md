@@ -4,6 +4,8 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-11
+
 ### Added
 
 - `relaybook setup` teaches a fresh agent its role. The planner and executor blocks name when to plan, claim, and review. `relaybook guide` prints the worked examples. Claude Code gets a Relaybook skill and a `SessionStart` hook that speaks up only when work is waiting.
