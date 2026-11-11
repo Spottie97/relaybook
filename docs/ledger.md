@@ -8,7 +8,7 @@ relaybook init
 
 The database runs in WAL mode with a 5 second busy timeout. Tasks, steps, and decisions are the current projection. The `events` table is append-only. Relaybook never updates or deletes a row there.
 
-WAL sidecar files (`.db-wal`, `.db-shm`) are gitignored. The ledger file itself is safe to commit after a command exits. Each write checkpoints so the `.db` file holds the data.
+`relaybook setup` gitignores WAL sidecar files (`.relaybook/*.db-wal`, `.relaybook/*.db-shm`) and `.relaybook/runs/` inside a `# relaybook:start` block. `.relaybook/ledger.db` stays committable. The ledger file itself is safe to commit after a command exits. Each write checkpoints so the `.db` file holds the data.
 
 `relaybook-core` owns the ledger. A future adapter should call that crate. It should not invent a second protocol or a second store. The `relaybook` binary is the CLI over the same API.
 

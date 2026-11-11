@@ -204,15 +204,15 @@ fn record_ignore(root: &Path, options: &Options, steps: &mut Vec<Step>) -> Resul
     } else {
         String::new()
     };
-    let mut text = original;
-    let mut changed = insert_ignore(&mut text, ".claude/*.graphify-bak");
-    if options.ci {
-        changed |= delete_ignore(&mut text, "graphify-out/");
-    } else {
-        changed |= insert_ignore(&mut text, "graphify-out/");
-    }
-    if changed {
-        std::fs::write(&path, text)?;
+    let text = crate::managed::rewrite_ignore(&original, options.ci);
+    if text != original {
+        if text.is_empty() {
+            if path.is_file() {
+                std::fs::remove_file(&path)?;
+            }
+        } else {
+            std::fs::write(&path, text)?;
+        }
         let detail = if options.ci {
             "graphify-out stays tracked"
         } else {
@@ -228,41 +228,6 @@ fn record_ignore(root: &Path, options: &Options, steps: &mut Vec<Step>) -> Resul
         push(steps, "gitignore", "skipped", detail);
     }
     Ok(())
-}
-
-fn insert_ignore(text: &mut String, line: &str) -> bool {
-    if ignore_present(text, line) {
-        return false;
-    }
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(line);
-    text.push_str(" # relaybook\n");
-    true
-}
-
-fn ignore_present(text: &str, line: &str) -> bool {
-    let marked = format!("{line} # relaybook");
-    text.lines()
-        .any(|item| item.trim() == line || item.trim() == marked)
-}
-
-fn delete_ignore(text: &mut String, line: &str) -> bool {
-    if !ignore_present(text, line) {
-        return false;
-    }
-    let marked = format!("{line} # relaybook");
-    let mut kept = String::new();
-    for item in text.lines() {
-        if item.trim() == line || item.trim() == marked {
-            continue;
-        }
-        kept.push_str(item);
-        kept.push('\n');
-    }
-    *text = kept;
-    true
 }
 
 fn record_graphify(root: &Path, options: &Options, steps: &mut Vec<Step>) {

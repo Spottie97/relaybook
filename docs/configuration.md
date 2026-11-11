@@ -17,7 +17,9 @@ relaybook setup --ci
 - `relaybook setup --no-hooks` skips `graphify hook install` and the post-merge / post-rewrite hooks.
 - `relaybook setup --no-claude-hook` skips the project `UserPromptSubmit` hook that tells Claude to run `relaybook inbox`. The other Graphify commands still run.
 - `relaybook setup --no-commands` skips `.claude/commands/relaybook.md` and `.cursor/commands/relaybook.md`.
-- `relaybook setup --ci` writes `.github/workflows/graphify-update.yml` and adds `graphify-out/graph.json merge=graphify` to `.gitattributes`. An existing workflow file is left untouched. The workflow opens a pull request instead of pushing to `main`.
+- `relaybook setup --ci` writes `.github/workflows/graphify-update.yml` and adds `graphify-out/graph.json merge=graphify` to `.gitattributes`. An existing workflow file is left untouched. The workflow opens a pull request instead of pushing to `main`. `graphify-out/` stays tracked.
+
+`relaybook setup` writes a `# relaybook:start` / `# relaybook:end` block in `.gitignore` and, with `--ci`, in `.gitattributes`. The entries sit on their own lines. A pattern you already ignore is left where it is. The ignore block covers Graphify backups, `graphify-out/` (unless you passed `--ci`), `.relaybook/*.db-wal`, `.relaybook/*.db-shm`, and `.relaybook/runs/`. `.relaybook/ledger.db` stays committable.
 
 ## How the graph stays current
 
@@ -104,7 +106,7 @@ What it removes, and only inside Relaybook's markers or the setup manifest:
 - The `UserPromptSubmit` hook. It runs `relaybook hook prompt` when `relaybook` is on PATH, and stays silent when it is not. On Windows without Git Bash the hook uses PowerShell.
 - The `command -v graphify` guards wrapped around Graphify's `PreToolUse` hooks. Graphify's own hooks stay.
 - The post-merge and post-rewrite blocks between the relaybook hook markers.
-- `.gitignore` and `.gitattributes` lines marked `# relaybook`.
+- The `# relaybook:start` / `# relaybook:end` block in `.gitignore` and `.gitattributes`, including an older `pattern # relaybook` line and a lone `# relaybook` line directly above a pattern Relaybook owns. Other lines stay.
 - `.github/workflows/graphify-update.yml` when it still matches the template, the graphify merge attribute, and `merge.graphify.name` / `merge.graphify.driver`.
 
 What it keeps unless you pass `--purge`:

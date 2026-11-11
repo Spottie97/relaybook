@@ -3,8 +3,6 @@ use std::process::Command;
 
 const WORKFLOW: &str = include_str!("../templates/graphify-update.yml");
 pub(crate) const TEMPLATE: &str = WORKFLOW;
-const ATTRIBUTE: &str = "graphify-out/graph.json merge=graphify";
-pub(crate) const ATTRIBUTE_LINE: &str = ATTRIBUTE;
 const CI_REQUIREMENTS: &str = "Enable Settings > Actions > General > Allow GitHub Actions to create and approve pull requests. PRs opened with GITHUB_TOKEN do not run other workflows; set secret GRAPHIFY_PR_TOKEN (contents and pull-requests write) so required checks run.";
 
 pub(crate) struct WriteResult {
@@ -44,20 +42,23 @@ pub(crate) fn install_attributes(root: &Path) -> Result<WriteResult, std::io::Er
     } else {
         String::new()
     };
-    if has_driver(&existing) {
-        register_driver(root);
+    let next = crate::managed::rewrite_attributes(&existing);
+    if next == existing {
+        if has_driver(&existing) {
+            register_driver(root);
+        }
         return Ok(WriteResult {
             status: "skipped",
             detail: "merge driver already configured".to_string(),
         });
     }
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
+    if next.is_empty() {
+        if path.is_file() {
+            std::fs::remove_file(&path)?;
+        }
+    } else {
+        std::fs::write(&path, next)?;
     }
-    next.push_str(ATTRIBUTE);
-    next.push_str(" # relaybook\n");
-    std::fs::write(&path, next)?;
     register_driver(root);
     Ok(WriteResult {
         status: "done",
@@ -70,6 +71,7 @@ fn has_driver(text: &str) -> bool {
         let line = line.trim();
         !line.starts_with('#')
             && !line.is_empty()
+            && !line.contains('#')
             && line.contains("graph.json")
             && line.contains("merge=graphify")
     })

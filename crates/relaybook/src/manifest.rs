@@ -174,8 +174,12 @@ fn kind_for(file: &str) -> String {
 
 fn added_for(file: &str) -> String {
     match kind_for(file).as_str() {
-        "gitignore-line" => "ignore lines marked # relaybook".to_string(),
-        "gitattributes-line" => "graphify merge attribute".to_string(),
+        "gitignore-line" => {
+            "ignore lines between # relaybook:start and # relaybook:end".to_string()
+        }
+        "gitattributes-line" => {
+            "merge attribute between # relaybook:start and # relaybook:end".to_string()
+        }
         "hook-block" => "graphify refresh hook".to_string(),
         "json-entry" => "relaybook settings entry".to_string(),
         "file" => file.to_string(),

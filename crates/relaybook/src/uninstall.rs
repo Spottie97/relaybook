@@ -14,7 +14,6 @@ use crate::workflow;
 const GUARD_PREFIX: &str = "command -v graphify >/dev/null 2>&1 && graphify ";
 const GRAPHIFY_NAME: &str = "graphify graph.json union merge";
 const GRAPHIFY_DRIVER: &str = "graphify merge-driver %O %A %B";
-const HISTORICAL_IGNORES: &[&str] = &[".claude/*.graphify-bak", "graphify-out/"];
 
 pub(crate) struct Options {
     pub yes: bool,
@@ -327,26 +326,9 @@ fn plan_markers(root: &Path, has_manifest: bool) -> Vec<Change> {
         && text.lines().any(|line| line.contains("# relaybook"))
     {
         changes.push(change(".gitignore", "removed", "# relaybook lines"));
-    } else if !has_manifest
-        && fs::read_to_string(root.join(".gitignore"))
-            .ok()
-            .is_some_and(|text| {
-                HISTORICAL_IGNORES
-                    .iter()
-                    .any(|line| text.lines().any(|item| item.trim() == *line))
-            })
-    {
-        changes.push(change(
-            ".gitignore",
-            "removed",
-            "ignore lines from an older setup",
-        ));
     }
     if let Ok(text) = fs::read_to_string(root.join(".gitattributes"))
-        && (text.contains("# relaybook")
-            || text
-                .lines()
-                .any(|line| line.trim() == workflow::ATTRIBUTE_LINE))
+        && text.contains("# relaybook")
     {
         changes.push(change(".gitattributes", "removed", "merge attribute"));
     }
@@ -547,48 +529,28 @@ fn clean_hook(path: &Path) -> Result<(), String> {
     fs::write(path, next).map_err(|err| err.to_string())
 }
 
-fn clean_ignore(root: &Path, has_manifest: bool) -> Result<(), String> {
+fn clean_ignore(root: &Path, _has_manifest: bool) -> Result<(), String> {
     let path = root.join(".gitignore");
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(());
     };
-    let mut kept = String::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("# relaybook") {
-            continue;
-        }
-        if !has_manifest && HISTORICAL_IGNORES.contains(&trimmed) {
-            continue;
-        }
-        kept.push_str(line);
-        kept.push('\n');
-    }
-    if kept == text {
+    let next = crate::managed::strip_ignore(&text);
+    if next == text {
         return Ok(());
     }
-    write_or_remove(&path, &kept)
+    write_or_remove(&path, &next)
 }
 
-fn clean_attributes(root: &Path, has_manifest: bool) -> Result<(), String> {
+fn clean_attributes(root: &Path, _has_manifest: bool) -> Result<(), String> {
     let path = root.join(".gitattributes");
     let Ok(text) = fs::read_to_string(&path) else {
         return Ok(());
     };
-    let mut kept = String::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("# relaybook") || (!has_manifest && trimmed == workflow::ATTRIBUTE_LINE)
-        {
-            continue;
-        }
-        kept.push_str(line);
-        kept.push('\n');
-    }
-    if kept == text {
+    let next = crate::managed::strip_attributes(&text);
+    if next == text {
         return Ok(());
     }
-    write_or_remove(&path, &kept)
+    write_or_remove(&path, &next)
 }
 
 fn strip_block(text: &str, start: &str, end: &str) -> Option<String> {

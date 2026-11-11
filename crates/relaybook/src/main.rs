@@ -11,6 +11,7 @@ mod gitinfo;
 mod graphify;
 mod hooks;
 mod install;
+mod managed;
 mod manifest;
 mod paths;
 mod picker;

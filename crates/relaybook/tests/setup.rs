@@ -806,11 +806,13 @@ fn setup_guards_graphify_hooks_and_ignores_local_output() {
         "command -v graphify >/dev/null 2>&1 && graphify hook-guard read --strict || true"
     );
     let ignore = fs::read_to_string(dir.path().join(".gitignore")).expect("gitignore");
+    assert!(ignore.contains("# relaybook:start\n"), "{ignore}");
+    assert!(ignore.contains(".claude/*.graphify-bak\n"), "{ignore}");
+    assert!(ignore.contains("graphify-out/\n"), "{ignore}");
     assert!(
-        ignore.contains(".claude/*.graphify-bak # relaybook\n"),
+        !ignore.lines().any(|line| line.contains(" # relaybook")),
         "{ignore}"
     );
-    assert!(ignore.contains("graphify-out/ # relaybook\n"), "{ignore}");
 
     let wrapped = value["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         .as_str()
