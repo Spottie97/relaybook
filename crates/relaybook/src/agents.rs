@@ -77,11 +77,13 @@ pub(crate) struct Accounts {
 }
 
 pub(crate) fn preflight() -> Result<Accounts, String> {
-    if !on_path("claude") {
+    if crate::exe::Program::resolve("claude").is_none() {
         return Err("claude: not on PATH; install Claude Code".to_string());
     }
-    if !on_path("cursor-agent") {
-        return Err("cursor: not on PATH; install Cursor CLI".to_string());
+    if crate::exe::resolve_cursor().is_none() {
+        return Err(
+            "cursor: not on PATH; install Cursor CLI (`cursor-agent` or `agent`)".to_string(),
+        );
     }
     let claude = claude_account()?;
     let cursor = cursor_account()?;
@@ -103,7 +105,12 @@ pub(crate) fn call_claude(
     budget: Option<&str>,
     run_id: i64,
 ) -> AgentResult {
-    let mut command = Command::new("claude");
+    let Some(program) = crate::exe::Program::resolve("claude") else {
+        return AgentResult::Failed {
+            output: "claude: not on PATH; install Claude Code".to_string(),
+        };
+    };
+    let mut command = program.command();
     command
         .current_dir(cwd)
         .arg("-p")
@@ -127,7 +134,14 @@ pub(crate) fn call_claude(
 }
 
 pub(crate) fn call_cursor(cwd: &Path, prompt: &str, timeout: Duration, run_id: i64) -> AgentResult {
-    let mut child = match Command::new("cursor-agent")
+    let Some(program) = crate::exe::resolve_cursor() else {
+        return AgentResult::Failed {
+            output: "cursor: not on PATH; install Cursor CLI (`cursor-agent` or `agent`)"
+                .to_string(),
+        };
+    };
+    let mut child = match program
+        .command()
         .current_dir(cwd)
         .arg("-p")
         .arg("--force")
@@ -316,8 +330,13 @@ fn claude_account() -> Result<AccountKind, String> {
 }
 
 fn cursor_account() -> Result<AccountKind, String> {
+    let Some(program) = crate::exe::resolve_cursor() else {
+        return Err(
+            "cursor: not on PATH; install Cursor CLI (`cursor-agent` or `agent`)".to_string(),
+        );
+    };
     for args in [["status"], ["about"]] {
-        let output = Command::new("cursor-agent").args(args).output();
+        let output = program.command().args(args).output();
         let Some(output) = output.ok().filter(|item| item.status.success()) else {
             continue;
         };
@@ -332,13 +351,6 @@ fn cursor_account() -> Result<AccountKind, String> {
         }
     }
     Err("cursor: not signed in; run cursor-agent login".to_string())
-}
-
-fn on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join(name).is_file())
 }
 
 #[cfg(test)]

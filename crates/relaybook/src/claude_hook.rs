@@ -4,8 +4,8 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-const PROMPT_COMMAND: &str =
-    "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true";
+const PROMPT_COMMAND: &str = "relaybook hook prompt";
+const LEGACY_PROMPT: &str = "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true";
 
 pub(crate) enum Status {
     Updated,
@@ -92,13 +92,16 @@ pub(crate) fn install(root: &Path) -> io::Result<Status> {
     };
     let hooks = object_entry(root_object, "hooks")?;
     let prompt = array_entry(hooks, "UserPromptSubmit")?;
-    if contains_command(prompt, PROMPT_COMMAND) {
+    let replaced = replace_command(prompt, LEGACY_PROMPT, PROMPT_COMMAND);
+    if !replaced && contains_command(prompt, PROMPT_COMMAND) {
         return Ok(Status::Unchanged);
     }
-    prompt
-        .as_array_mut()
-        .expect("UserPromptSubmit is an array")
-        .push(hook_group());
+    if !contains_command(prompt, PROMPT_COMMAND) {
+        prompt
+            .as_array_mut()
+            .expect("UserPromptSubmit is an array")
+            .push(hook_group());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -147,6 +150,21 @@ fn hook_group() -> Value {
             }
         ]
     })
+}
+
+fn replace_command(value: &mut Value, from: &str, to: &str) -> bool {
+    match value {
+        Value::Array(items) => items.iter_mut().any(|item| replace_command(item, from, to)),
+        Value::Object(map) => map.iter_mut().any(|(key, child)| {
+            if key == "command" && child.as_str() == Some(from) {
+                *child = Value::String(to.to_string());
+                true
+            } else {
+                replace_command(child, from, to)
+            }
+        }),
+        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => false,
+    }
 }
 
 fn contains_command(value: &Value, command: &str) -> bool {

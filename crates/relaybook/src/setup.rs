@@ -319,13 +319,7 @@ fn record_rtk(steps: &mut Vec<Step>) {
 }
 
 fn command_on_path(name: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| {
-        let candidate = dir.join(name);
-        candidate.is_file()
-    })
+    crate::exe::Program::resolve(name).is_some()
 }
 
 fn record_hooks(root: &Path, options: &Options, steps: &mut Vec<Step>) {

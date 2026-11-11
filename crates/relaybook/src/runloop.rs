@@ -774,16 +774,21 @@ fn worktree_fingerprint(cwd: &Path) -> Result<String, String> {
     let mut body = diff;
     body.push('\n');
     for path in untracked.lines() {
+        let path = git_path(path);
         if path == ".relaybook" || path.starts_with(".relaybook/") {
             continue;
         }
-        body.push_str(path);
+        body.push_str(&path);
         body.push('\n');
-        let bytes = std::fs::read(cwd.join(path)).unwrap_or_default();
+        let bytes = std::fs::read(cwd.join(&path)).unwrap_or_default();
         body.push_str(&content_hash(&bytes));
         body.push('\n');
     }
     Ok(content_hash(body.as_bytes()))
+}
+
+fn git_path(path: &str) -> String {
+    path.replace('\\', "/")
 }
 
 fn content_hash(bytes: &[u8]) -> String {
@@ -802,10 +807,11 @@ fn dirty_paths(cwd: &Path) -> Result<Vec<String>, String> {
         .filter_map(|line| {
             let path = line.get(3..).unwrap_or(line).trim().trim_matches('"');
             let path = path.rsplit(" -> ").next().unwrap_or(path);
+            let path = git_path(path);
             if path == ".relaybook" || path.starts_with(".relaybook/") {
                 None
             } else {
-                Some(path.to_string())
+                Some(path)
             }
         })
         .collect())

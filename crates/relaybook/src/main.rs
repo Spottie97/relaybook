@@ -6,6 +6,7 @@ mod agents;
 mod claude_hook;
 mod cli;
 mod commands;
+mod exe;
 mod gitinfo;
 mod graphify;
 mod hooks;

@@ -82,126 +82,51 @@ fn repo() -> Repo {
     }
 }
 
-fn install_fakes(kind: &str) -> (tempfile::TempDir, PathBuf) {
+fn install_fakes() -> (tempfile::TempDir, PathBuf) {
     let root = tempfile::tempdir().expect("fakes");
     let bin = root.path().join("bin");
     fs::create_dir_all(&bin).expect("mkdir");
-    let claude = r#"#!/bin/sh
-if [ "$1" = auth ]; then echo logged in; exit 0; fi
-printf '%s\n' "$*" >> "$LOG/claude.args"
-case __KIND__ in
-  edit)
-    echo dirty > dirty.txt
-    ;;
-  fail)
-    exit 1
-    ;;
-  limit)
-    if [ ! -f .git/limited ]; then
-      echo limited > .git/limited
-      echo "usage limit reached. resets at 2026-11-10T18:00:00Z"
-      exit 1
-    fi
-    ;;
-esac
-if printf '%s' "$*" | grep -q 'PRD:'; then
-  "$RELAYBOOK" task create work --title "Do the work"
-  "$RELAYBOOK" step add work "ship it"
-  if [ __KIND__ = two ]; then
-    "$RELAYBOOK" task create more --title "Do more" --depends-on work
-  fi
-else
-  if [ __KIND__ = reopen ]; then
-    "$RELAYBOOK" task reopen work --reason "try again"
-  elif [ __KIND__ = editdirty ]; then
-    echo more >> extra.txt
-    "$RELAYBOOK" report accept work
-    "$RELAYBOOK" run complete
-  else
-    "$RELAYBOOK" report accept work
-    "$RELAYBOOK" run complete
-  fi
-fi
-printf '%s\n' '{"session_id":"sess-1","total_cost_usd":0.20}'
-"#;
-    let cursor = r#"#!/bin/sh
-if [ "$1" = status ] || [ "$1" = about ]; then echo logged in; exit 0; fi
-printf '%s\n' "$*" >> "$LOG/cursor.args"
-case __KIND__ in
-  fail|limit-cursor)
-    if [ "$KIND" = limit-cursor ]; then
-      echo "rate limit"
-      exit 1
-    fi
-    exit 1
-    ;;
-  block)
-    "$RELAYBOOK" task block work --reason "stuck"
-    exit 0
-    ;;
-  tag)
-    git tag v9
-    ;;
-  extra)
-    echo leftover > extra.txt
-    ;;
-  editdirty)
-    echo before > extra.txt
-    ;;
-  switch)
-    git checkout main
-    exit 0
-    ;;
-  manual)
-    "$RELAYBOOK" mode manual
-    ;;
-  sleep)
-    sleep 30
-    ;;
-esac
-"$RELAYBOOK" task claim work --by cursor
-echo hello >> work.txt
-git add work.txt
-git commit -m "do the work"
-"$RELAYBOOK" task done work --changed "added work" --verified "git show" --not-verified "live" --review "diff"
-if [ __KIND__ = pushmain ]; then
-  git push origin HEAD:main
-fi
-printf '%s\n' '{"ok":true}'
-"#;
-    write_exe(&bin.join("claude"), &claude.replace("__KIND__", kind));
-    write_exe(&bin.join("cursor-agent"), &cursor.replace("__KIND__", kind));
-    write_exe(
-        &bin.join("gh"),
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LOG/gh.args\"\necho https://example.test/pr/1\n",
-    );
+    for name in ["claude", "cursor-agent", "gh"] {
+        copy_fake(&bin, name);
+    }
     (root, bin)
 }
 
-fn write_exe(path: &Path, body: &str) {
-    fs::write(path, body).expect("script");
-    let mut permissions = fs::metadata(path).expect("meta").permissions();
+fn copy_fake(dir: &Path, name: &str) {
+    let src = PathBuf::from(env!("CARGO_BIN_EXE_fake"));
+    let dest = if cfg!(windows) {
+        dir.join(format!("{name}.exe"))
+    } else {
+        dir.join(name)
+    };
+    fs::copy(src, &dest).expect("copy fake");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&dest).expect("meta").permissions();
         permissions.set_mode(0o755);
+        fs::set_permissions(&dest, permissions).expect("chmod");
     }
-    fs::set_permissions(path, permissions).expect("chmod");
 }
 
-fn with_fakes(cmd: &mut Command, log: &Path, bin: &Path) {
+fn with_fakes(cmd: &mut Command, log: &Path, bin: &Path, kind: &str) {
     fs::create_dir_all(log).expect("log");
-    let path = std::env::var("PATH").unwrap_or_default();
-    cmd.env("PATH", format!("{}:{path}", bin.display()));
+    let mut path = std::ffi::OsString::from(bin);
+    if let Some(rest) = std::env::var_os("PATH") {
+        path.push(if cfg!(windows) { ";" } else { ":" });
+        path.push(rest);
+    }
+    cmd.env("PATH", path);
     cmd.env("LOG", log);
+    cmd.env("RELAYBOOK_FAKE_KIND", kind);
     cmd.env_remove("ANTHROPIC_API_KEY");
 }
 
 fn run(dir: &Path, kind: &str, args: &[&str]) -> std::process::Output {
-    let (root, bin) = install_fakes(kind);
+    let (root, bin) = install_fakes();
     let log = root.path().join("log");
     let mut cmd = relaybook(dir);
-    with_fakes(&mut cmd, &log, &bin);
+    with_fakes(&mut cmd, &log, &bin, kind);
     cmd.args(args);
     let output = cmd.output().expect("run");
     let saved = std::env::temp_dir().join(format!(
@@ -398,9 +323,9 @@ fn stop_conditions_cover_cycles_calls_cost_block_failure_timeout_and_manual() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("two consecutive agent failures"));
 
     let dir = repo();
-    let (root, bin) = install_fakes("sleep");
+    let (root, bin) = install_fakes();
     let mut cmd = relaybook(dir.path());
-    with_fakes(&mut cmd, &root.path().join("log"), &bin);
+    with_fakes(&mut cmd, &root.path().join("log"), &bin, "sleep");
     cmd.env("RELAYBOOK_CURSOR_TIMEOUT_SECS", "1");
     cmd.args(["run", "--prd", "prd.md"]);
     let output = cmd.output().expect("timeout");

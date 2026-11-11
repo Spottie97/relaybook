@@ -1,6 +1,5 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use assert_cmd::prelude::*;
@@ -224,19 +223,11 @@ fn edited_command_is_kept_and_graphify_uninstall_is_optional() {
     fs::write(&command, "custom cursor command\n").expect("write");
     let bin = dir.path().join("bin");
     fs::create_dir_all(&bin).expect("mkdir");
-    let script = bin.join("graphify");
-    fs::write(
-        &script,
-        "#!/bin/sh\necho \"$*\" >> \"$GRAPHIFY_LOG\"\nexit 0\n",
-    )
-    .expect("write");
-    let mut permissions = fs::metadata(&script).expect("meta").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod");
+    copy_fake(&bin, "graphify");
     let log = dir.path().join("graphify.log");
     relaybook(dir.path())
         .args(["uninstall", "--yes", "--graphify"])
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("PATH", prepend_path(&bin))
         .env("GRAPHIFY_LOG", &log)
         .assert()
         .success()
@@ -288,4 +279,31 @@ fn ci_round_trip_removes_the_workflow_and_merge_driver() {
         .output()
         .expect("config");
     assert!(!name.status.success());
+}
+
+fn copy_fake(dir: &Path, name: &str) {
+    fs::create_dir_all(dir).expect("mkdir");
+    let src = PathBuf::from(env!("CARGO_BIN_EXE_fake"));
+    let dest = if cfg!(windows) {
+        dir.join(format!("{name}.exe"))
+    } else {
+        dir.join(name)
+    };
+    fs::copy(src, &dest).expect("copy fake");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&dest).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&dest, permissions).expect("chmod");
+    }
+}
+
+fn prepend_path(bin: &Path) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::from(bin);
+    if let Some(rest) = std::env::var_os("PATH") {
+        path.push(if cfg!(windows) { ";" } else { ":" });
+        path.push(rest);
+    }
+    path
 }

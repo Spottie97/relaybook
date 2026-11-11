@@ -82,7 +82,7 @@ fn external_hooks(root: &Path) -> Option<String> {
 fn place_hook(dir: &Path, name: &str) -> Result<HookResult, std::io::Error> {
     let path = dir.join(name);
     if !path.is_file() {
-        std::fs::write(&path, format!("#!/bin/sh\n{BLOCK}"))?;
+        write_lf(&path, &format!("#!/bin/sh\n{BLOCK}"))?;
         make_executable(&path)?;
         return Ok(HookResult::Installed);
     }
@@ -91,9 +91,9 @@ fn place_hook(dir: &Path, name: &str) -> Result<HookResult, std::io::Error> {
         return Ok(HookResult::Unchanged);
     }
     if existing.contains(legacy::HOOK_START) && existing.contains(legacy::HOOK_END) {
-        std::fs::write(
+        write_lf(
             &path,
-            replace_span(&existing, legacy::HOOK_START, legacy::HOOK_END, BLOCK),
+            &replace_span(&existing, legacy::HOOK_START, legacy::HOOK_END, BLOCK),
         )?;
         make_executable(&path)?;
         return Ok(HookResult::Installed);
@@ -101,7 +101,7 @@ fn place_hook(dir: &Path, name: &str) -> Result<HookResult, std::io::Error> {
     if let Some(interpreter) = foreign_interpreter(&existing) {
         return Ok(HookResult::Foreign { interpreter });
     }
-    std::fs::write(&path, insert_block(&existing))?;
+    write_lf(&path, &insert_block(&existing))?;
     make_executable(&path)?;
     Ok(HookResult::Installed)
 }
@@ -174,7 +174,7 @@ fn hooks_dir(root: &Path) -> Result<PathBuf, std::io::Error> {
         return Ok(root.join(".git").join("hooks"));
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let raw = text.trim();
+    let raw = text.trim().replace('\\', "/");
     let path = PathBuf::from(raw);
     if path.is_absolute() {
         Ok(path)
@@ -210,6 +210,10 @@ fn git_config(root: &Path, key: &str) -> Option<String> {
     } else {
         Some(line.to_string())
     }
+}
+
+fn write_lf(path: &Path, text: &str) -> Result<(), std::io::Error> {
+    std::fs::write(path, text.replace("\r\n", "\n"))
 }
 
 fn make_executable(path: &Path) -> Result<(), std::io::Error> {

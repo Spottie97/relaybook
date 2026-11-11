@@ -11,8 +11,8 @@ use crate::manifest::{self, Entry};
 use crate::paths;
 use crate::workflow;
 
-const PROMPT_COMMAND: &str =
-    "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true";
+const PROMPT_COMMAND: &str = "relaybook hook prompt";
+const LEGACY_PROMPT: &str = "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true";
 const GUARD_PREFIX: &str = "command -v graphify >/dev/null 2>&1 && graphify ";
 const GRAPHIFY_NAME: &str = "graphify graph.json union merge";
 const GRAPHIFY_DRIVER: &str = "graphify merge-driver %O %A %B";
@@ -509,7 +509,9 @@ fn clean_settings(root: &Path) -> Result<(), String> {
         .and_then(|value| value.as_array_mut())
     {
         let before = groups.len();
-        groups.retain(|group| !group_has_command(group, PROMPT_COMMAND));
+        groups.retain(|group| {
+            !group_has_command(group, PROMPT_COMMAND) && !group_has_command(group, LEGACY_PROMPT)
+        });
         changed |= groups.len() != before;
     }
     if let Some(groups) = value
@@ -630,7 +632,7 @@ fn dir_is_empty(path: &Path) -> bool {
 fn settings_have_prompt(root: &Path) -> bool {
     fs::read_to_string(root.join(".claude").join("settings.json"))
         .ok()
-        .is_some_and(|text| text.contains(PROMPT_COMMAND))
+        .is_some_and(|text| text.contains(PROMPT_COMMAND) || text.contains(LEGACY_PROMPT))
 }
 
 fn settings_have_guard(root: &Path) -> bool {

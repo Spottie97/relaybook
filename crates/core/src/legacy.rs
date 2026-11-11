@@ -33,11 +33,20 @@ pub fn migrate_legacy_ledger(root: &Path) -> Result<Option<LegacyMove>, Error> {
         return Ok(None);
     }
     checkpoint(&old_db)?;
-    std::fs::rename(&old_dir, &new_dir)?;
+    rename_dir(&old_dir, &new_dir)?;
     Ok(Some(LegacyMove {
         from: old_db,
         to: new_db,
     }))
+}
+
+fn rename_dir(from: &Path, to: &Path) -> Result<(), Error> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    std::fs::rename(from, to)?;
+    Ok(())
 }
 
 fn checkpoint(database: &Path) -> Result<(), Error> {

@@ -1,5 +1,4 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -47,15 +46,7 @@ fn missing_graphify_skips_without_failing() {
 fn rtk_step_follows_the_fake_on_path() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bin = fake_graphify(dir.path(), false);
-    let rtk = bin.join("rtk");
-    fs::write(
-        &rtk,
-        "#!/bin/sh\nif [ \"$1\" = verify ]; then exit 0; fi\nexit 1\n",
-    )
-    .expect("write");
-    let mut permissions = fs::metadata(&rtk).expect("meta").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&rtk, permissions).expect("chmod");
+    copy_fake(&bin, "rtk");
     let log = dir.path().join("graphify.log");
     setup(dir.path(), &bin, &log, &["setup", "--no-graphify"])
         .assert()
@@ -453,10 +444,7 @@ fn setup_merges_the_prompt_hook_without_duplicating_it() {
         .as_array()
         .expect("prompt");
     assert_eq!(prompt.len(), 1);
-    assert_eq!(
-        prompt[0]["hooks"][0]["command"],
-        "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true"
-    );
+    assert_eq!(prompt[0]["hooks"][0]["command"], "relaybook hook prompt");
 
     let first = fs::read(&settings).expect("read");
     setup_plain(dir.path(), &["setup", "--no-graphify"])
@@ -669,17 +657,16 @@ fn setup_installs_and_preserves_the_cursor_command() {
 fn prompt_hook_reports_installed_when_relaybook_is_on_path() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bin = dir.path().join("bin");
-    fs::create_dir_all(&bin).expect("mkdir");
-    fs::write(bin.join("relaybook"), "#!/bin/sh\nexit 0\n").expect("write");
+    copy_fake(&bin, "relaybook");
     setup_plain(dir.path(), &["setup", "--no-graphify"])
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("PATH", prepend_path(&bin))
         .assert()
         .success()
         .stdout(predicates::str::contains(
             "prompt hook: done (added UserPromptSubmit)",
         ));
     setup_plain(dir.path(), &["setup", "--no-graphify"])
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("PATH", prepend_path(&bin))
         .assert()
         .success()
         .stdout(predicates::str::contains(
@@ -730,7 +717,7 @@ fn setup_guards_graphify_hooks_and_ignores_local_output() {
         .as_str()
         .expect("command")
         .to_string();
-    let printed = Command::new("sh")
+    let printed = posix_shell()
         .arg("-c")
         .arg(&wrapped)
         .env("PATH", "/usr/bin:/bin")
@@ -746,12 +733,8 @@ fn setup_guards_graphify_hooks_and_ignores_local_output() {
         "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true}'\n",
     )
     .expect("write");
-    let mut permissions = fs::metadata(fake.join("graphify"))
-        .expect("meta")
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(fake.join("graphify"), permissions).expect("chmod");
-    let printed = Command::new("sh")
+    make_executable(&fake.join("graphify"));
+    let printed = posix_shell()
         .arg("-c")
         .arg(&wrapped)
         .env("PATH", format!("{}:/usr/bin:/bin", fake.display()))
@@ -778,18 +761,11 @@ fn fake_graphify_install_gets_guarded() {
     let dir = tempfile::tempdir().expect("tempdir");
     let bin = dir.path().join("bin");
     fs::create_dir_all(&bin).expect("mkdir");
-    let script = bin.join("graphify");
-    fs::write(
-        &script,
-        "#!/bin/sh\nif [ \"$1\" = claude ]; then\n  mkdir -p .claude\n  printf '%s\\n' '{\"hooks\":{\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"/opt/graphify hook-guard search\",\"timeout\":10}]}]}}' > .claude/settings.json\nfi\nexit 0\n",
-    )
-    .expect("write");
-    let mut permissions = fs::metadata(&script).expect("meta").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod");
+    copy_fake(&bin, "graphify");
 
     setup_plain(dir.path(), &["setup", "--no-hooks"])
-        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("PATH", prepend_path(&bin))
+        .env("RELAYBOOK_FAKE_GRAPHIFY", "claude-settings")
         .assert()
         .success()
         .stdout(predicates::str::contains(
@@ -861,24 +837,68 @@ fn relaybook(dir: &Path) -> Command {
 
 fn fake_graphify(dir: &Path, fail: bool) -> PathBuf {
     let bin = dir.join("fake-bin");
-    fs::create_dir_all(&bin).expect("mkdir");
-    let script = bin.join("graphify");
-    let exit = if fail { "exit 1" } else { "exit 0" };
-    fs::write(
-        &script,
-        format!("#!/bin/sh\necho \"$*\" >> \"$GRAPHIFY_LOG\"\necho boom >&2\n{exit}\n"),
-    )
-    .expect("write");
-    let mut permissions = fs::metadata(&script).expect("meta").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&script, permissions).expect("chmod");
+    copy_fake(&bin, "graphify");
+    if cfg!(windows) {
+        fs::write(
+            bin.join("graphify"),
+            "#!/bin/sh\necho \"$*\" >> \"$GRAPHIFY_LOG\"\necho boom >&2\nif [ -f \"$(dirname \"$0\")/graphify.fail\" ]; then exit 1; fi\nexit 0\n",
+        )
+        .expect("hook script");
+    }
+    if fail {
+        fs::write(bin.join("graphify.fail"), "1").expect("fail marker");
+    }
     bin
 }
 
+fn copy_fake(dir: &Path, name: &str) {
+    fs::create_dir_all(dir).expect("mkdir");
+    let src = PathBuf::from(env!("CARGO_BIN_EXE_fake"));
+    let dest = if cfg!(windows) {
+        dir.join(format!("{name}.exe"))
+    } else {
+        dir.join(name)
+    };
+    fs::copy(src, &dest).expect("copy fake");
+    make_executable(&dest);
+}
+
+fn prepend_path(bin: &Path) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::from(bin);
+    if let Some(rest) = std::env::var_os("PATH") {
+        path.push(if cfg!(windows) { ";" } else { ":" });
+        path.push(rest);
+    }
+    path
+}
+
 fn with_graphify(cmd: &mut Command, bin: &Path, log: &Path) {
-    let path = std::env::var("PATH").unwrap_or_default();
-    cmd.env("PATH", format!("{}:{path}", bin.display()));
+    cmd.env("PATH", prepend_path(bin));
     cmd.env("GRAPHIFY_LOG", log);
+}
+
+fn posix_shell() -> Command {
+    if cfg!(windows) {
+        let git_bash = Path::new(r"C:\Program Files\Git\bin\sh.exe");
+        if git_bash.is_file() {
+            return Command::new(git_bash);
+        }
+    }
+    Command::new("sh")
+}
+
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        let _ = fs::set_permissions(path, permissions);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 fn git_init(dir: &Path) {
@@ -931,9 +951,7 @@ fn write_hook(path: &Path, body: &str) {
         fs::create_dir_all(parent).expect("mkdir");
     }
     fs::write(path, body).expect("write");
-    let mut permissions = fs::metadata(path).expect("meta").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("chmod");
+    make_executable(path);
 }
 
 fn count_log(path: &Path, needle: &str) -> usize {
