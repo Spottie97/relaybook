@@ -24,7 +24,7 @@ Cursor CLI has a native Windows install. In PowerShell:
 irm 'https://cursor.com/install?win32=true' | iex
 ```
 
-The documented command is `agent` (`agent --version`, `agent update`). The install page does not name `cursor-agent`. Relaybook currently looks for `cursor-agent` on `PATH`.
+The documented command is `agent` (`agent --version`, `agent update`). The install page does not name `cursor-agent`. Relaybook resolves `cursor-agent` first, then `agent` when `agent --version` identifies the Cursor CLI.
 
 Source: [CLI installation](https://cursor.com/docs/cli/installation) and [CLI overview](https://cursor.com/docs/cli/overview)
 

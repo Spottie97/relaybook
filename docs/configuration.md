@@ -103,7 +103,7 @@ What it removes, and only inside Relaybook's markers or the setup manifest:
 
 - The Relaybook blocks in `CLAUDE.md` and `AGENTS.md`. A file that becomes empty is deleted. Other text stays.
 - `.claude/commands/relaybook.md` and `.cursor/commands/relaybook.md` when they still contain `relaybook:managed`. An edited command file is kept.
-- The `UserPromptSubmit` hook. It runs `relaybook hook prompt` when `relaybook` is on PATH, and stays silent when it is not. On Windows without Git Bash the hook uses PowerShell.
+- The `UserPromptSubmit` hook. Setup writes `command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true`, so the hook stays silent when `relaybook` is not on PATH. On Windows, when Git Bash `bash.exe` is not on PATH (the `System32` WSL stub does not count), setup writes `if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }` with `"shell": "powershell"`. A bare `relaybook hook prompt` is rewritten to the guarded POSIX command. Uninstall removes the guarded command, the bare command, and the PowerShell command.
 - The `command -v graphify` guards wrapped around Graphify's `PreToolUse` hooks. Graphify's own hooks stay.
 - The post-merge and post-rewrite blocks between the relaybook hook markers.
 - The `# relaybook:start` / `# relaybook:end` block in `.gitignore` and `.gitattributes`, including an older `pattern # relaybook` line and a lone `# relaybook` line directly above a pattern Relaybook owns. Other lines stay.
@@ -121,6 +121,12 @@ The machine installer is separate:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --uninstall
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Spottie97/relaybook/main/install.ps1))) -Uninstall
 ```
 
 That removes the `relaybook` binary the installer wrote. Graphify and RTK are removed only when the installer added them, and only after a `y/N` for each tool (`--yes` skips the questions). Tools that were already installed are kept. If another `relaybook` remains on `PATH` from `~/.cargo/bin`, the installer prints `cargo uninstall relaybook` instead of deleting it. Run `relaybook uninstall` in each project before removing the binary.

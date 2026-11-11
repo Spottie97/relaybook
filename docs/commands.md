@@ -81,7 +81,7 @@ relaybook report accept --all
 relaybook task reopen greet --reason "needs a test"
 ```
 
-The executor claims the task, then finishes with short bullets under 1,500 bytes. A cross-task note uses `relaybook report note`. On the next prompt, `UserPromptSubmit` runs `relaybook hook prompt`. When reports are waiting it prints one line, `N new Cursor reports: relaybook inbox`. Otherwise it prints nothing and exits 0.
+The executor claims the task, then finishes with short bullets under 1,500 bytes. A cross-task note uses `relaybook report note`. On the next prompt, `UserPromptSubmit` runs `command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true`. On Windows without Git Bash it runs `if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }`. When reports are waiting it prints one line, `N new Cursor reports: relaybook inbox`. Otherwise it prints nothing and exits 0.
 
 The planner runs `relaybook inbox`, then `relaybook report accept greet` or `relaybook task reopen greet --reason "needs a test"`. A reopened task returns to `relaybook task list --ready` with `reopened: needs a test` until it is done again. A larger problem becomes a new task.
 

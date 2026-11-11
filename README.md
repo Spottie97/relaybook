@@ -11,7 +11,7 @@
   <a href="https://github.com/Spottie97/relaybook/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Spottie97/relaybook/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/Spottie97/relaybook/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/Spottie97/relaybook"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
-  <img alt="Platforms: macOS arm64 and Linux x86_64" src="https://img.shields.io/badge/platforms-macOS%20arm64%20%7C%20Linux%20x86__64-lightgrey">
+  <img alt="Platforms: macOS arm64, Linux x86_64, Windows x64, and Windows ARM64" src="https://img.shields.io/badge/platforms-macOS%20arm64%20%7C%20Linux%20x86__64%20%7C%20Windows%20x64%20%7C%20Windows%20ARM64-lightgrey">
 </p>
 
 <p align="center">
@@ -42,9 +42,19 @@ Agents step on the same task, re-explain state every session, and pay context co
 
 ## Quick start
 
+macOS, Linux, and Windows Git Bash:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh
 ```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Spottie97/relaybook/main/install.ps1 | iex
+```
+
+The same `curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh` line works in Git Bash. Open a new terminal on Windows after the installer changes PATH.
 
 Then, in the project:
 
@@ -58,16 +68,28 @@ Upgrade an existing install with:
 curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --upgrade
 ```
 
+Windows PowerShell passes flags through a scriptblock, because a script piped into `iex` does not receive them:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Spottie97/relaybook/main/install.ps1))) -Upgrade
+```
+
 Any agent that can run a shell command can join. There is no server and no protocol.
 
 ## Uninstall
 
 In a project, `relaybook uninstall` removes the files and hooks setup added. The ledger stays. `relaybook uninstall --purge` deletes `.relaybook/` too.
 
-On a machine:
+On a machine, macOS, Linux, and Windows Git Bash:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --uninstall
+```
+
+Windows PowerShell:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Spottie97/relaybook/main/install.ps1))) -Uninstall
 ```
 
 <img alt="Demo: setup, claim a task, file a report, and read the inbox" src="docs/demo.gif" width="720">
@@ -126,7 +148,7 @@ Graphify answers where the code lives. RTK compacts command output. Relaybook co
 
 **What if two agents claim the same task?** One `relaybook task claim` wins. The other exits 1 with `already claimed`.
 
-**Which machines can install a release?** macOS arm64 and Linux x86_64. On another machine, run `cargo build --release`.
+**Which machines can install a release?** macOS arm64, Linux x86_64, Windows x64, and Windows ARM64. On another machine, run `cargo build --release`.
 
 ## Docs
 

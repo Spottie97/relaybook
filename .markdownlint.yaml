@@ -2,7 +2,10 @@
 # MD033 is the README picture element and centered badges. GitHub does not
 # theme those from Markdown alone.
 # MD041: the logo is the title. The image alt text is the name.
+# MD024: Keep a Changelog repeats Added, Changed, and Fixed under each version.
 default: true
 MD013: false
 MD033: false
 MD041: false
+MD024:
+  siblings_only: true

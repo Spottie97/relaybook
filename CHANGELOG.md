@@ -7,6 +7,7 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 ### Added
 
 - Auto runs print each phase, tool call, and the first line of agent text as they happen, and append the same lines to `.relaybook/runs/<id>/live.log`. `relaybook run watch` follows that log until the run pauses or ends. `relaybook run --quiet` prints the phase headers and the closing summary. `relaybook status` shows the latest live lines.
+- Native Windows support: PowerShell `install.ps1` and Git Bash `install.sh`, Windows x64 and ARM64 release archives, the Cursor CLI name `agent`, and a prompt hook that uses the guarded POSIX command or a PowerShell command when Git Bash is absent.
 
 ### Fixed
 
