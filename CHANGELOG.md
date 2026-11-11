@@ -4,6 +4,13 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-11
+
+### Fixed
+
+- The Linux release binary is fully static (musl), so it runs on older glibc and on Alpine.
+- The publish job checks out the repository before it creates the GitHub release.
+
 ## [0.2.0] - 2026-11-11
 
 ### Added
