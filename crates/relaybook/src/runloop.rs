@@ -12,6 +12,8 @@ pub(crate) struct Launch {
     pub approve: bool,
     pub stop: bool,
     pub complete: bool,
+    pub add: Vec<String>,
+    pub new_only: bool,
     pub max_cycles: Option<i64>,
     pub max_agent_calls: Option<i64>,
     pub max_reopens: Option<i64>,
@@ -35,6 +37,9 @@ pub(crate) fn execute(cwd: &Path, launch: Launch) -> RunOutput {
     if launch.stop {
         return stop_requested(&db);
     }
+    if !launch.add.is_empty() {
+        return add_to_run(&db, &launch.add);
+    }
     if let Err(err) = apply_overrides(&db, &launch) {
         return fail(&err);
     }
@@ -42,7 +47,7 @@ pub(crate) fn execute(cwd: &Path, launch: Launch) -> RunOutput {
         if let Err(err) = reopen_run(&db, cwd, launch.approve) {
             return fail(&err);
         }
-    } else if let Err(err) = begin_run(&db, cwd, launch.prd.as_deref()) {
+    } else if let Err(err) = begin_run(&db, cwd, launch.prd.as_deref(), launch.new_only) {
         return fail(&err);
     }
     drive(&db, cwd)
@@ -114,7 +119,7 @@ fn apply_overrides(db: &Path, launch: &Launch) -> Result<(), String> {
     Ok(())
 }
 
-fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>) -> Result<(), String> {
+fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Result<(), String> {
     let accounts = agents::preflight()?;
     let mut ledger = Ledger::open(db).map_err(|err| err.to_string())?;
     let settings = ledger.settings().map_err(|err| err.to_string())?;
@@ -148,11 +153,100 @@ fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>) -> Result<(), String> {
     let branch = format!("relaybook/{}", stem(prd));
     sync_main(cwd)?;
     git(cwd, &["checkout", "-B", &branch, "main"])?;
-    ledger
+    let run = ledger
         .start_run(&prd_path, &digest, &branch)
         .map_err(|err| err.to_string())?;
+    if !new_only {
+        let adopted = match adopt_existing(&mut ledger, run.id) {
+            Ok(adopted) => adopted,
+            Err(err) => {
+                if let Ok(Some(mut run)) = ledger.active_run() {
+                    run.status = "stopped".to_string();
+                    run.stop_reason = Some(err.clone());
+                    let _ = ledger.save_run(&run);
+                }
+                return Err(err);
+            }
+        };
+        if !adopted.is_empty() {
+            println!(
+                "adopted {} existing tasks: {}",
+                adopted.len(),
+                adopted.join(", ")
+            );
+        }
+    }
     println!("{}", agents::account_line(&accounts));
     Ok(())
+}
+
+fn adopt_existing(ledger: &mut Ledger, run_id: i64) -> Result<Vec<String>, String> {
+    let mut adopted = ledger
+        .adopt_backlog(run_id)
+        .map_err(|err| err.to_string())?;
+    match ledger
+        .absorb_dependencies(run_id)
+        .map_err(|err| err.to_string())?
+    {
+        relaybook_core::Absorb::Linked(extra) => {
+            for slug in extra {
+                if !adopted.contains(&slug) {
+                    adopted.push(slug);
+                }
+            }
+        }
+        relaybook_core::Absorb::Waiting { task, dependency } => {
+            return Err(format!(
+                "{task} waits on {dependency}, which is not in this run; link it with relaybook run add {dependency}"
+            ));
+        }
+    }
+    Ok(adopted)
+}
+
+fn absorb_after_plan(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> Option<RunOutput> {
+    match ledger.absorb_dependencies(run.id) {
+        Ok(relaybook_core::Absorb::Linked(slugs)) if !slugs.is_empty() => {
+            println!(
+                "adopted {} existing tasks: {}",
+                slugs.len(),
+                slugs.join(", ")
+            );
+            None
+        }
+        Ok(relaybook_core::Absorb::Waiting { task, dependency }) => Some(halt(
+            cwd,
+            ledger,
+            run,
+            &format!(
+                "{task} waits on {dependency}, which is not in this run; link it with relaybook run add {dependency}"
+            ),
+        )),
+        Ok(_) => None,
+        Err(err) => Some(fail(&err.to_string())),
+    }
+}
+
+fn add_to_run(db: &Path, slugs: &[String]) -> RunOutput {
+    let mut ledger = match Ledger::open(db) {
+        Ok(ledger) => ledger,
+        Err(err) => return fail(&err.to_string()),
+    };
+    let Some(run) = (match ledger.active_run() {
+        Ok(run) => run,
+        Err(err) => return fail(&err.to_string()),
+    }) else {
+        return fail("no active run");
+    };
+    let mut lines = Vec::new();
+    for slug in slugs {
+        match ledger.assign_run(slug, run.id) {
+            Ok(true) => lines.push(format!("linked {slug}")),
+            Ok(false) => lines.push(format!("{slug} already in this run")),
+            Err(err) => return fail(&err.to_string()),
+        }
+    }
+    ok(&lines.join("\n"))
 }
 
 fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<(), String> {
@@ -218,7 +312,23 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
         if run.stage == "plan" {
             let prd_file = cwd.join(&run.prd_path);
             let prd = std::fs::read_to_string(&prd_file).unwrap_or_default();
-            let prompt = format!("PRD:\n{prd}");
+            let adopted = ledger
+                .run_tasks(run.id)
+                .map(|tasks| {
+                    tasks
+                        .into_iter()
+                        .map(|task| task.slug)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let prompt = if adopted.is_empty() {
+                format!("PRD:\n{prd}")
+            } else {
+                format!(
+                    "PRD:\n{prd}\nAdopted tasks: {adopted}\nBuild on these tasks. Do not create duplicates.\n"
+                )
+            };
             let budget = settings.est_cost_cap_usd.clone();
             let run_id = run.id;
             run.agent_calls += 1;
@@ -260,6 +370,9 @@ fn drive(db: &Path, cwd: &Path) -> RunOutput {
                 return fail("no active run");
             };
             note_cost(&mut run, &result);
+            if let Some(output) = absorb_after_plan(cwd, &mut ledger, &mut run) {
+                return output;
+            }
             let gates = ledger.settings().map(|item| item.gates).unwrap_or_default();
             run.stage = if gates == "plan" || gates == "plan,review" {
                 "gate_plan".to_string()

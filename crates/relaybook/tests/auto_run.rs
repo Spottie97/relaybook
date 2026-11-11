@@ -434,6 +434,182 @@ fn manual_mode_refuses_to_start_and_preflight_names_the_fix() {
     );
 }
 
+#[test]
+fn existing_tasks_are_adopted_and_new_only_leaves_them() {
+    let dir = repo();
+    relaybook(dir.path())
+        .args(["task", "create", "work", "--title", "Already planned"])
+        .assert()
+        .success();
+    let output = run(dir.path(), "happy", &["run", "--prd", "prd.md"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("adopted 1 existing tasks: work"), "{text}");
+    assert!(task_list(dir.path()).contains("\"status\":\"done\""),);
+
+    let dir = repo();
+    relaybook(dir.path())
+        .args(["task", "create", "other", "--title", "Leave me"])
+        .assert()
+        .success();
+    let output = run(
+        dir.path(),
+        "happy",
+        &["run", "--new-only", "--prd", "prd.md"],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!text.contains("adopted "), "{text}");
+    let listed = task_list(dir.path());
+    assert!(listed.contains("\"slug\":\"other\""), "{listed}");
+    assert!(listed.contains("\"status\":\"open\""), "{listed}");
+}
+
+#[test]
+fn a_dependency_outside_the_run_is_pulled_in_or_named() {
+    let dir = repo();
+    relaybook(dir.path())
+        .args(["task", "create", "login", "--title", "Sign in"])
+        .assert()
+        .success();
+    let output = run(
+        dir.path(),
+        "depend",
+        &["run", "--new-only", "--prd", "prd.md"],
+    );
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("adopted 1 existing tasks: login"), "{text}");
+    let listed = task_list(dir.path());
+    assert!(listed.contains("\"slug\":\"login\""), "{listed}");
+    assert!(listed.contains("\"slug\":\"uploads\""), "{listed}");
+
+    let dir = repo();
+    relaybook(dir.path())
+        .args(["task", "create", "login", "--title", "Sign in"])
+        .assert()
+        .success();
+    let first = run(dir.path(), "stop", &["run", "--prd", "prd.md"]);
+    assert!(
+        !first.status.success(),
+        "stop run should end when the planner stops it"
+    );
+    let output = run(
+        dir.path(),
+        "depend",
+        &["run", "--new-only", "--prd", "prd.md"],
+    );
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains(
+            "uploads waits on login, which is not in this run; link it with relaybook run add login"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn run_add_links_unfinished_tasks_and_rejects_the_rest() {
+    let dir = repo();
+    relaybook(dir.path())
+        .args(["config", "set", "gates", "plan"])
+        .assert()
+        .success();
+    relaybook(dir.path())
+        .args(["task", "create", "login", "--title", "Sign in"])
+        .assert()
+        .success();
+    let output = run(
+        dir.path(),
+        "happy",
+        &["run", "--new-only", "--prd", "prd.md"],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{text} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("waiting for approval"), "{text}");
+    relaybook(dir.path())
+        .args(["run", "add", "login"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("linked login"));
+    relaybook(dir.path())
+        .args(["run", "add", "login"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("login already in this run"));
+    let events = relaybook(dir.path())
+        .args(["context", "login", "--json"])
+        .output()
+        .expect("context");
+    let events = String::from_utf8_lossy(&events.stdout);
+    assert!(events.contains("run_linked"), "{events}");
+    relaybook(dir.path())
+        .args(["task", "create", "gone", "--title", "Finished"])
+        .assert()
+        .success();
+    relaybook(dir.path())
+        .args(["task", "claim", "gone", "--by", "cursor"])
+        .assert()
+        .success();
+    relaybook(dir.path())
+        .args([
+            "task",
+            "done",
+            "gone",
+            "--changed",
+            "done",
+            "--verified",
+            "seen",
+            "--not-verified",
+            "rest",
+            "--review",
+            "ok",
+        ])
+        .assert()
+        .success();
+    relaybook(dir.path())
+        .args(["run", "add", "gone"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("gone is done"));
+    relaybook(dir.path())
+        .args(["run", "stop"])
+        .assert()
+        .failure();
+    relaybook(dir.path())
+        .args(["run", "add", "login"])
+        .assert()
+        .failure()
+        .stdout(predicates::str::contains("no active run"));
+}
+
+fn task_list(dir: &Path) -> String {
+    let output = relaybook(dir)
+        .args(["task", "list", "--all", "--json"])
+        .output()
+        .expect("list");
+    String::from_utf8(output.stdout).expect("utf8")
+}
+
 fn args_contain(dir: &Path, name: &str, needle: &str) -> bool {
     let path = fs::read_to_string(dir.join(".relaybook").join("log-path")).unwrap_or_default();
     fs::read_to_string(Path::new(path.trim()).join(name))

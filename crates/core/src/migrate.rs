@@ -1,7 +1,9 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::Error;
-use crate::schema::{MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4, SCHEMA, SCHEMA_VERSION};
+use crate::schema::{
+    MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4, MIGRATE_V5_TO_V6, SCHEMA, SCHEMA_VERSION,
+};
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -42,6 +44,9 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
                  ALTER TABLE runs ADD COLUMN complete_requested INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
+    }
+    if version < 6 && table_exists(&tx, "events")? {
+        tx.execute_batch(MIGRATE_V5_TO_V6)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;

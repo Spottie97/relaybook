@@ -2,7 +2,7 @@
 ///
 /// `events_progress_once` rejects a second progress event for the same task
 /// and commit. A null commit (no git HEAD) is not covered, so those reports append.
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS events (
             'decision',
             'status_changed',
             'dependency_changed',
-            'task_renamed'
+            'task_renamed',
+            'run_linked'
         )
     ),
     payload TEXT NOT NULL
@@ -175,6 +176,41 @@ DROP TABLE events;
 ALTER TABLE events_v2 RENAME TO events;
 
 CREATE UNIQUE INDEX events_progress_once
+ON events (
+    json_extract(payload, '$.slug'),
+    json_extract(payload, '$.commit')
+)
+WHERE kind = 'progress'
+  AND json_extract(payload, '$.commit') IS NOT NULL;
+";
+
+pub(crate) const MIGRATE_V5_TO_V6: &str = "
+CREATE TABLE events_v6 (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (
+        kind IN (
+            'task_created',
+            'claimed',
+            'progress',
+            'decision',
+            'status_changed',
+            'dependency_changed',
+            'task_renamed',
+            'run_linked'
+        )
+    ),
+    payload TEXT NOT NULL
+);
+
+INSERT INTO events_v6 (id, ts, kind, payload)
+SELECT id, ts, kind, payload FROM events;
+
+DROP TABLE events;
+
+ALTER TABLE events_v6 RENAME TO events;
+
+CREATE UNIQUE INDEX IF NOT EXISTS events_progress_once
 ON events (
     json_extract(payload, '$.slug'),
     json_extract(payload, '$.commit')

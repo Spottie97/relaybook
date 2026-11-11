@@ -98,6 +98,24 @@ fn claude(args: &[String]) {
         _ => {}
     }
     let joined = args.join(" ");
+    if kind() == "stop" && joined.contains("PRD:") {
+        relay(&["run", "stop"]);
+        println!(r#"{{"session_id":"sess-1","total_cost_usd":0.20}}"#);
+        return;
+    }
+    if kind() == "depend" && joined.contains("PRD:") {
+        relay(&[
+            "task",
+            "create",
+            "uploads",
+            "--title",
+            "Upload",
+            "--depends-on",
+            "login",
+        ]);
+        println!(r#"{{"session_id":"sess-1","total_cost_usd":0.20}}"#);
+        return;
+    }
     if joined.contains("PRD:") {
         relay(&["task", "create", "work", "--title", "Do the work"]);
         relay(&["step", "add", "work", "ship it"]);
@@ -171,6 +189,12 @@ fn cursor(args: &[String]) {
             relay(&["mode", "manual"]);
         }
         "sleep" => thread::sleep(Duration::from_secs(30)),
+        "depend" => {
+            let slug = task_slug(args).unwrap_or_else(|| "uploads".to_string());
+            finish_slug(&slug);
+            println!(r#"{{"ok":true}}"#);
+            return;
+        }
         _ => {}
     }
     relay(&["task", "claim", "work", "--by", "cursor"]);
@@ -194,6 +218,34 @@ fn cursor(args: &[String]) {
         git(&["push", "origin", "HEAD:main"]);
     }
     println!(r#"{{"ok":true}}"#);
+}
+
+fn task_slug(args: &[String]) -> Option<String> {
+    let joined = args.join(" ");
+    let marker = "Task slug: ";
+    let rest = joined.split(marker).nth(1)?;
+    let slug = rest.split_whitespace().next()?;
+    Some(slug.to_string())
+}
+
+fn finish_slug(slug: &str) {
+    relay(&["task", "claim", slug, "--by", "cursor"]);
+    let _ = append_file(&format!("{slug}.txt"), "hello\n");
+    git(&["add", &format!("{slug}.txt")]);
+    git(&["commit", "-m", &format!("do {slug}")]);
+    relay(&[
+        "task",
+        "done",
+        slug,
+        "--changed",
+        "added work",
+        "--verified",
+        "git show",
+        "--not-verified",
+        "live",
+        "--review",
+        "diff",
+    ]);
 }
 
 fn sibling_fail() -> bool {

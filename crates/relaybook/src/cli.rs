@@ -138,6 +138,9 @@ enum Command {
         est_cost_cap_usd: Option<String>,
         #[arg(long)]
         gates: Option<String>,
+        /// Leave tasks that already exist out of this run.
+        #[arg(long)]
+        new_only: bool,
         #[command(subcommand)]
         action: Option<RunAction>,
     },
@@ -288,6 +291,8 @@ enum RunAction {
     Stop,
     /// Mark the PRD covered. The loop opens the PR when nothing is open.
     Complete,
+    /// Link unfinished tasks to the active run.
+    Add { slug: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -542,6 +547,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             cursor_timeout_min,
             est_cost_cap_usd,
             gates,
+            new_only,
             action,
         } => {
             let prd = match (prd, prd_path) {
@@ -551,14 +557,22 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                 (Some(path), None) | (None, Some(path)) => Some(path),
                 (None, None) => None,
             };
+            let (stop, complete, add) = match action {
+                Some(RunAction::Stop) => (true, false, Vec::new()),
+                Some(RunAction::Complete) => (false, true, Vec::new()),
+                Some(RunAction::Add { slug }) => (false, false, slug),
+                None => (false, false, Vec::new()),
+            };
             run_auto(
                 &cwd,
                 runloop::Launch {
                     prd,
                     resume,
                     approve: false,
-                    stop: matches!(action, Some(RunAction::Stop)),
-                    complete: matches!(action, Some(RunAction::Complete)),
+                    stop,
+                    complete,
+                    add,
+                    new_only,
                     max_cycles,
                     max_agent_calls,
                     max_reopens,
@@ -576,6 +590,8 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                 approve: true,
                 stop: false,
                 complete: false,
+                add: Vec::new(),
+                new_only: false,
                 max_cycles: None,
                 max_agent_calls: None,
                 max_reopens: None,

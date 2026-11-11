@@ -13,7 +13,7 @@ mod schema;
 mod settings;
 
 pub use error::Error;
-pub use ledger::Ledger;
+pub use ledger::{Absorb, Ledger};
 pub use legacy::{LegacyMove, migrate_legacy_ledger};
 pub use model::{
     Context, Decision, Event, EventKind, RECENT_EVENT_LIMIT, Status, Step, Task, TaskDetail,

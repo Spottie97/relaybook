@@ -12,6 +12,13 @@ relaybook run docs/prd.md
 
 `relaybook run --prd docs/prd.md` is the same start. Pass either the positional path or `--prd`, not both.
 
+A run adopts unfinished tasks that are not already in a run, and prints `adopted N existing tasks: ...`. The planner is told to build on them. `relaybook run --new-only docs/prd.md` leaves those tasks alone. A task that depends on an unfinished task outside the run pulls that task in. If the dependency is blocked or belongs to another run, the run stops and names `relaybook run add <slug>`. `/relaybook run add <slug>` passes that command through.
+
+```sh
+relaybook run --new-only docs/prd.md
+relaybook run add login
+```
+
 ## Controls
 
 `/relaybook` in Claude Code or Cursor shows the current status and a menu. With arguments it runs the matching command.

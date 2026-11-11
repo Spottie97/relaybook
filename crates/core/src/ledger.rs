@@ -263,12 +263,54 @@ impl Ledger {
         crate::settings::hook_wait_line(&self.conn)
     }
 
-    pub fn assign_run(&mut self, slug: &str, run_id: i64) -> Result<(), Error> {
+    pub fn assign_run(&mut self, slug: &str, run_id: i64) -> Result<bool, Error> {
         let slug = checked_slug(slug)?;
-        self.transaction(|conn| {
-            let _ = load_task(conn, &slug)?;
-            crate::runs::assign_task(conn, &slug, run_id)
-        })
+        self.transaction(|conn| link_run(conn, &slug, run_id))
+    }
+
+    pub fn adopt_backlog(&mut self, run_id: i64) -> Result<Vec<String>, Error> {
+        let slugs = unassigned_work(&self.conn)?;
+        let mut linked = Vec::new();
+        for slug in slugs {
+            if self.assign_run(&slug, run_id)? {
+                linked.push(slug);
+            }
+        }
+        Ok(linked)
+    }
+
+    pub fn absorb_dependencies(&mut self, run_id: i64) -> Result<Absorb, Error> {
+        let mut linked = Vec::new();
+        loop {
+            let tasks = self.run_tasks(run_id)?;
+            let mut added = false;
+            for task in &tasks {
+                if task.status == Status::Done {
+                    continue;
+                }
+                for dependency in &task.depends_on {
+                    match outside_dependency(&self.conn, dependency, run_id)? {
+                        Outside::Ready => {
+                            if self.assign_run(dependency, run_id)? {
+                                linked.push(dependency.clone());
+                                added = true;
+                            }
+                        }
+                        Outside::Waiting => {
+                            return Ok(Absorb::Waiting {
+                                task: task.slug.clone(),
+                                dependency: dependency.clone(),
+                            });
+                        }
+                        Outside::Inside => {}
+                    }
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        Ok(Absorb::Linked(linked))
     }
 
     pub fn active_run(&self) -> Result<Option<crate::runs::Run>, Error> {
@@ -743,6 +785,68 @@ fn now(conn: &Connection) -> Result<String, Error> {
     Ok(ts)
 }
 
+pub enum Absorb {
+    Linked(Vec<String>),
+    Waiting { task: String, dependency: String },
+}
+
+enum Outside {
+    Inside,
+    Ready,
+    Waiting,
+}
+
+fn link_run(conn: &Connection, slug: &str, run_id: i64) -> Result<bool, Error> {
+    let task = load_task(conn, slug)?;
+    if task.status == Status::Done {
+        return Err(Error::InvalidSetting(format!("{slug} is done")));
+    }
+    let owner: Option<i64> = conn.query_row(
+        "SELECT run_id FROM tasks WHERE slug = ?1",
+        params![slug],
+        |row| row.get(0),
+    )?;
+    if owner == Some(run_id) {
+        return Ok(false);
+    }
+    crate::runs::assign_task(conn, slug, run_id)?;
+    record_event(
+        conn,
+        EventKind::RunLinked,
+        serde_json::json!({ "slug": slug, "run_id": run_id }),
+    )?;
+    Ok(true)
+}
+
+fn unassigned_work(conn: &Connection) -> Result<Vec<String>, Error> {
+    let mut statement = conn.prepare(
+        "SELECT slug FROM tasks
+         WHERE run_id IS NULL AND status IN ('open', 'claimed')
+         ORDER BY id",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut slugs = Vec::new();
+    for row in rows {
+        slugs.push(row?);
+    }
+    Ok(slugs)
+}
+
+fn outside_dependency(conn: &Connection, dependency: &str, run_id: i64) -> Result<Outside, Error> {
+    let (status, owner): (String, Option<i64>) = conn.query_row(
+        "SELECT status, run_id FROM tasks WHERE slug = ?1",
+        params![dependency],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if status == Status::Done.as_str() || owner == Some(run_id) {
+        return Ok(Outside::Inside);
+    }
+    if status == Status::Blocked.as_str() || owner.is_some() {
+        return Ok(Outside::Waiting);
+    }
+    Ok(Outside::Ready)
+}
+
 fn insert_event(
     conn: &Connection,
     kind: EventKind,
@@ -1120,7 +1224,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let deps: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_deps'",
@@ -1136,7 +1240,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let stored_again: String = conn
             .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
                 row.get(0)
@@ -1191,7 +1295,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1245,6 +1349,6 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 }

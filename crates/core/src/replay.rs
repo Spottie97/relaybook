@@ -101,6 +101,7 @@ fn apply(tasks: &mut Vec<ReplayedTask>, event: &Event) -> Result<(), Error> {
             task.title = to;
             Ok(())
         }
+        EventKind::RunLinked => Ok(()),
     }
 }
 

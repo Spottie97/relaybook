@@ -57,6 +57,7 @@ pub enum EventKind {
     StatusChanged,
     DependencyChanged,
     TaskRenamed,
+    RunLinked,
 }
 
 impl EventKind {
@@ -69,6 +70,7 @@ impl EventKind {
             Self::StatusChanged => "status_changed",
             Self::DependencyChanged => "dependency_changed",
             Self::TaskRenamed => "task_renamed",
+            Self::RunLinked => "run_linked",
         }
     }
 }
@@ -91,6 +93,7 @@ impl std::str::FromStr for EventKind {
             "status_changed" => Ok(Self::StatusChanged),
             "dependency_changed" => Ok(Self::DependencyChanged),
             "task_renamed" => Ok(Self::TaskRenamed),
+            "run_linked" => Ok(Self::RunLinked),
             other => Err(Error::BadEvent(format!("unknown kind {other}"))),
         }
     }
@@ -218,6 +221,7 @@ mod tests {
             EventKind::StatusChanged,
             EventKind::DependencyChanged,
             EventKind::TaskRenamed,
+            EventKind::RunLinked,
         ] {
             let parsed: EventKind = kind.as_str().parse().expect("kind");
             assert_eq!(parsed, kind);
