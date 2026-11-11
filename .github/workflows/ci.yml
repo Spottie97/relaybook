@@ -27,6 +27,29 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+      - name: PSScriptAnalyzer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $issues = @(Invoke-ScriptAnalyzer -Path install.ps1 -Severity Warning -ExcludeRule PSUseShouldProcessForStateChangingFunctions)
+          if ($issues.Count -gt 0) {
+            $issues | Format-Table -AutoSize | Out-String | Write-Output
+            exit 1
+          }
+      - name: install windows binaries
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test-windows-install.ps1 -Phase Install
+      - name: relaybook from the user PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: relaybook --version
+      - name: reinstall and uninstall on windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/test-windows-install.ps1 -Phase Finish
       - name: context budget
         run: scripts/measure-context.sh --check
       - name: docs commands
