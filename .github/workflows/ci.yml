@@ -88,9 +88,31 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact: relaybook-linux-x86_64
+            binary: relaybook
+            archive: tar.gz
+            crt: "false"
+            smoke: "false"
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: relaybook-macos-aarch64
+            binary: relaybook
+            archive: tar.gz
+            crt: "false"
+            smoke: "false"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: relaybook-windows-x86_64
+            binary: relaybook.exe
+            archive: zip
+            crt: "true"
+            smoke: "true"
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: relaybook-windows-aarch64
+            binary: relaybook.exe
+            archive: zip
+            crt: "true"
+            smoke: "true"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -102,6 +124,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: build
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.crt == 'true' && '-C target-feature=+crt-static' || '' }}
         run: |
           if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
             export CC_x86_64_unknown_linux_musl=musl-gcc
@@ -123,15 +148,64 @@ jobs:
             echo "binary links shared libraries" >&2
             exit 1
           fi
-      - name: package
+      - name: no visual c runtime
+        if: matrix.crt == 'true'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            $vswhere = "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
+          }
+          $dumpbin = & $vswhere -latest -find "**\dumpbin.exe" | Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin not found" }
+          $exe = "target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          $deps = & $dumpbin /dependents $exe
+          $deps | Write-Output
+          $imported = $deps | Where-Object { $_ -match "(?i)(VCRUNTIME|MSVCP).*\.dll" }
+          if ($imported) {
+            throw "exe imports the Visual C++ runtime: $($imported -join ', ')"
+          }
+      - name: smoke
+        if: matrix.smoke == 'true'
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "target/${{ matrix.target }}/release/relaybook.exe").Path
+          $work = Join-Path $env:RUNNER_TEMP "relaybook-smoke"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          git -C $work init -b main
+          git -C $work config user.email relaybook@example.com
+          git -C $work config user.name Relaybook
+          function Invoke-Relaybook([string[]]$RelayArgs) {
+            & $exe @RelayArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "relaybook $($RelayArgs -join ' ') exited $LASTEXITCODE"
+            }
+          }
+          Set-Location $work
+          Invoke-Relaybook -RelayArgs @("--version")
+          Invoke-Relaybook -RelayArgs @("init")
+          Invoke-Relaybook -RelayArgs @("task", "create", "greet", "--title", "Say hello")
+          Invoke-Relaybook -RelayArgs @("context")
+          Invoke-Relaybook -RelayArgs @("setup", "--no-graphify")
+      - name: package tarball
+        if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
-          cp "target/${{ matrix.target }}/release/relaybook" relaybook
-          tar -czf "${{ matrix.artifact }}.tar.gz" relaybook
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.binary }}"
+          tar -czf "${{ matrix.artifact }}.tar.gz" "${{ matrix.binary }}"
+          ls -l "${{ matrix.artifact }}.tar.gz"
+      - name: package zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.binary }}"
+          tar.exe -a -c -f "${{ matrix.artifact }}.zip" "${{ matrix.binary }}"
+          tar.exe -tf "${{ matrix.artifact }}.zip"
+          Get-Item "${{ matrix.artifact }}.zip" | Select-Object Name, Length
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+          path: ${{ matrix.artifact }}.${{ matrix.archive }}
 
   linux-containers:
     name: linux containers
@@ -180,6 +254,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz \
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip \
             --title "${GITHUB_REF_NAME}" \
             --notes "Relaybook ${GITHUB_REF_NAME}"
