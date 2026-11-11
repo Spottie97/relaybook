@@ -4,6 +4,8 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-11
+
 ### Added
 
 - Claude can run the safe Relaybook commands without a prompt. Setup pre-approves context, inbox, guide, status, task create and list, reopen, depend, step add and edit, decision log, and report accept and note. Claim, done, run, approve, setup, uninstall, mode, and gates still ask.
