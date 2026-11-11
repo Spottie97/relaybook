@@ -53,10 +53,27 @@ pub(crate) enum AgentResult {
     TimedOut,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccountKind {
+    ApiKey,
+    Subscription,
+    Plan,
+}
+
+impl AccountKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api key",
+            Self::Subscription => "subscription account",
+            Self::Plan => "plan account",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Accounts {
-    pub claude: String,
-    pub cursor: String,
+    pub claude: AccountKind,
+    pub cursor: AccountKind,
 }
 
 pub(crate) fn preflight() -> Result<Accounts, String> {
@@ -72,7 +89,11 @@ pub(crate) fn preflight() -> Result<Accounts, String> {
 }
 
 pub(crate) fn account_line(accounts: &Accounts) -> String {
-    format!("claude: {}, cursor: {}", accounts.claude, accounts.cursor)
+    format!(
+        "claude: {}, cursor: {}",
+        accounts.claude.label(),
+        accounts.cursor.label()
+    )
 }
 
 pub(crate) fn call_claude(
@@ -270,12 +291,9 @@ fn reset_time(text: &str) -> Option<String> {
     None
 }
 
-fn claude_account() -> Result<String, String> {
-    if std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return Ok("api key".to_string());
+fn claude_account() -> Result<AccountKind, String> {
+    if std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|value| !value.is_empty()) {
+        return Ok(AccountKind::ApiKey);
     }
     let output = Command::new("claude").args(["auth", "status"]).output();
     let text = output
@@ -291,13 +309,13 @@ fn claude_account() -> Result<String, String> {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if text.contains("logged") || text.contains("subscription") || text.contains("org") {
-        Ok("subscription account".to_string())
+        Ok(AccountKind::Subscription)
     } else {
         Err("claude: not signed in; run claude /login".to_string())
     }
 }
 
-fn cursor_account() -> Result<String, String> {
+fn cursor_account() -> Result<AccountKind, String> {
     for args in [["status"], ["about"]] {
         let output = Command::new("cursor-agent").args(args).output();
         let Some(output) = output.ok().filter(|item| item.status.success()) else {
@@ -310,7 +328,7 @@ fn cursor_account() -> Result<String, String> {
         )
         .to_ascii_lowercase();
         if text.contains("logged in") || text.contains('@') {
-            return Ok("plan account".to_string());
+            return Ok(AccountKind::Plan);
         }
     }
     Err("cursor: not signed in; run cursor-agent login".to_string())
@@ -325,7 +343,7 @@ fn on_path(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentResult, classify};
+    use super::{AccountKind, Accounts, AgentResult, account_line, classify, claude_account};
 
     #[test]
     fn usage_limit_is_not_a_failure_and_keeps_the_reset_time() {
@@ -364,5 +382,27 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn account_line_never_prints_the_api_key_or_an_address() {
+        let sentinel = "sentinel-key-value";
+        let previous = std::env::var_os("ANTHROPIC_API_KEY");
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", sentinel) };
+        let kind = claude_account().expect("api key");
+        let line = account_line(&Accounts {
+            claude: kind,
+            cursor: AccountKind::Plan,
+        });
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+                None => std::env::remove_var("ANTHROPIC_API_KEY"),
+            }
+        }
+        assert_eq!(kind, AccountKind::ApiKey);
+        assert_eq!(line, "claude: api key, cursor: plan account");
+        assert!(!line.contains(sentinel));
+        assert!(!line.contains('@'));
     }
 }
