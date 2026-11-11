@@ -11,6 +11,6 @@
 cargo build --release
 ```
 
-The binary is `target/release/relaybook`. It is a single static executable. SQLite is compiled in via `rusqlite` with the `bundled` feature. There is no server and no daemon.
+The binary is `target/release/relaybook`. SQLite is compiled in via `rusqlite` with the `bundled` feature. The Linux release binary is fully static (musl). The macOS release binary is self-contained and links only system libraries. There is no server and no daemon.
 
 Release archives are `relaybook-macos-aarch64.tar.gz` and `relaybook-linux-x86_64.tar.gz`.
