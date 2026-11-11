@@ -17,6 +17,7 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 - Auto mode: Claude plans and reviews, Cursor implements, with checkpoints and usage limits.
 - `/relaybook` in Claude Code and Cursor, and terminal pickers for `mode` and `gates`.
 - `relaybook uninstall` removes what `relaybook setup` added to a project. `install.sh --uninstall` removes the binary and, when the installer added them, Graphify and RTK.
+- `relaybook step add <slug> --text "..."` for step text that starts with a dash. The positional form still works.
 
 ### Changed
 

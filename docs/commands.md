@@ -50,9 +50,10 @@ relaybook task reopen greet --reason "needs a test"
 
 ## Checklist, decisions, and context
 
-Checklist positions start at 1.
+Checklist positions start at 1. Prefer `--text` on `step add`, including when the text starts with a dash. The positional form still works. Pass one of the two. Titles (`--title`), decision text (`--why`), and notes (`--text`) may also start with a dash.
 
 ```sh
+relaybook step add greet --text "write the command"
 relaybook step add greet "write the command"
 relaybook step check greet 1
 relaybook step edit greet 1 --text "write the command again"

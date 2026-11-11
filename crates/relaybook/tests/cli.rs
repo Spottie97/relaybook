@@ -527,6 +527,81 @@ fn edit_step_accepts_a_leading_dash() {
 }
 
 #[test]
+fn step_add_text_flag_accepts_a_leading_dash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "--add auth"],
+    )
+    .assert()
+    .success();
+    run(
+        dir.path(),
+        ["step", "add", "auth", "--text", "--keep the dash"],
+    )
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("added step 1 to auth"));
+    run(dir.path(), ["step", "add", "auth", "  hash passwords  "])
+        .assert()
+        .success();
+    run(dir.path(), ["step", "add", "auth", "--text", "  trim me  "])
+        .assert()
+        .success();
+    let ctx = json_data(dir.path(), ["context", "auth", "--json"]);
+    let steps = ctx["tasks"][0]["steps"].as_array().expect("steps");
+    assert_eq!(steps[0]["description"], "--keep the dash");
+    assert_eq!(steps[1]["description"], "hash passwords");
+    assert_eq!(steps[2]["description"], "trim me");
+    assert_eq!(ctx["tasks"][0]["title"], "--add auth");
+
+    run(dir.path(), ["step", "add", "auth"])
+        .assert()
+        .failure()
+        .code(2)
+        .stderr(predicate::str::contains(
+            "step text is required: pass it as an argument or with --text",
+        ));
+    run(
+        dir.path(),
+        ["step", "add", "auth", "both", "--text", "also"],
+    )
+    .assert()
+    .failure()
+    .code(2)
+    .stderr(predicate::str::contains(
+        "pass step text as an argument or with --text, not both",
+    ));
+    run(dir.path(), ["step", "add", "auth", "--text", "   "])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("description is required"));
+
+    run(
+        dir.path(),
+        [
+            "decision",
+            "log",
+            "auth",
+            "--why",
+            "--keep it",
+            "--by",
+            "cursor",
+        ],
+    )
+    .assert()
+    .success();
+    run(
+        dir.path(),
+        ["report", "note", "--by", "cursor", "--text", "--note"],
+    )
+    .assert()
+    .success();
+}
+
+#[test]
 fn task_list_hides_done_tasks_until_asked() {
     let dir = tempfile::tempdir().expect("tempdir");
     run(dir.path(), ["init"]).assert().success();

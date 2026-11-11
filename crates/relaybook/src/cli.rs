@@ -194,7 +194,8 @@ enum TaskCmd {
     /// Create an open task.
     Create {
         slug: String,
-        #[arg(long)]
+        /// Title. A leading dash is part of the title.
+        #[arg(long, allow_hyphen_values = true)]
         title: String,
         /// Slug this task must wait for. Repeat the flag for more than one.
         #[arg(long = "depends-on")]
@@ -232,26 +233,27 @@ enum TaskCmd {
     /// Send a done task back to the ready list.
     Reopen {
         slug: String,
-        #[arg(long)]
+        /// Why it is open again. A leading dash is part of the reason.
+        #[arg(long, allow_hyphen_values = true)]
         reason: String,
     },
     /// Mark a claimed task done and attach a short report.
     Done {
         slug: String,
         /// What changed. Repeat for more than one line. At least one is required.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         changed: Vec<String>,
         /// What was verified.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         verified: Vec<String>,
         /// What was not verified.
-        #[arg(long = "not-verified")]
+        #[arg(long = "not-verified", allow_hyphen_values = true)]
         not_verified: Vec<String>,
         /// Where the work left the plan.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         deviations: Vec<String>,
         /// What the planner should look at.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         review: Vec<String>,
         /// Finish without section text. An empty report is still stored.
         #[arg(long)]
@@ -260,19 +262,22 @@ enum TaskCmd {
     /// Mark an open or claimed task blocked.
     Block {
         slug: String,
-        #[arg(long)]
+        /// Why the work is stuck. A leading dash is part of the reason.
+        #[arg(long, allow_hyphen_values = true)]
         reason: String,
     },
     /// Return a blocked task to open, or to claimed when it still has an owner.
     Unblock {
         slug: String,
-        #[arg(long)]
+        /// Note stored with the unblock. A leading dash is part of the note.
+        #[arg(long, allow_hyphen_values = true)]
         note: Option<String>,
     },
     /// Change a task's title. The slug stays the same.
     Rename {
         slug: String,
-        #[arg(long)]
+        /// New title. A leading dash is part of the title.
+        #[arg(long, allow_hyphen_values = true)]
         title: String,
     },
 }
@@ -313,8 +318,8 @@ enum ReportCmd {
     Note {
         #[arg(long)]
         by: String,
-        /// Note text. Omit this to read the note from stdin.
-        #[arg(long)]
+        /// Note text. Omit this to read the note from stdin. A leading dash is part of the text.
+        #[arg(long, allow_hyphen_values = true)]
         text: Option<String>,
     },
 }
@@ -322,7 +327,14 @@ enum ReportCmd {
 #[derive(Subcommand)]
 enum StepCmd {
     /// Append a checklist step. Positions start at 1.
-    Add { slug: String, description: String },
+    Add {
+        slug: String,
+        /// Step text. A leading dash is part of the text. Pass this or the positional, not both.
+        #[arg(long, allow_hyphen_values = true)]
+        text: Option<String>,
+        /// Step text when it does not start with a dash.
+        description: Option<String>,
+    },
     /// Mark checklist step n done.
     Check { slug: String, n: i64 },
     /// Replace the text of checklist step n.
@@ -340,7 +352,8 @@ enum ProgressCmd {
     /// Record progress once for the current git commit.
     Report {
         slug: String,
-        #[arg(long)]
+        /// Progress note. A leading dash is part of the note.
+        #[arg(long, allow_hyphen_values = true)]
         note: String,
     },
 }
@@ -350,7 +363,8 @@ enum DecisionCmd {
     /// Record why a choice was made, and who made it.
     Log {
         slug: String,
-        #[arg(long)]
+        /// Why the choice was made. A leading dash is part of the text.
+        #[arg(long, allow_hyphen_values = true)]
         why: String,
         #[arg(long)]
         by: String,
@@ -484,7 +498,14 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             unblock_task(&cwd, &slug, note.as_deref())
         }
         Command::Task(TaskCmd::Rename { slug, title }) => rename_task(&cwd, &slug, &title),
-        Command::Step(StepCmd::Add { slug, description }) => add_step(&cwd, &slug, &description),
+        Command::Step(StepCmd::Add {
+            slug,
+            description,
+            text,
+        }) => {
+            let description = one_step_text(description, text)?;
+            add_step(&cwd, &slug, &description)
+        }
         Command::Step(StepCmd::Check { slug, n }) => check_step(&cwd, &slug, n),
         Command::Step(StepCmd::Edit { slug, n, text }) => edit_step(&cwd, &slug, n, &text),
         Command::Progress(ProgressCmd::Report { slug, note }) => {
@@ -944,6 +965,18 @@ fn rename_task(cwd: &Path, slug: &str, title: &str) -> Result<Outcome, Fail> {
     let task = ledger.rename_task(slug, title)?;
     let human = render::line(&format!("renamed {}", task.slug));
     json_outcome(task_ack(&task), human)
+}
+
+fn one_step_text(positional: Option<String>, flag: Option<String>) -> Result<String, Fail> {
+    match (positional, flag) {
+        (Some(text), None) | (None, Some(text)) => Ok(text),
+        (None, None) => Err(Fail::Usage(
+            "step text is required: pass it as an argument or with --text".to_string(),
+        )),
+        (Some(_), Some(_)) => Err(Fail::Usage(
+            "pass step text as an argument or with --text, not both".to_string(),
+        )),
+    }
 }
 
 fn add_step(cwd: &Path, slug: &str, description: &str) -> Result<Outcome, Fail> {
