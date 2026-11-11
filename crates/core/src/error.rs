@@ -26,6 +26,7 @@ pub enum Error {
     BadStatus(String),
     BadEvent(String),
     InvalidSetting(String),
+    NeedsClaim(String),
 }
 
 impl fmt::Display for Error {
@@ -56,6 +57,10 @@ impl fmt::Display for Error {
             Self::BadStatus(status) => write!(formatter, "invalid status: {status}"),
             Self::BadEvent(message) => write!(formatter, "invalid event: {message}"),
             Self::InvalidSetting(message) => formatter.write_str(message),
+            Self::NeedsClaim(slug) => write!(
+                formatter,
+                "claim it first: relaybook task claim {slug} --by <agent>"
+            ),
         }
     }
 }
@@ -131,6 +136,10 @@ mod tests {
         assert_eq!(
             Error::BadStatus("nope".to_string()).to_string(),
             "invalid status: nope"
+        );
+        assert_eq!(
+            Error::NeedsClaim("auth".to_string()).to_string(),
+            "claim it first: relaybook task claim auth --by <agent>"
         );
     }
 }

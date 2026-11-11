@@ -28,6 +28,7 @@ cd "$work"
 i=1
 while [ "$i" -le 40 ]; do
   "$bin" task create "done-$i" --title "Done task $i" >/dev/null
+  "$bin" task claim "done-$i" --by cursor >/dev/null
   # shellcheck disable=SC1010
   "$bin" task done --no-report "done-$i" >/dev/null
   i=$((i + 1))
@@ -126,6 +127,7 @@ cd "$inbox_work"
 "$bin" init >/dev/null
 for slug in one two three; do
   "$bin" task create "$slug" --title "Report $slug" >/dev/null
+  "$bin" task claim "$slug" --by cursor >/dev/null
   # shellcheck disable=SC1010
   "$bin" task done "$slug" \
     --changed "landed $slug" \

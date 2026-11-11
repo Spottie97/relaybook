@@ -235,7 +235,7 @@ enum TaskCmd {
         #[arg(long)]
         reason: String,
     },
-    /// Mark a task done and attach a short report.
+    /// Mark a claimed task done and attach a short report.
     Done {
         slug: String,
         /// What changed. Repeat for more than one line. At least one is required.

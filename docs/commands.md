@@ -46,7 +46,7 @@ relaybook task reopen greet --reason "needs a test"
 
 `relaybook progress report` stores `git rev-parse HEAD` when that succeeds. A second report for the same task and commit fails with `already reported for <sha>`. Outside a git checkout the commit is null, and each report is appended.
 
-`relaybook task done` on a task that is already done succeeds and does not write another event. `relaybook task done greet --no-report` still stores an empty report and does not store a second one if the task is already done.
+`relaybook task done` requires a claim. On an open task it fails with `claim it first: relaybook task claim greet --by <agent>` and exit code 1, and it writes nothing. A task that is already done succeeds and does not write another event. `relaybook task done greet --no-report` still stores an empty report and does not store a second one if the task is already done.
 
 ## Checklist, decisions, and context
 

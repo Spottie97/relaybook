@@ -158,6 +158,7 @@ fn block_task_from_open_or_claimed_and_rejects_done() {
     assert_eq!(claimed.claimed_by.as_deref(), Some("cursor"));
 
     ledger.create_task("ship", "Ship it").expect("create");
+    ledger.claim_task("ship", "cursor").expect("claim");
     ledger.complete_task("ship").expect("done");
     assert_eq!(
         ledger
@@ -195,6 +196,7 @@ fn dependencies_gate_claims_and_reject_cycles() {
         "waiting on: base, other"
     );
 
+    ledger.claim_task("base", "cursor").expect("claim");
     ledger.complete_task("base").expect("done");
     assert_eq!(
         ledger
@@ -203,6 +205,7 @@ fn dependencies_gate_claims_and_reject_cycles() {
             .to_string(),
         "waiting on: other"
     );
+    ledger.claim_task("other", "cursor").expect("claim");
     ledger.complete_task("other").expect("done");
     let claimed = ledger.claim_task("feature", "cursor").expect("claim");
     assert_eq!(claimed.status, Status::Claimed);
@@ -318,6 +321,7 @@ fn rename_updates_any_status_and_skips_an_unchanged_title() {
         "no such task: missing"
     );
 
+    ledger.claim_task("auth", "cursor").expect("claim");
     ledger.complete_task("auth").expect("done");
     let done = ledger
         .rename_task("auth", "Add login later")
@@ -425,6 +429,7 @@ fn oversized_report_rolls_back_the_done_status() {
     let path = dir.path().join("ledger.db");
     let mut ledger = Ledger::initialize(&path).expect("init");
     ledger.create_task("auth", "Add auth").expect("create");
+    ledger.claim_task("auth", "cursor").expect("claim");
     let huge = "x".repeat(1600);
     let err = ledger
         .finish_task(
@@ -441,7 +446,7 @@ fn oversized_report_rolls_back_the_done_status() {
     assert!(err.to_string().starts_with("report is "));
     assert!(err.to_string().contains("limit 1500"));
     let task = ledger.context(Some("auth"), 5).expect("context");
-    assert_eq!(task.tasks[0].task.status, Status::Open);
+    assert_eq!(task.tasks[0].task.status, Status::Claimed);
 
     ledger
         .finish_task(
@@ -467,6 +472,45 @@ fn oversized_report_rolls_back_the_done_status() {
     assert!(note > 0);
     let too_long = "n".repeat(500);
     assert!(ledger.add_note("cursor", &too_long).is_err());
+}
+
+#[test]
+fn done_on_an_open_task_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.create_task("auth", "Add auth").expect("create");
+    let err = ledger
+        .finish_task(
+            "auth",
+            Some(Sections {
+                changed: vec!["shipped".to_string()],
+                verified: Vec::new(),
+                not_verified: Vec::new(),
+                deviations: Vec::new(),
+                review: Vec::new(),
+            }),
+        )
+        .expect_err("open");
+    assert_eq!(
+        err.to_string(),
+        "claim it first: relaybook task claim auth --by <agent>"
+    );
+    let task = ledger.context(Some("auth"), 20).expect("context");
+    assert_eq!(task.tasks[0].task.status, Status::Open);
+    let conn = rusqlite::Connection::open(&path).expect("open");
+    let reports: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+        .expect("reports");
+    assert_eq!(reports, 0);
+    let done_events: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'status_changed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("events");
+    assert_eq!(done_events, 0);
 }
 
 fn spawn_claim(

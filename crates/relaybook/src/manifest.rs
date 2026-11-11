@@ -11,7 +11,17 @@ const CONFIG_KEYS: &[&str] = &["merge.graphify.name", "merge.graphify.driver"];
 pub(crate) struct Capture {
     files: BTreeMap<String, Option<String>>,
     configs: BTreeMap<String, Option<String>>,
+    dirs: BTreeMap<String, bool>,
 }
+
+const CREATED_DIRS: &[&str] = &[
+    ".claude",
+    ".claude/commands",
+    ".cursor",
+    ".cursor/commands",
+    ".github",
+    ".github/workflows",
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Entry {
@@ -40,7 +50,15 @@ pub(crate) fn capture(root: &Path) -> Capture {
     for key in CONFIG_KEYS {
         configs.insert((*key).to_string(), git_config(root, key));
     }
-    Capture { files, configs }
+    let mut dirs = BTreeMap::new();
+    for dir in CREATED_DIRS {
+        dirs.insert((*dir).to_string(), root.join(dir).is_dir());
+    }
+    Capture {
+        files,
+        configs,
+        dirs,
+    }
 }
 
 pub(crate) fn record(root: &Path, before: &Capture) -> std::io::Result<()> {
@@ -83,6 +101,21 @@ pub(crate) fn record(root: &Path, before: &Capture) -> std::io::Result<()> {
             added: key.clone(),
             before: previous.clone(),
             after: now,
+        });
+    }
+    for (dir, existed) in &before.dirs {
+        if *existed || !root.join(dir).is_dir() {
+            continue;
+        }
+        if manifest.entries.iter().any(|entry| entry.file == *dir) {
+            continue;
+        }
+        manifest.entries.push(Entry {
+            file: dir.clone(),
+            kind: "directory".to_string(),
+            added: "created".to_string(),
+            before: None,
+            after: Some("created".to_string()),
         });
     }
     if manifest.entries.is_empty() {

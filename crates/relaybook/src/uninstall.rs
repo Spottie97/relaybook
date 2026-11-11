@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -67,6 +68,9 @@ pub(crate) fn run(cwd: &Path, options: Options) -> Result<Report, String> {
         ));
     }
     if options.dry_run {
+        for change in &mut changes {
+            change.action = dry_action(&change.action);
+        }
         return Ok(Report {
             changes,
             error: None,
@@ -127,10 +131,16 @@ fn planned(root: &Path, manifest: Option<&manifest::Manifest>, graphify: bool) -
     let mut changes = Vec::new();
     if let Some(manifest) = manifest {
         for entry in &manifest.entries {
+            if entry.kind == "directory" {
+                continue;
+            }
             changes.push(plan_entry(root, entry));
         }
     }
-    changes.extend(plan_markers(root, manifest.is_some()));
+    changes = merge_plans(changes, plan_markers(root, manifest.is_some()));
+    if let Some(manifest) = manifest {
+        changes.extend(plan_dirs(root, manifest));
+    }
     if graphify {
         for command in ["claude uninstall", "cursor uninstall", "hook uninstall"] {
             let item = format!("graphify {command}");
@@ -149,7 +159,7 @@ fn plan_entry(root: &Path, entry: &Entry) -> Change {
         let key = entry.file.trim_start_matches("git-config:");
         let current = git_config(root, key);
         if current.as_deref() == entry.after.as_deref() {
-            return change(entry.file.clone(), "removed", "restored git config");
+            return change(entry.file.clone(), file_action(&entry.before), "");
         }
         return change(
             entry.file.clone(),
@@ -159,13 +169,110 @@ fn plan_entry(root: &Path, entry: &Entry) -> Change {
     }
     let current = fs::read_to_string(root.join(&entry.file)).ok();
     if current == entry.after {
-        return change(entry.file.clone(), "removed", "restored the previous bytes");
+        return change(entry.file.clone(), file_action(&entry.before), "");
     }
     change(
         entry.file.clone(),
         "skipped",
         "changed since setup; markers still apply",
     )
+}
+
+fn file_action(before: &Option<String>) -> &'static str {
+    if before.is_some() {
+        "restored"
+    } else {
+        "removed"
+    }
+}
+
+fn dry_action(action: &str) -> String {
+    match action {
+        "removed" => "would remove".to_string(),
+        "restored" => "would restore".to_string(),
+        "kept" => "would keep".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn merge_plans(manifest_changes: Vec<Change>, markers: Vec<Change>) -> Vec<Change> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for item in manifest_changes {
+        if item.action == "skipped"
+            && let Some(marker) = markers.iter().find(|marker| marker.item == item.item)
+        {
+            if seen.insert(marker.item.clone()) {
+                out.push(marker.clone());
+            }
+            continue;
+        }
+        if seen.insert(item.item.clone()) {
+            out.push(item);
+        }
+    }
+    for marker in markers {
+        if seen.insert(marker.item.clone()) {
+            out.push(marker);
+        }
+    }
+    out
+}
+
+fn files_removed_by_manifest(root: &Path, manifest: &manifest::Manifest) -> HashSet<String> {
+    manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.kind != "directory" && entry.kind != "git-config")
+        .filter(|entry| entry.before.is_none())
+        .filter(|entry| fs::read_to_string(root.join(&entry.file)).ok() == entry.after)
+        .map(|entry| entry.file.clone())
+        .collect()
+}
+
+fn plan_dirs(root: &Path, manifest: &manifest::Manifest) -> Vec<Change> {
+    dirs_to_remove(root, manifest)
+        .into_iter()
+        .map(|dir| change(dir, "removed", ""))
+        .collect()
+}
+
+fn dirs_to_remove(root: &Path, manifest: &manifest::Manifest) -> Vec<String> {
+    let deleting = files_removed_by_manifest(root, manifest);
+    let mut dirs: Vec<String> = manifest
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == "directory" && entry.before.is_none())
+        .map(|entry| entry.file.clone())
+        .filter(|dir| dir_clears(root, dir, &deleting))
+        .collect();
+    dirs.sort_by_key(|dir| std::cmp::Reverse(dir.matches('/').count()));
+    dirs
+}
+
+fn dir_clears(root: &Path, dir: &str, deleting: &HashSet<String>) -> bool {
+    let Ok(entries) = fs::read_dir(root.join(dir)) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let child = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(entry.path().as_path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        if entry.path().is_dir() {
+            if !dir_clears(root, &child, deleting) {
+                return false;
+            }
+        } else if !deleting.contains(&child) {
+            return false;
+        }
+    }
+    true
 }
 
 fn plan_markers(root: &Path, has_manifest: bool) -> Vec<Change> {
@@ -272,12 +379,21 @@ fn plan_markers(root: &Path, has_manifest: bool) -> Vec<Change> {
 }
 
 fn apply(root: &Path, manifest: Option<&manifest::Manifest>, graphify: bool) -> Result<(), String> {
+    let dirs = manifest
+        .map(|manifest| dirs_to_remove(root, manifest))
+        .unwrap_or_default();
     if let Some(manifest) = manifest {
         for entry in &manifest.entries {
             restore_entry(root, entry)?;
         }
     }
     clean_markers(root, manifest.is_some())?;
+    for dir in dirs {
+        let path = root.join(&dir);
+        if path.is_dir() && dir_is_empty(&path) {
+            fs::remove_dir(&path).map_err(|err| err.to_string())?;
+        }
+    }
     if graphify && crate::graphify::installed() {
         for args in [
             ["claude", "uninstall"],
@@ -291,6 +407,9 @@ fn apply(root: &Path, manifest: Option<&manifest::Manifest>, graphify: bool) -> 
 }
 
 fn restore_entry(root: &Path, entry: &Entry) -> Result<(), String> {
+    if entry.kind == "directory" {
+        return Ok(());
+    }
     if entry.kind == "git-config" {
         let key = entry.file.trim_start_matches("git-config:");
         if git_config(root, key).as_deref() != entry.after.as_deref() {
@@ -499,17 +618,13 @@ fn remove_file(path: &Path) -> Result<(), String> {
     if path.exists() {
         fs::remove_file(path).map_err(|err| err.to_string())?;
     }
-    if let Some(parent) = path.parent()
-        && parent.exists()
-        && parent
-            .read_dir()
-            .ok()
-            .is_some_and(|mut dir| dir.next().is_none())
-        && parent != path
-    {
-        let _ = fs::remove_dir(parent);
-    }
     Ok(())
+}
+
+fn dir_is_empty(path: &Path) -> bool {
+    fs::read_dir(path)
+        .ok()
+        .is_some_and(|mut dir| dir.next().is_none())
 }
 
 fn settings_have_prompt(root: &Path) -> bool {

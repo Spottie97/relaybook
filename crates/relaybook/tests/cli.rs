@@ -210,6 +210,9 @@ fn block_sets_status_and_rejects_a_done_task() {
     run(dir.path(), ["task", "create", "ship", "--title", "Ship it"])
         .assert()
         .success();
+    run(dir.path(), ["task", "claim", "ship", "--by", "cursor"])
+        .assert()
+        .success();
     run(dir.path(), ["task", "done", "--no-report", "ship"])
         .assert()
         .success();
@@ -270,6 +273,9 @@ fn dependencies_show_in_json_and_ready_list() {
         .code(1)
         .stderr(predicate::str::contains("waiting on: base"));
 
+    run(dir.path(), ["task", "claim", "base", "--by", "cursor"])
+        .assert()
+        .success();
     run(dir.path(), ["task", "done", "--no-report", "base"])
         .assert()
         .success();
@@ -340,6 +346,9 @@ fn rename_keeps_the_slug_and_shows_the_new_title() {
         .success()
         .stdout(predicate::str::contains("auth [open] Add login"));
 
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success();
     run(dir.path(), ["task", "done", "--no-report", "auth"])
         .assert()
         .success();
@@ -417,6 +426,9 @@ fn context_hides_done_tasks_until_asked() {
     let dir = tempfile::tempdir().expect("tempdir");
     run(dir.path(), ["init"]).assert().success();
     run(dir.path(), ["task", "create", "old", "--title", "Old"])
+        .assert()
+        .success();
+    run(dir.path(), ["task", "claim", "old", "--by", "cursor"])
         .assert()
         .success();
     run(dir.path(), ["task", "done", "--no-report", "old"])
@@ -521,6 +533,9 @@ fn task_list_hides_done_tasks_until_asked() {
     run(dir.path(), ["task", "create", "old", "--title", "Old"])
         .assert()
         .success();
+    run(dir.path(), ["task", "claim", "old", "--by", "cursor"])
+        .assert()
+        .success();
     run(dir.path(), ["task", "done", "--no-report", "old"])
         .assert()
         .success();
@@ -557,6 +572,31 @@ fn task_list_hides_done_tasks_until_asked() {
 }
 
 #[test]
+fn task_done_on_an_open_task_writes_nothing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(dir.path(), ["task", "done", "auth", "--changed", "not yet"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "claim it first: relaybook task claim auth --by <agent>",
+        ));
+    let data = json_data(dir.path(), ["context", "auth", "--json"]);
+    assert_eq!(data["tasks"][0]["status"], "open");
+    run(dir.path(), ["inbox"])
+        .assert()
+        .success()
+        .stdout("inbox empty\n");
+}
+
+#[test]
 fn task_done_stores_a_report_and_rejects_a_long_one() {
     let dir = tempfile::tempdir().expect("tempdir");
     run(dir.path(), ["init"]).assert().success();
@@ -566,6 +606,9 @@ fn task_done_stores_a_report_and_rejects_a_long_one() {
     )
     .assert()
     .success();
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success();
     run(dir.path(), ["task", "done", "auth"])
         .assert()
         .failure()
@@ -599,6 +642,9 @@ fn task_done_stores_a_report_and_rejects_a_long_one() {
     run(dir.path(), ["task", "create", "big", "--title", "Big"])
         .assert()
         .success();
+    run(dir.path(), ["task", "claim", "big", "--by", "cursor"])
+        .assert()
+        .success();
     command(dir.path())
         .args(["task", "done", "big", "--changed", &huge])
         .assert()
@@ -606,7 +652,7 @@ fn task_done_stores_a_report_and_rejects_a_long_one() {
         .code(1)
         .stderr(predicate::str::contains("limit 1500"));
     let still = json_data(dir.path(), ["context", "big", "--json"]);
-    assert_eq!(still["tasks"][0]["status"], "open");
+    assert_eq!(still["tasks"][0]["status"], "claimed");
 
     run(
         dir.path(),
@@ -638,6 +684,12 @@ fn inbox_accepts_reopens_and_stays_out_of_default_context() {
     )
     .assert()
     .success();
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success();
+    run(dir.path(), ["task", "claim", "billing", "--by", "cursor"])
+        .assert()
+        .success();
     run(
         dir.path(),
         ["task", "done", "auth", "--changed", "added reports"],
@@ -729,6 +781,9 @@ fn inbox_accepts_reopens_and_stays_out_of_default_context() {
     .failure()
     .stderr(predicate::str::contains("task is not done"));
 
+    run(dir.path(), ["task", "claim", "billing", "--by", "cursor"])
+        .assert()
+        .success();
     run(
         dir.path(),
         [
@@ -775,6 +830,9 @@ fn hook_prompt_is_one_line_or_silent() {
     )
     .assert()
     .success();
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success();
     run(
         dir.path(),
         ["task", "done", "auth", "--changed", "added the hook"],
@@ -787,6 +845,9 @@ fn hook_prompt_is_one_line_or_silent() {
     )
     .assert()
     .success();
+    run(dir.path(), ["task", "claim", "billing", "--by", "cursor"])
+        .assert()
+        .success();
     run(
         dir.path(),
         ["task", "done", "billing", "--changed", "added the inbox"],

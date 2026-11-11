@@ -24,5 +24,7 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 
 ### Fixed
 
+- `relaybook uninstall` lists each file once, says `restored` when previous bytes are put back, and says `would remove`, `would restore`, or `would keep` on `--dry-run`. Empty folders setup created are removed.
+- `relaybook task done` on an open task fails with `claim it first: relaybook task claim <slug> --by <agent>` and writes nothing.
 - Auto mode stops when Claude edits the worktree.
 - The Claude Code `/relaybook` command starts with front matter on line 1.

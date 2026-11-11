@@ -81,7 +81,7 @@ curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh
 
 ## Uninstall
 
-`relaybook uninstall` reverses what `relaybook setup` added. It prints one line per item, then asks `y/N`. `--yes` skips the question. `--dry-run` prints the list and changes nothing.
+`relaybook uninstall` reverses what `relaybook setup` added. It prints one line per item, then asks `y/N`. `--yes` skips the question. `--dry-run` prints the list and changes nothing. A file setup created is `removed`. A file that already existed is `restored`. `--dry-run` says `would remove`, `would restore`, or `would keep`. An empty folder that setup created is removed when nothing else is left in it. A folder that existed before setup stays.
 
 ```sh
 relaybook uninstall --dry-run

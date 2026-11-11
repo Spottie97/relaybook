@@ -71,12 +71,28 @@ fn setup_then_uninstall_restores_a_fresh_repo() {
         .assert()
         .success();
     assert!(dir.path().join("CLAUDE.md").is_file());
-    relaybook(dir.path())
+    let report = relaybook(dir.path())
         .args(["uninstall", "--yes"])
-        .assert()
-        .success()
-        .stdout(predicates::str::contains("kept .relaybook/"));
+        .output()
+        .expect("uninstall");
+    assert!(report.status.success());
+    let text = String::from_utf8(report.stdout).expect("utf8");
+    assert!(text.contains("kept .relaybook/"), "{text}");
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("CLAUDE.md"))
+            .count(),
+        1
+    );
+    assert!(
+        text.lines().any(|line| line == "removed CLAUDE.md"),
+        "{text}"
+    );
+    assert!(text.lines().any(|line| line == "removed .cursor"), "{text}");
+    assert!(text.lines().any(|line| line == "removed .claude"), "{text}");
     assert_eq!(files(dir.path()), before);
+    assert!(!dir.path().join(".cursor").exists());
+    assert!(!dir.path().join(".claude").exists());
     assert!(dir.path().join(".relaybook").join("ledger.db").is_file());
     relaybook(dir.path())
         .args(["uninstall", "--yes"])
@@ -108,10 +124,24 @@ fn uninstall_keeps_preexisting_project_files() {
         .args(["setup", "--no-graphify"])
         .assert()
         .success();
-    relaybook(dir.path())
+    let report = relaybook(dir.path())
         .args(["uninstall", "--yes"])
-        .assert()
-        .success();
+        .output()
+        .expect("uninstall");
+    assert!(report.status.success());
+    let text = String::from_utf8(report.stdout).expect("utf8");
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("CLAUDE.md"))
+            .count(),
+        1
+    );
+    assert!(
+        text.lines().any(|line| line == "restored CLAUDE.md"),
+        "{text}"
+    );
+    assert!(dir.path().join(".claude").is_dir());
+    assert!(!dir.path().join(".cursor").exists());
 
     assert_eq!(
         fs::read(dir.path().join("CLAUDE.md")).expect("read"),
@@ -143,7 +173,8 @@ fn dry_run_and_purge_and_an_active_run() {
         .args(["uninstall", "--dry-run"])
         .assert()
         .success()
-        .stdout(predicates::str::contains("removed CLAUDE.md"));
+        .stdout(predicates::str::contains("would remove CLAUDE.md"))
+        .stdout(predicates::str::contains("would keep .relaybook/"));
     assert!(dir.path().join("CLAUDE.md").is_file());
 
     let db = dir.path().join(".relaybook").join("ledger.db");
@@ -249,6 +280,7 @@ fn ci_round_trip_removes_the_workflow_and_merge_driver() {
             .exists()
     );
     assert!(!dir.path().join(".gitattributes").exists());
+    assert!(!dir.path().join(".github").exists());
     let name = Command::new("git")
         .arg("-C")
         .arg(dir.path())

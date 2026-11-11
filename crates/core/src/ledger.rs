@@ -183,6 +183,9 @@ impl Ledger {
             if task.status == Status::Done {
                 return Ok(task);
             }
+            if task.status == Status::Open {
+                return Err(Error::NeedsClaim(slug.clone()));
+            }
             let from = task.status.as_str();
             let ts = now(conn)?;
             conn.execute(
@@ -204,6 +207,9 @@ impl Ledger {
             let task = load_task(conn, &slug)?;
             if task.status == Status::Done {
                 return Ok(task);
+            }
+            if task.status == Status::Open {
+                return Err(Error::NeedsClaim(slug.clone()));
             }
             let body = match &sections {
                 Some(sections) => reports::task_body(sections)?,
