@@ -49,6 +49,7 @@ pub(crate) struct Report {
 
 pub(crate) fn run(cwd: &Path, options: Options) -> Result<Report, Error> {
     let root = paths::init_root(cwd);
+    let before = crate::manifest::capture(&root);
     let mut steps = Vec::new();
     record_ledger(&root, &mut steps)?;
     record_docs(&root, &mut steps)?;
@@ -62,6 +63,7 @@ pub(crate) fn run(cwd: &Path, options: Options) -> Result<Report, Error> {
     if options.ci {
         record_ci(&root, &mut steps)?;
     }
+    crate::manifest::record(&root, &before)?;
     let error = failure_message(&steps);
     Ok(Report { steps, error })
 }
@@ -229,24 +231,31 @@ fn record_ignore(root: &Path, options: &Options, steps: &mut Vec<Step>) -> Resul
 }
 
 fn insert_ignore(text: &mut String, line: &str) -> bool {
-    if text.lines().any(|item| item.trim() == line) {
+    if ignore_present(text, line) {
         return false;
     }
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
     text.push_str(line);
-    text.push('\n');
+    text.push_str(" # relaybook\n");
     true
 }
 
+fn ignore_present(text: &str, line: &str) -> bool {
+    let marked = format!("{line} # relaybook");
+    text.lines()
+        .any(|item| item.trim() == line || item.trim() == marked)
+}
+
 fn delete_ignore(text: &mut String, line: &str) -> bool {
-    if !text.lines().any(|item| item.trim() == line) {
+    if !ignore_present(text, line) {
         return false;
     }
+    let marked = format!("{line} # relaybook");
     let mut kept = String::new();
     for item in text.lines() {
-        if item.trim() == line {
+        if item.trim() == line || item.trim() == marked {
             continue;
         }
         kept.push_str(item);

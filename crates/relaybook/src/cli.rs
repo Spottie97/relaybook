@@ -11,6 +11,7 @@ use crate::picker::{self, Pick};
 use crate::render;
 use crate::runloop;
 use crate::setup;
+use crate::uninstall;
 
 pub(crate) fn execute() -> ExitCode {
     let cli = match Cli::try_parse() {
@@ -170,6 +171,21 @@ enum Command {
         /// Write the opt-in GitHub Actions workflow and graph.json merge driver.
         #[arg(long)]
         ci: bool,
+    },
+    /// Remove what `relaybook setup` added to this project.
+    Uninstall {
+        /// Apply changes without asking.
+        #[arg(long)]
+        yes: bool,
+        /// Print the changes and do not touch files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also delete `.relaybook/` and `graphify-out/`.
+        #[arg(long)]
+        purge: bool,
+        /// Also run Graphify's own project uninstall commands.
+        #[arg(long)]
+        graphify: bool,
     },
 }
 
@@ -568,6 +584,20 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                 no_claude_hook,
                 no_commands,
                 ci,
+            },
+        ),
+        Command::Uninstall {
+            yes,
+            dry_run,
+            purge,
+            graphify,
+        } => uninstall_project(
+            &cwd,
+            uninstall::Options {
+                yes,
+                dry_run,
+                purge,
+                graphify,
             },
         ),
     }
@@ -1016,6 +1046,17 @@ fn install_docs(cwd: &Path, claude: bool, cursor: bool) -> Result<Outcome, Fail>
         human,
         code: 0,
         error: None,
+    })
+}
+
+fn uninstall_project(cwd: &Path, options: uninstall::Options) -> Result<Outcome, Fail> {
+    let report = uninstall::run(cwd, options).map_err(Fail::Usage)?;
+    let human = uninstall::render(&report);
+    Ok(Outcome {
+        data: serde_json::json!({ "changes": report.changes }),
+        human,
+        code: u8::from(report.error.is_some()),
+        error: report.error,
     })
 }
 

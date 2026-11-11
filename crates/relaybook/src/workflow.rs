@@ -2,7 +2,9 @@ use std::path::Path;
 use std::process::Command;
 
 const WORKFLOW: &str = include_str!("../templates/graphify-update.yml");
+pub(crate) const TEMPLATE: &str = WORKFLOW;
 const ATTRIBUTE: &str = "graphify-out/graph.json merge=graphify";
+pub(crate) const ATTRIBUTE_LINE: &str = ATTRIBUTE;
 const CI_REQUIREMENTS: &str = "Enable Settings > Actions > General > Allow GitHub Actions to create and approve pull requests. PRs opened with GITHUB_TOKEN do not run other workflows; set secret GRAPHIFY_PR_TOKEN (contents and pull-requests write) so required checks run.";
 
 pub(crate) struct WriteResult {
@@ -54,7 +56,7 @@ pub(crate) fn install_attributes(root: &Path) -> Result<WriteResult, std::io::Er
         next.push('\n');
     }
     next.push_str(ATTRIBUTE);
-    next.push('\n');
+    next.push_str(" # relaybook\n");
     std::fs::write(&path, next)?;
     register_driver(root);
     Ok(WriteResult {
