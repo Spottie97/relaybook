@@ -51,7 +51,11 @@ code_paths() {
 export PATH="$(dirname "$relaybook"):$PATH"
 "$relaybook" setup --no-graphify >/dev/null
 
-claude -p "Plan adding a /health endpoint" --dangerously-skip-permissions
+allow="Bash(relaybook context:*),Bash(relaybook inbox:*),Bash(relaybook guide:*),Bash(relaybook status:*),Bash(relaybook task create:*),Bash(relaybook task list:*),Bash(relaybook task reopen:*),Bash(relaybook task depend:*),Bash(relaybook step add:*),Bash(relaybook step edit:*),Bash(relaybook decision log:*),Bash(relaybook report accept:*),Bash(relaybook report note:*)"
+
+claude -p "Plan adding a /health endpoint" \
+  --permission-mode default \
+  --allowedTools "$allow"
 
 python3 - "$work/.relaybook/ledger.db" <<'PY'
 import sqlite3, sys
@@ -92,7 +96,9 @@ if [ -z "$code" ]; then
 fi
 echo "execute: code changed ($code)"
 
-claude -p "Check that it has been done" --dangerously-skip-permissions
+claude -p "Check that it has been done" \
+  --permission-mode default \
+  --allowedTools "$allow"
 
 python3 - "$work/.relaybook/ledger.db" <<'PY'
 import sqlite3, sys

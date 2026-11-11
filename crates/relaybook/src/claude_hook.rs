@@ -14,6 +14,23 @@ pub(crate) const GUARDED_SESSION: &str =
 pub(crate) const BARE_SESSION: &str = "relaybook hook session";
 pub(crate) const POWERSHELL_SESSION: &str =
     "if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook session }";
+
+/// Read and planning commands. Claim, done, run, and uninstall stay prompted.
+pub(crate) const PLANNER_ALLOW: &[&str] = &[
+    "Bash(relaybook context:*)",
+    "Bash(relaybook inbox:*)",
+    "Bash(relaybook guide:*)",
+    "Bash(relaybook status:*)",
+    "Bash(relaybook task create:*)",
+    "Bash(relaybook task list:*)",
+    "Bash(relaybook task reopen:*)",
+    "Bash(relaybook task depend:*)",
+    "Bash(relaybook step add:*)",
+    "Bash(relaybook step edit:*)",
+    "Bash(relaybook decision log:*)",
+    "Bash(relaybook report accept:*)",
+    "Bash(relaybook report note:*)",
+];
 const POWERSHELL_SHELL: &str = "powershell";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,6 +137,42 @@ pub(crate) fn install(root: &Path) -> io::Result<Installed> {
         write_settings(&path, &value)?;
     }
     Ok(Installed { prompt, session })
+}
+
+pub(crate) fn install_permissions(root: &Path) -> io::Result<Status> {
+    let path = root.join(".claude").join("settings.json");
+    let mut value = read_settings(&path)?;
+    let Some(root_object) = value.as_object_mut() else {
+        return Err(invalid("settings.json must be a JSON object"));
+    };
+    let permissions = object_entry(root_object, "permissions")?;
+    let Some(permissions) = permissions.as_object_mut() else {
+        return Err(invalid("permissions must be a JSON object"));
+    };
+    if let Some(current) = permissions.get("allow")
+        && !current.is_array()
+    {
+        return Err(invalid("permissions.allow must be a JSON array"));
+    }
+    let allow = permissions
+        .entry("allow")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(allow) = allow.as_array_mut() else {
+        return Err(invalid("permissions.allow must be a JSON array"));
+    };
+    let mut changed = false;
+    for rule in PLANNER_ALLOW {
+        let present = allow.iter().any(|item| item.as_str() == Some(*rule));
+        if !present {
+            allow.push(Value::String((*rule).to_string()));
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(Status::Unchanged);
+    }
+    write_settings(&path, &value)?;
+    Ok(Status::Updated)
 }
 
 fn ensure_hook(

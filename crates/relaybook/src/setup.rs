@@ -175,6 +175,25 @@ fn record_skill(root: &Path, steps: &mut Vec<Step>) {
         ".claude/skills/relaybook/SKILL.md",
         crate::commands::install_skill(root),
     );
+    match crate::claude_hook::install_permissions(root) {
+        Ok(crate::claude_hook::Status::Updated) => {
+            push(
+                steps,
+                "claude permissions",
+                "done",
+                "allowed safe relaybook commands",
+            );
+        }
+        Ok(crate::claude_hook::Status::Unchanged) => {
+            push(
+                steps,
+                "claude permissions",
+                "skipped",
+                "safe relaybook commands already allowed",
+            );
+        }
+        Err(err) => push(steps, "claude permissions", "failed", err.to_string()),
+    }
 }
 
 fn record_prompt_hook(root: &Path, options: &Options, steps: &mut Vec<Step>) {

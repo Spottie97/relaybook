@@ -7,7 +7,7 @@ use std::process::Command;
 use serde::Serialize;
 
 use crate::claude_hook::{
-    BARE_PROMPT, BARE_SESSION, GUARDED_PROMPT, GUARDED_SESSION, POWERSHELL_PROMPT,
+    BARE_PROMPT, BARE_SESSION, GUARDED_PROMPT, GUARDED_SESSION, PLANNER_ALLOW, POWERSHELL_PROMPT,
     POWERSHELL_SESSION,
 };
 use crate::commands::MARKER;
@@ -315,6 +315,9 @@ fn plan_markers(root: &Path, has_manifest: bool) -> Vec<Change> {
         )),
         (false, false) => {}
     }
+    if settings_have_planner_allow(root) {
+        note_settings(&mut changes, "safe relaybook commands");
+    }
     if settings_have_guard(root) {
         changes.push(change(
             ".claude/settings.json",
@@ -511,6 +514,7 @@ fn clean_settings(root: &Path) -> Result<(), String> {
         "SessionStart",
         &[GUARDED_SESSION, BARE_SESSION, POWERSHELL_SESSION],
     );
+    changed |= strip_planner_allow(&mut value);
     if let Some(groups) = value
         .pointer_mut("/hooks/PreToolUse")
         .and_then(|value| value.as_array_mut())
@@ -604,6 +608,73 @@ fn dir_is_empty(path: &Path) -> bool {
     fs::read_dir(path)
         .ok()
         .is_some_and(|mut dir| dir.next().is_none())
+}
+
+fn note_settings(changes: &mut Vec<Change>, detail: &str) {
+    if let Some(existing) = changes
+        .iter_mut()
+        .find(|item| item.item == ".claude/settings.json" && item.action == "removed")
+    {
+        if !existing.detail.contains(detail) {
+            if !existing.detail.is_empty() {
+                existing.detail.push_str("; ");
+            }
+            existing.detail.push_str(detail);
+        }
+        return;
+    }
+    changes.push(change(".claude/settings.json", "removed", detail));
+}
+
+fn settings_have_planner_allow(root: &Path) -> bool {
+    fs::read_to_string(root.join(".claude").join("settings.json"))
+        .ok()
+        .is_some_and(|text| PLANNER_ALLOW.iter().any(|rule| text.contains(rule)))
+}
+
+fn strip_planner_allow(value: &mut serde_json::Value) -> bool {
+    let kept = {
+        let Some(allow) = value
+            .pointer("/permissions/allow")
+            .and_then(|item| item.as_array())
+        else {
+            return false;
+        };
+        let next: Vec<serde_json::Value> = allow
+            .iter()
+            .filter(|item| {
+                item.as_str()
+                    .is_none_or(|text| !PLANNER_ALLOW.contains(&text))
+            })
+            .cloned()
+            .collect();
+        if next.len() == allow.len() {
+            return false;
+        }
+        next
+    };
+    if kept.is_empty() {
+        let Some(root) = value.as_object_mut() else {
+            return false;
+        };
+        if let Some(permissions) = root
+            .get_mut("permissions")
+            .and_then(|item| item.as_object_mut())
+        {
+            permissions.remove("allow");
+            if permissions.is_empty() {
+                root.remove("permissions");
+            }
+        }
+        return true;
+    }
+    if let Some(allow) = value
+        .pointer_mut("/permissions/allow")
+        .and_then(|item| item.as_array_mut())
+    {
+        *allow = kept;
+    }
+    true
 }
 
 fn strip_hook_commands(value: &mut serde_json::Value, event: &str, commands: &[&str]) -> bool {

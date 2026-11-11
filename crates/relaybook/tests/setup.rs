@@ -663,6 +663,103 @@ fn setup_writes_the_skill_and_uninstall_removes_it() {
 }
 
 #[test]
+fn setup_preapproves_safe_relaybook_commands_and_uninstall_keeps_other_rules() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let allowed = [
+        "Bash(relaybook context:*)",
+        "Bash(relaybook inbox:*)",
+        "Bash(relaybook guide:*)",
+        "Bash(relaybook status:*)",
+        "Bash(relaybook task create:*)",
+        "Bash(relaybook task list:*)",
+        "Bash(relaybook task reopen:*)",
+        "Bash(relaybook task depend:*)",
+        "Bash(relaybook step add:*)",
+        "Bash(relaybook step edit:*)",
+        "Bash(relaybook decision log:*)",
+        "Bash(relaybook report accept:*)",
+        "Bash(relaybook report note:*)",
+    ];
+    let blocked = [
+        "Bash(relaybook run:*)",
+        "Bash(relaybook approve:*)",
+        "Bash(relaybook uninstall:*)",
+        "Bash(relaybook setup:*)",
+        "Bash(relaybook mode:*)",
+        "Bash(relaybook gates:*)",
+        "Bash(relaybook task done:*)",
+        "Bash(relaybook task claim:*)",
+    ];
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude permissions: done (allowed safe relaybook commands)",
+        ));
+    let skill = fs::read_to_string(
+        dir.path()
+            .join(".claude")
+            .join("skills")
+            .join("relaybook")
+            .join("SKILL.md"),
+    )
+    .expect("skill");
+    let settings: Value = serde_json::from_str(
+        &fs::read_to_string(dir.path().join(".claude").join("settings.json")).expect("settings"),
+    )
+    .expect("json");
+    let allow = settings["permissions"]["allow"].as_array().expect("allow");
+    assert_eq!(allow.len(), allowed.len(), "{settings}");
+    for rule in allowed {
+        assert!(skill.contains(rule), "{skill}");
+        assert!(
+            allow.iter().any(|item| item.as_str() == Some(rule)),
+            "{rule} missing from {settings}"
+        );
+    }
+    for rule in blocked {
+        assert!(!skill.contains(rule), "{skill}");
+        assert!(
+            !allow.iter().any(|item| item.as_str() == Some(rule)),
+            "{rule} was pre-approved"
+        );
+    }
+    let written = fs::read(dir.path().join(".claude").join("settings.json")).expect("read");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude permissions: skipped (safe relaybook commands already allowed)",
+        ));
+    assert_eq!(
+        fs::read(dir.path().join(".claude").join("settings.json")).expect("read"),
+        written
+    );
+
+    let path = dir.path().join(".claude").join("settings.json");
+    let mut value: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+    value["permissions"]["allow"]
+        .as_array_mut()
+        .expect("allow")
+        .insert(0, Value::String("Bash(git status:*)".to_string()));
+    fs::write(&path, serde_json::to_string_pretty(&value).expect("json")).expect("write");
+    relaybook(dir.path())
+        .args(["uninstall", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("safe relaybook commands"));
+    let after: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read")).expect("json");
+    let allow = after["permissions"]["allow"].as_array().expect("allow");
+    assert_eq!(
+        allow,
+        &vec![Value::String("Bash(git status:*)".to_string())]
+    );
+}
+
+#[test]
 fn session_hook_is_quiet_until_work_is_waiting() {
     let dir = tempfile::tempdir().expect("tempdir");
     setup_plain(dir.path(), &["setup", "--no-graphify"])
@@ -1111,7 +1208,11 @@ fn no_claude_hook_skips_the_prompt_hook() {
         .stdout(predicates::str::contains(
             "session hook: skipped (--no-claude-hook)",
         ));
-    assert!(!dir.path().join(".claude").join("settings.json").exists());
+    let settings =
+        fs::read_to_string(dir.path().join(".claude").join("settings.json")).expect("settings");
+    assert!(!settings.contains("UserPromptSubmit"), "{settings}");
+    assert!(!settings.contains("SessionStart"), "{settings}");
+    assert!(settings.contains("Bash(relaybook context:*)"), "{settings}");
 }
 
 fn setup(dir: &Path, bin: &Path, log: &Path, args: &[&str]) -> Command {
