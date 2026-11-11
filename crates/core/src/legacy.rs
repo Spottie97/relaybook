@@ -107,11 +107,12 @@ mod tests {
             old_dir.join("ledger.db-wal").is_file(),
             "expected a WAL sidecar, found {names:?}"
         );
+        // Windows denies renaming a directory that still contains an open file.
+        drop(connection);
 
         let moved = migrate_legacy_ledger(dir.path())
             .expect("move")
             .expect("moved");
-        drop(connection);
         assert!(!old_dir.exists());
         let reopened = Connection::open(&moved.to).expect("reopen");
         let id: i64 = reopened
