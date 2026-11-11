@@ -1,0 +1,17 @@
+name: Windows release verify
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: published Windows release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: install the published release
+        shell: pwsh
+        run: ./scripts/verify-published-windows.ps1
