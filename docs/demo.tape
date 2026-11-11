@@ -9,7 +9,10 @@ Set Padding 20
 Set TypingSpeed 18ms
 
 Hide
-Type "cd /tmp && rm -rf relaybook-demo && mkdir relaybook-demo && cd relaybook-demo && git init -q"
+Type "cd /tmp && rm -rf relaybook-demo && mkdir relaybook-demo && cd relaybook-demo && git init -q && export PS1='> '"
+Enter
+Sleep 500ms
+Type "clear"
 Enter
 Show
 
@@ -29,7 +32,7 @@ Type "relaybook task claim greet --by cursor"
 Enter
 Sleep 400ms
 
-Type 'relaybook task done greet --changed "said hello" --verified "inbox shows the report"'
+Type 'relaybook task done greet --changed "said hello" --verified "inbox"'
 Enter
 Sleep 700ms
 
