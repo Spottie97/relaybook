@@ -101,7 +101,7 @@ What it removes, and only inside Relaybook's markers or the setup manifest:
 
 - The Relaybook blocks in `CLAUDE.md` and `AGENTS.md`. A file that becomes empty is deleted. Other text stays.
 - `.claude/commands/relaybook.md` and `.cursor/commands/relaybook.md` when they still contain `relaybook:managed`. An edited command file is kept.
-- The `UserPromptSubmit` hook that runs `relaybook hook prompt`.
+- The `UserPromptSubmit` hook. It runs `relaybook hook prompt` when `relaybook` is on PATH, and stays silent when it is not. On Windows without Git Bash the hook uses PowerShell.
 - The `command -v graphify` guards wrapped around Graphify's `PreToolUse` hooks. Graphify's own hooks stay.
 - The post-merge and post-rewrite blocks between the relaybook hook markers.
 - `.gitignore` and `.gitattributes` lines marked `# relaybook`.

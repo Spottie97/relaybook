@@ -4,8 +4,12 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
-const PROMPT_COMMAND: &str = "relaybook hook prompt";
-const LEGACY_PROMPT: &str = "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true";
+pub(crate) const GUARDED_PROMPT: &str =
+    "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true";
+pub(crate) const BARE_PROMPT: &str = "relaybook hook prompt";
+pub(crate) const POWERSHELL_PROMPT: &str =
+    "if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }";
+const POWERSHELL_SHELL: &str = "powershell";
 
 pub(crate) enum Status {
     Updated,
@@ -92,22 +96,64 @@ pub(crate) fn install(root: &Path) -> io::Result<Status> {
     };
     let hooks = object_entry(root_object, "hooks")?;
     let prompt = array_entry(hooks, "UserPromptSubmit")?;
-    let replaced = replace_command(prompt, LEGACY_PROMPT, PROMPT_COMMAND);
-    if !replaced && contains_command(prompt, PROMPT_COMMAND) {
-        return Ok(Status::Unchanged);
-    }
-    if !contains_command(prompt, PROMPT_COMMAND) {
+    let write = if migrate_bare_to_guarded(prompt) {
+        true
+    } else if contains_command(prompt, GUARDED_PROMPT)
+        || contains_command(prompt, POWERSHELL_PROMPT)
+    {
+        false
+    } else {
         prompt
             .as_array_mut()
             .expect("UserPromptSubmit is an array")
-            .push(hook_group());
+            .push(hook_group(desired_prompt()));
+        true
+    };
+    if !write {
+        return Ok(Status::Unchanged);
     }
+    write_settings(&path, &value)?;
+    Ok(Status::Updated)
+}
+
+fn write_settings(path: &Path, value: &Value) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let text = serde_json::to_string_pretty(&value).map_err(|err| invalid(err.to_string()))?;
-    fs::write(&path, text + "\n")?;
-    Ok(Status::Updated)
+    let text = serde_json::to_string_pretty(value).map_err(|err| invalid(err.to_string()))?;
+    fs::write(path, text + "\n")
+}
+
+fn desired_prompt() -> &'static str {
+    if use_powershell() {
+        POWERSHELL_PROMPT
+    } else {
+        GUARDED_PROMPT
+    }
+}
+
+fn use_powershell() -> bool {
+    #[cfg(windows)]
+    {
+        !git_bash_on_path()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+fn git_bash_on_path() -> bool {
+    which::which("bash").is_ok_and(|path| !is_wsl_stub(&path))
+}
+
+#[cfg(windows)]
+fn is_wsl_stub(path: &Path) -> bool {
+    path.components().any(|component| {
+        let text = component.as_os_str().to_string_lossy();
+        text.eq_ignore_ascii_case("system32") || text.eq_ignore_ascii_case("sysnative")
+    })
 }
 
 fn read_settings(path: &Path) -> io::Result<Value> {
@@ -141,28 +187,53 @@ fn array_entry<'a>(object: &'a mut Value, key: &str) -> io::Result<&'a mut Value
     Ok(map.entry(key).or_insert_with(|| Value::Array(Vec::new())))
 }
 
-fn hook_group() -> Value {
-    serde_json::json!({
-        "hooks": [
-            {
-                "type": "command",
-                "command": PROMPT_COMMAND
-            }
-        ]
-    })
+fn hook_group(command: &str) -> Value {
+    if command == POWERSHELL_PROMPT {
+        serde_json::json!({
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command,
+                    "shell": POWERSHELL_SHELL
+                }
+            ]
+        })
+    } else {
+        serde_json::json!({
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": command
+                }
+            ]
+        })
+    }
 }
 
-fn replace_command(value: &mut Value, from: &str, to: &str) -> bool {
+fn migrate_bare_to_guarded(value: &mut Value) -> bool {
     match value {
-        Value::Array(items) => items.iter_mut().any(|item| replace_command(item, from, to)),
-        Value::Object(map) => map.iter_mut().any(|(key, child)| {
-            if key == "command" && child.as_str() == Some(from) {
-                *child = Value::String(to.to_string());
-                true
-            } else {
-                replace_command(child, from, to)
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= migrate_bare_to_guarded(item);
             }
-        }),
+            changed
+        }
+        Value::Object(map) => {
+            let migrated = map.get("command").and_then(Value::as_str) == Some(BARE_PROMPT);
+            if migrated {
+                map.insert(
+                    "command".to_string(),
+                    Value::String(GUARDED_PROMPT.to_string()),
+                );
+                map.remove("shell");
+            }
+            let mut changed = migrated;
+            for child in map.values_mut() {
+                changed |= migrate_bare_to_guarded(child);
+            }
+            changed
+        }
         Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => false,
     }
 }

@@ -444,7 +444,7 @@ fn setup_merges_the_prompt_hook_without_duplicating_it() {
         .as_array()
         .expect("prompt");
     assert_eq!(prompt.len(), 1);
-    assert_eq!(prompt[0]["hooks"][0]["command"], "relaybook hook prompt");
+    assert_default_prompt(&prompt[0]["hooks"][0]);
 
     let first = fs::read(&settings).expect("read");
     setup_plain(dir.path(), &["setup", "--no-graphify"])
@@ -454,6 +454,105 @@ fn setup_merges_the_prompt_hook_without_duplicating_it() {
             "prompt hook: done (relaybook is not on PATH; the prompt hook stays silent until it is)",
         ));
     assert_eq!(fs::read(&settings).expect("read"), first);
+}
+
+const GUARDED_PROMPT: &str =
+    "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true";
+const BARE_PROMPT: &str = "relaybook hook prompt";
+const POWERSHELL_PROMPT: &str =
+    "if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }";
+
+#[test]
+fn setup_writes_the_guarded_prompt_hook() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut cmd = setup_plain(dir.path(), &["setup", "--no-graphify"]);
+    if cfg!(windows) {
+        let bash_dir = dir.path().join("Git").join("bin");
+        fs::create_dir_all(&bash_dir).expect("mkdir");
+        fs::write(bash_dir.join("bash.exe"), "").expect("bash");
+        cmd.env("PATH", &bash_dir);
+    }
+    cmd.assert().success();
+    let hook = prompt_command(dir.path());
+    assert_eq!(hook["command"], GUARDED_PROMPT);
+    assert!(hook.get("shell").is_none(), "{hook}");
+}
+
+#[test]
+fn setup_migrates_a_bare_prompt_hook_to_the_guarded_form() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_prompt(dir.path(), BARE_PROMPT, None);
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success();
+    let hook = prompt_command(dir.path());
+    assert_eq!(hook["command"], GUARDED_PROMPT);
+    assert!(hook.get("shell").is_none(), "{hook}");
+}
+
+#[test]
+fn setup_keeps_an_existing_powershell_prompt_hook() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_prompt(dir.path(), POWERSHELL_PROMPT, Some("powershell"));
+    let before = fs::read(settings_path(dir.path())).expect("read");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(settings_path(dir.path())).expect("read"), before);
+}
+
+#[test]
+#[cfg(windows)]
+fn setup_writes_powershell_when_git_bash_is_absent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success();
+    let hook = prompt_command(dir.path());
+    assert_eq!(hook["command"], POWERSHELL_PROMPT);
+    assert_eq!(hook["shell"], "powershell");
+}
+
+fn assert_default_prompt(hook: &Value) {
+    if cfg!(windows) {
+        assert_eq!(hook["command"], POWERSHELL_PROMPT);
+        assert_eq!(hook["shell"], "powershell");
+    } else {
+        assert_eq!(hook["command"], GUARDED_PROMPT);
+        assert!(hook.get("shell").is_none(), "{hook}");
+    }
+}
+
+fn prompt_command(root: &Path) -> Value {
+    let value: Value =
+        serde_json::from_str(&fs::read_to_string(settings_path(root)).expect("read"))
+            .expect("json");
+    let prompts = value["hooks"]["UserPromptSubmit"]
+        .as_array()
+        .expect("prompt");
+    assert_eq!(prompts.len(), 1, "{value}");
+    prompts[0]["hooks"][0].clone()
+}
+
+fn settings_path(root: &Path) -> PathBuf {
+    root.join(".claude").join("settings.json")
+}
+
+fn write_prompt(root: &Path, command: &str, shell: Option<&str>) {
+    let path = settings_path(root);
+    fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let mut hook = serde_json::json!({
+        "type": "command",
+        "command": command
+    });
+    if let Some(shell) = shell {
+        hook["shell"] = Value::String(shell.to_string());
+    }
+    let body = serde_json::json!({
+        "keep": true,
+        "hooks": { "UserPromptSubmit": [{ "hooks": [hook] }] }
+    });
+    fs::write(path, serde_json::to_string_pretty(&body).expect("json")).expect("write");
 }
 
 #[test]

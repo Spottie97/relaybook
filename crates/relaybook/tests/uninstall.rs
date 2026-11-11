@@ -281,6 +281,57 @@ fn ci_round_trip_removes_the_workflow_and_merge_driver() {
     assert!(!name.status.success());
 }
 
+#[test]
+fn uninstall_removes_every_prompt_hook_form() {
+    let forms = [
+        (
+            "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true",
+            None,
+        ),
+        ("relaybook hook prompt", None),
+        (
+            "if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }",
+            Some("powershell"),
+        ),
+    ];
+    for (command, shell) in forms {
+        let dir = tempfile::tempdir().expect("tempdir");
+        git_init(dir.path());
+        let path = dir.path().join(".claude").join("settings.json");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let mut hook = serde_json::json!({
+            "type": "command",
+            "command": command
+        });
+        if let Some(shell) = shell {
+            hook["shell"] = serde_json::json!(shell);
+        }
+        let body = serde_json::json!({
+            "keep": true,
+            "hooks": {
+                "UserPromptSubmit": [{ "hooks": [hook] }],
+                "Stop": [{ "hooks": [{ "type": "command", "command": "echo stay" }] }]
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&body).expect("json")).expect("write");
+        relaybook(dir.path())
+            .args(["uninstall", "--yes"])
+            .assert()
+            .success()
+            .stdout(predicates::str::contains(
+                "removed .claude/settings.json (UserPromptSubmit hook)",
+            ));
+        let text = fs::read_to_string(&path).expect("settings");
+        assert!(!text.contains("UserPromptSubmit"), "{text}");
+        assert!(!text.contains(command), "{text}");
+        assert!(text.contains("echo stay"), "{text}");
+        assert!(
+            text.contains("\"keep\": true") || text.contains("\"keep\":true"),
+            "{text}"
+        );
+    }
+}
+
 fn copy_fake(dir: &Path, name: &str) {
     fs::create_dir_all(dir).expect("mkdir");
     let src = PathBuf::from(env!("CARGO_BIN_EXE_fake"));
