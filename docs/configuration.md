@@ -2,7 +2,7 @@
 
 ## Setup
 
-`relaybook setup` creates the ledger when it is missing, appends the planner block to `CLAUDE.md` and the executor block to `AGENTS.md`, writes `/relaybook` for Claude Code and Cursor, then runs `graphify claude install`, `graphify cursor install`, `graphify hook install`, and `graphify update .` when `graphify` is on `PATH`. The update is AST-only and does not call an LLM. Run it again whenever you want: existing instruction blocks, command files that carry the `relaybook:managed` marker, and hooks are left as they are. A command file without that marker is skipped.
+`relaybook setup` creates the ledger when it is missing, writes the planner block to `CLAUDE.md` and the executor block to `AGENTS.md`, writes `/relaybook` for Claude Code and Cursor, writes `.claude/skills/relaybook/SKILL.md`, then runs `graphify claude install`, `graphify cursor install`, `graphify hook install`, and `graphify update .` when `graphify` is on `PATH`. The update is AST-only and does not call an LLM. Run it again whenever you want. Instruction blocks between the `relaybook` markers are replaced, and setup reports `updated agent instructions`. Command files and the skill that carry the `relaybook:managed` marker are refreshed. A file without that marker is skipped. Hooks that are already installed stay as they are.
 
 ```sh
 relaybook setup
@@ -15,7 +15,7 @@ relaybook setup --ci
 
 - `relaybook setup --no-graphify` skips every Graphify command and the pull hooks.
 - `relaybook setup --no-hooks` skips `graphify hook install` and the post-merge / post-rewrite hooks.
-- `relaybook setup --no-claude-hook` skips the project `UserPromptSubmit` hook that tells Claude to run `relaybook inbox`. The other Graphify commands still run.
+- `relaybook setup --no-claude-hook` skips the project `UserPromptSubmit` hook and the `SessionStart` hook. The other Graphify commands still run.
 - `relaybook setup --no-commands` skips `.claude/commands/relaybook.md` and `.cursor/commands/relaybook.md`.
 - `relaybook setup --ci` writes `.github/workflows/graphify-update.yml` and adds `graphify-out/graph.json merge=graphify` to `.gitattributes`. An existing workflow file is left untouched. The workflow opens a pull request instead of pushing to `main`. `graphify-out/` stays tracked.
 
@@ -79,7 +79,7 @@ curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh
 
 `--yes` also runs `rtk init -g` without the y/N prompt. Without a terminal and without `--yes`, the installer prints `rtk init -g` instead of editing `~/.claude/settings.json`. `relaybook setup` never installs RTK and never edits that global file. The pull hooks run `graphify update .` in the background and print nothing. Graphify's editor hook does not rewrite `relaybook` commands.
 
-`scripts/measure-context.sh --check` fails when fixture context exceeds 4000 bytes, a write acknowledgement exceeds 120 bytes, or an instruction block exceeds 600 bytes. Role prompts stay under 1200 bytes. Slash commands stay under 1500 bytes.
+`scripts/measure-context.sh --check` fails when fixture context exceeds 4000 bytes, a write acknowledgement exceeds 120 bytes, or an instruction block exceeds 1000 bytes. Role prompts stay under 1200 bytes. Slash commands stay under 1500 bytes. `relaybook guide` stays under 4000 bytes per role.
 
 ## Uninstall
 
@@ -104,6 +104,8 @@ What it removes, and only inside Relaybook's markers or the setup manifest:
 - The Relaybook blocks in `CLAUDE.md` and `AGENTS.md`. A file that becomes empty is deleted. Other text stays.
 - `.claude/commands/relaybook.md` and `.cursor/commands/relaybook.md` when they still contain `relaybook:managed`. An edited command file is kept.
 - The `UserPromptSubmit` hook. Setup writes `command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true`, so the hook stays silent when `relaybook` is not on PATH. On Windows, when Git Bash `bash.exe` is not on PATH (the `System32` WSL stub does not count), setup writes `if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }` with `"shell": "powershell"`. A bare `relaybook hook prompt` is rewritten to the guarded POSIX command. Uninstall removes the guarded command, the bare command, and the PowerShell command.
+- The `SessionStart` hook. It uses the same guarded POSIX command and PowerShell command, with `relaybook hook session`. It prints one line when ready tasks or unreviewed reports are waiting, and nothing otherwise. Uninstall removes all three forms.
+- `.claude/skills/relaybook/SKILL.md` when it still contains `relaybook:managed`. The skill tells Claude to run `relaybook guide planner` and `relaybook context`. An edited skill without that marker is kept.
 - The `command -v graphify` guards wrapped around Graphify's `PreToolUse` hooks. Graphify's own hooks stay.
 - The post-merge and post-rewrite blocks between the relaybook hook markers.
 - The `# relaybook:start` / `# relaybook:end` block in `.gitignore` and `.gitattributes`, including an older `pattern # relaybook` line and a lone `# relaybook` line directly above a pattern Relaybook owns. Other lines stay.

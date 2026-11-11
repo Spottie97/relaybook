@@ -12,7 +12,7 @@ scripts/measure-context.sh --check
 shellcheck install.sh
 ```
 
-`scripts/measure-context.sh --check` fails when an instruction block, role prompt, or slash command is over its byte budget. Run it whenever you change those templates.
+`scripts/measure-context.sh --check` fails when an instruction block, role prompt, or slash command is over its byte budget. Planner and executor blocks stay under 1,000 bytes. Run it whenever you change those templates.
 
 CI runs fmt, clippy, and tests on Ubuntu, macOS, and Windows. The Windows test job is a required check.
 

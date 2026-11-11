@@ -9,8 +9,14 @@ pub(crate) const GUARDED_PROMPT: &str =
 pub(crate) const BARE_PROMPT: &str = "relaybook hook prompt";
 pub(crate) const POWERSHELL_PROMPT: &str =
     "if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }";
+pub(crate) const GUARDED_SESSION: &str =
+    "command -v relaybook >/dev/null 2>&1 && relaybook hook session || true";
+pub(crate) const BARE_SESSION: &str = "relaybook hook session";
+pub(crate) const POWERSHELL_SESSION: &str =
+    "if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook session }";
 const POWERSHELL_SHELL: &str = "powershell";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Status {
     Updated,
     Unchanged,
@@ -88,31 +94,57 @@ fn guard_command(command: &str) -> Option<String> {
     ))
 }
 
-pub(crate) fn install(root: &Path) -> io::Result<Status> {
+pub(crate) struct Installed {
+    pub prompt: Status,
+    pub session: Status,
+}
+
+pub(crate) fn install(root: &Path) -> io::Result<Installed> {
     let path = root.join(".claude").join("settings.json");
     let mut value = read_settings(&path)?;
+    let prompt = ensure_hook(
+        &mut value,
+        "UserPromptSubmit",
+        BARE_PROMPT,
+        GUARDED_PROMPT,
+        POWERSHELL_PROMPT,
+    )?;
+    let session = ensure_hook(
+        &mut value,
+        "SessionStart",
+        BARE_SESSION,
+        GUARDED_SESSION,
+        POWERSHELL_SESSION,
+    )?;
+    if prompt == Status::Updated || session == Status::Updated {
+        write_settings(&path, &value)?;
+    }
+    Ok(Installed { prompt, session })
+}
+
+fn ensure_hook(
+    value: &mut Value,
+    event: &str,
+    bare: &'static str,
+    guarded: &'static str,
+    powershell: &'static str,
+) -> io::Result<Status> {
     let Some(root_object) = value.as_object_mut() else {
         return Err(invalid("settings.json must be a JSON object"));
     };
     let hooks = object_entry(root_object, "hooks")?;
-    let prompt = array_entry(hooks, "UserPromptSubmit")?;
-    let write = if migrate_bare_to_guarded(prompt) {
-        true
-    } else if contains_command(prompt, GUARDED_PROMPT)
-        || contains_command(prompt, POWERSHELL_PROMPT)
-    {
-        false
-    } else {
-        prompt
-            .as_array_mut()
-            .expect("UserPromptSubmit is an array")
-            .push(hook_group(desired_prompt()));
-        true
-    };
-    if !write {
-        return Ok(Status::Unchanged);
+    let list = array_entry(hooks, event)?;
+    let migrated = migrate_bare(list, bare, guarded);
+    if contains_command(list, guarded) || contains_command(list, powershell) {
+        return Ok(if migrated {
+            Status::Updated
+        } else {
+            Status::Unchanged
+        });
     }
-    write_settings(&path, &value)?;
+    list.as_array_mut()
+        .expect("hook event is an array")
+        .push(hook_group(desired_command(guarded, powershell)));
     Ok(Status::Updated)
 }
 
@@ -124,11 +156,11 @@ fn write_settings(path: &Path, value: &Value) -> io::Result<()> {
     fs::write(path, text + "\n")
 }
 
-fn desired_prompt() -> &'static str {
+fn desired_command(guarded: &'static str, powershell: &'static str) -> &'static str {
     if use_powershell() {
-        POWERSHELL_PROMPT
+        powershell
     } else {
-        GUARDED_PROMPT
+        guarded
     }
 }
 
@@ -188,7 +220,7 @@ fn array_entry<'a>(object: &'a mut Value, key: &str) -> io::Result<&'a mut Value
 }
 
 fn hook_group(command: &str) -> Value {
-    if command == POWERSHELL_PROMPT {
+    if command == POWERSHELL_PROMPT || command == POWERSHELL_SESSION {
         serde_json::json!({
             "hooks": [
                 {
@@ -210,27 +242,24 @@ fn hook_group(command: &str) -> Value {
     }
 }
 
-fn migrate_bare_to_guarded(value: &mut Value) -> bool {
+fn migrate_bare(value: &mut Value, bare: &str, guarded: &str) -> bool {
     match value {
         Value::Array(items) => {
             let mut changed = false;
             for item in items {
-                changed |= migrate_bare_to_guarded(item);
+                changed |= migrate_bare(item, bare, guarded);
             }
             changed
         }
         Value::Object(map) => {
-            let migrated = map.get("command").and_then(Value::as_str) == Some(BARE_PROMPT);
+            let migrated = map.get("command").and_then(Value::as_str) == Some(bare);
             if migrated {
-                map.insert(
-                    "command".to_string(),
-                    Value::String(GUARDED_PROMPT.to_string()),
-                );
+                map.insert("command".to_string(), Value::String(guarded.to_string()));
                 map.remove("shell");
             }
             let mut changed = migrated;
             for child in map.values_mut() {
-                changed |= migrate_bare_to_guarded(child);
+                changed |= migrate_bare(child, bare, guarded);
             }
             changed
         }

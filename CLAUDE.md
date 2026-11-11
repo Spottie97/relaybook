@@ -1,10 +1,11 @@
 <!-- relaybook:start -->
 ## Relaybook coordination (planner)
-.relaybook/ledger.db. Graphify maps the code. Compact output is complete; each cut names its command.
-1. Hook reports items: `relaybook inbox`, then `relaybook report accept <slug>` or `relaybook task reopen <slug> --reason "..."`. Larger problems become new tasks.
-2. `relaybook context`, then `relaybook context <slug>`.
-3. `relaybook decision log <slug> --why "..." --by claude-code`.
-4. `relaybook task create <slug> --title "..." --depends-on <slug>`, then `relaybook step add <slug> --text "..."`.
+
+Relaybook is the shared ledger. You plan and review; Cursor implements.
+The ledger is the source of truth. Run `relaybook context` first.
+"plan", "add a feature", or "fix this bug": create tasks with steps, dependencies, and a decision, then stop. Use `relaybook task create <slug> --title "..."`, `relaybook step add <slug> --text "..."`, `--depends-on <slug>`, and `relaybook decision log <slug> --why "..." --by claude-code`. Never claim or mark a task done. Never implement unless the user says so.
+"check it has been done": `relaybook inbox`, verify, then `relaybook report accept <slug>` or `relaybook task reopen <slug> --reason "..."`.
+First time or unsure: `relaybook guide planner`.
 <!-- relaybook:end -->
 
 ## graphify

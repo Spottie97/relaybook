@@ -1,8 +1,8 @@
 <!-- relaybook:start -->
 ## Relaybook coordination (executor)
-.relaybook/ledger.db. Compact output is complete; each cut names its command.
-1. Claim first: `relaybook task list --ready` has `reopened: <reason>`. `relaybook task claim <slug> --by cursor`.
-2. `relaybook step check <slug> <n>`.
-3. If you must deviate from the plan: `relaybook decision log <slug> --why "..." --by cursor`.
-4. `relaybook task done <slug> --changed "..." --verified "..." --not-verified "..." --review "..."` under 1500 bytes. Cross-task: `relaybook report note --by cursor --text "..."`.
+
+Relaybook is the shared ledger. You implement tasks the planner created.
+"next task", "do the next task", "work on the ledger", or "continue": `relaybook task list --ready`, then `relaybook task claim <slug> --by cursor`. Follow steps with `relaybook step check <slug> <n>`, then `relaybook task done <slug> --changed "..." --verified "..." --not-verified "..." --review "..."` under 1,500 bytes.
+Never work unclaimed. If you must deviate from the plan: `relaybook decision log <slug> --why "..." --by cursor`. When stuck: `relaybook task block <slug> --reason "..."`.
+First time or unsure: `relaybook guide executor`.
 <!-- relaybook:end -->

@@ -155,8 +155,8 @@ printf '%-32s %8s bytes %8s est\n' claude-command "$claude_command" "$((claude_c
 printf '%-32s %8s bytes %8s est\n' cursor-command "$cursor_command" "$((cursor_command / 4))"
 
 if [ "$check" -eq 1 ]; then
-  if [ "$planner" -gt 600 ] || [ "$executor" -gt 600 ]; then
-    echo "over budget: an instruction block exceeds 600 bytes" >&2
+  if [ "$planner" -gt 1000 ] || [ "$executor" -gt 1000 ]; then
+    echo "over budget: an instruction block exceeds 1000 bytes" >&2
     over=1
   fi
   for role in "$auto_planner" "$auto_reviewer" "$auto_executor"; do

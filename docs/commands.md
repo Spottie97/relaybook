@@ -7,6 +7,17 @@ Plain text is the default. `relaybook status --json` prints one JSON envelope on
 {"ok": false, "data": null, "error": "already claimed"}
 ```
 
+## Guide
+
+```sh
+relaybook guide
+relaybook guide planner
+relaybook guide executor
+relaybook hook session
+```
+
+`relaybook guide` prints the planner and executor workflows, including one worked example each. Pass `planner` or `executor` to print one role. Each role stays under 4,000 bytes. `relaybook hook session` prints one line when a ready task or an unreviewed report is waiting, and prints nothing otherwise.
+
 ## Daily workflow
 
 ```sh

@@ -6,7 +6,10 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::claude_hook::{BARE_PROMPT, GUARDED_PROMPT, POWERSHELL_PROMPT};
+use crate::claude_hook::{
+    BARE_PROMPT, BARE_SESSION, GUARDED_PROMPT, GUARDED_SESSION, POWERSHELL_PROMPT,
+    POWERSHELL_SESSION,
+};
 use crate::commands::MARKER;
 use crate::manifest::{self, Entry};
 use crate::paths;
@@ -284,6 +287,7 @@ fn plan_markers(root: &Path, has_manifest: bool) -> Vec<Change> {
     for file in [
         ".claude/commands/relaybook.md",
         ".cursor/commands/relaybook.md",
+        ".claude/skills/relaybook/SKILL.md",
     ] {
         match fs::read_to_string(root.join(file)) {
             Ok(text) if text.contains(MARKER) => {
@@ -293,12 +297,23 @@ fn plan_markers(root: &Path, has_manifest: bool) -> Vec<Change> {
             Err(_) => {}
         }
     }
-    if settings_have_prompt(root) {
-        changes.push(change(
+    match (settings_have_prompt(root), settings_have_session(root)) {
+        (true, true) => changes.push(change(
+            ".claude/settings.json",
+            "removed",
+            "UserPromptSubmit hook and SessionStart hook",
+        )),
+        (true, false) => changes.push(change(
             ".claude/settings.json",
             "removed",
             "UserPromptSubmit hook",
-        ));
+        )),
+        (false, true) => changes.push(change(
+            ".claude/settings.json",
+            "removed",
+            "SessionStart hook",
+        )),
+        (false, false) => {}
     }
     if settings_have_guard(root) {
         changes.push(change(
@@ -422,6 +437,7 @@ fn clean_markers(root: &Path, has_manifest: bool) -> Result<(), String> {
     for file in [
         ".claude/commands/relaybook.md",
         ".cursor/commands/relaybook.md",
+        ".claude/skills/relaybook/SKILL.md",
     ] {
         let path = root.join(file);
         if fs::read_to_string(&path)
@@ -429,6 +445,7 @@ fn clean_markers(root: &Path, has_manifest: bool) -> Result<(), String> {
             .is_some_and(|text| text.contains(MARKER))
         {
             remove_file(&path)?;
+            remove_empty_parents(&path, root)?;
         }
     }
     clean_settings(root)?;
@@ -484,18 +501,16 @@ fn clean_settings(root: &Path) -> Result<(), String> {
     let mut value: serde_json::Value =
         serde_json::from_str(&text).map_err(|err| err.to_string())?;
     let mut changed = false;
-    if let Some(groups) = value
-        .pointer_mut("/hooks/UserPromptSubmit")
-        .and_then(|value| value.as_array_mut())
-    {
-        let before = groups.len();
-        groups.retain(|group| {
-            !group_has_command(group, GUARDED_PROMPT)
-                && !group_has_command(group, BARE_PROMPT)
-                && !group_has_command(group, POWERSHELL_PROMPT)
-        });
-        changed |= groups.len() != before;
-    }
+    changed |= strip_hook_commands(
+        &mut value,
+        "UserPromptSubmit",
+        &[GUARDED_PROMPT, BARE_PROMPT, POWERSHELL_PROMPT],
+    );
+    changed |= strip_hook_commands(
+        &mut value,
+        "SessionStart",
+        &[GUARDED_SESSION, BARE_SESSION, POWERSHELL_SESSION],
+    );
     if let Some(groups) = value
         .pointer_mut("/hooks/PreToolUse")
         .and_then(|value| value.as_array_mut())
@@ -589,6 +604,44 @@ fn dir_is_empty(path: &Path) -> bool {
     fs::read_dir(path)
         .ok()
         .is_some_and(|mut dir| dir.next().is_none())
+}
+
+fn strip_hook_commands(value: &mut serde_json::Value, event: &str, commands: &[&str]) -> bool {
+    let Some(groups) = value
+        .pointer_mut(&format!("/hooks/{event}"))
+        .and_then(|value| value.as_array_mut())
+    else {
+        return false;
+    };
+    let before = groups.len();
+    groups.retain(|group| {
+        !commands
+            .iter()
+            .any(|command| group_has_command(group, command))
+    });
+    groups.len() != before
+}
+
+fn remove_empty_parents(path: &Path, root: &Path) -> Result<(), String> {
+    let mut dir = path.parent();
+    while let Some(current) = dir {
+        if current == root || !dir_is_empty(current) {
+            break;
+        }
+        fs::remove_dir(current).map_err(|err| err.to_string())?;
+        dir = current.parent();
+    }
+    Ok(())
+}
+
+fn settings_have_session(root: &Path) -> bool {
+    fs::read_to_string(root.join(".claude").join("settings.json"))
+        .ok()
+        .is_some_and(|text| {
+            text.contains(GUARDED_SESSION)
+                || text.contains(BARE_SESSION)
+                || text.contains(POWERSHELL_SESSION)
+        })
 }
 
 fn settings_have_prompt(root: &Path) -> bool {

@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use relaybook_core::{Error, Ledger, RECENT_EVENT_LIMIT, Status};
 
 use crate::gitinfo;
+use crate::guide;
 use crate::install;
 use crate::paths;
 use crate::picker::{self, Pick};
@@ -19,8 +20,11 @@ pub(crate) fn execute() -> ExitCode {
         Err(err) => err.exit(),
     };
     let json = cli.json;
-    if matches!(&cli.command, Command::Hook(HookCmd::Prompt)) {
-        hook_prompt();
+    if let Command::Hook(hook) = &cli.command {
+        match hook {
+            HookCmd::Prompt => hook_prompt(),
+            HookCmd::Session => hook_session(),
+        }
         return ExitCode::SUCCESS;
     }
     if let Err(err) = announce_legacy_move() {
@@ -116,6 +120,11 @@ enum Command {
     },
     /// Print mode, limits, and the active run.
     Status,
+    /// Print the planner or executor workflow.
+    Guide {
+        /// `planner` or `executor`. Omit this to print both.
+        role: Option<GuideRole>,
+    },
     /// Run the auto-mode loop, or stop and complete it.
     Run {
         /// PRD file to implement. Same as the positional path.
@@ -310,6 +319,16 @@ enum ConfigAction {
 enum HookCmd {
     /// Print one line when unreviewed reports are waiting. Always exits 0.
     Prompt,
+    /// Print one line when ready tasks or unreviewed reports are waiting. Always exits 0.
+    Session,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum GuideRole {
+    /// The planning and review workflow.
+    Planner,
+    /// The implementation workflow.
+    Executor,
 }
 
 #[derive(Subcommand)]
@@ -611,7 +630,19 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                 gates: None,
             },
         ),
-        Command::Hook(HookCmd::Prompt) => Ok(Outcome {
+        Command::Guide { role } => {
+            let text = guide::render(role.map(|role| match role {
+                GuideRole::Planner => guide::Role::Planner,
+                GuideRole::Executor => guide::Role::Executor,
+            }));
+            Ok(Outcome {
+                human: text,
+                data: serde_json::json!({}),
+                error: None,
+                code: 0,
+            })
+        }
+        Command::Hook(HookCmd::Prompt | HookCmd::Session) => Ok(Outcome {
             human: String::new(),
             data: serde_json::json!({}),
             error: None,
@@ -825,6 +856,47 @@ fn accept_report(
         serde_json::json!({ "slug": slug, "verdict": "accepted" }),
         render::line(&format!("accepted {slug}")),
     )
+}
+
+fn hook_session() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Some(path) = paths::ledger_path(&cwd) else {
+        return;
+    };
+    let Ok(ledger) = Ledger::open_readonly(&path) else {
+        return;
+    };
+    let Ok(tasks) = ledger.list_tasks(None, true, false) else {
+        return;
+    };
+    let Ok(reports) = ledger.unreviewed_count() else {
+        return;
+    };
+    let mut parts = Vec::new();
+    if !tasks.is_empty() {
+        parts.push(count_phrase(tasks.len(), "ready task", "ready tasks"));
+    }
+    if reports > 0 {
+        parts.push(count_phrase(
+            reports,
+            "unreviewed report",
+            "unreviewed reports",
+        ));
+    }
+    if parts.is_empty() {
+        return;
+    }
+    println!("Relaybook: {}. Run relaybook context.", parts.join(", "));
+}
+
+fn count_phrase(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
 }
 
 fn hook_prompt() {

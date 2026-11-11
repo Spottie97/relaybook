@@ -39,6 +39,7 @@ Agents step on the same task, re-explain state every session, and pay context co
 - Auto mode: Claude plans and reviews, Cursor implements, one task at a time
 - `/relaybook` in Claude Code and Cursor
 - Compact `relaybook context` by default, with the full history one flag away
+- Setup teaches each agent its role: Claude plans and reviews, Cursor implements, and `relaybook guide` holds the full workflow
 
 ## Quick start
 
@@ -140,7 +141,7 @@ relaybook run docs/prd.md
 
 On this ledger, `relaybook context --all` is 102,072 bytes (about 25,518 tokens) and the default `relaybook context` is 6,386 bytes (about 1,597 tokens), about 94% less. Those counts are bytes/4 estimates. Done tasks stay behind `relaybook context --all`. On a 40-done fixture, context fell from 4,567 bytes (about 1,141 tokens) to 1,482 bytes (about 370 tokens).
 
-Graphify answers where the code lives. RTK compacts command output. Relaybook compacts the work ledger. The always-loaded planner and executor blocks are 540 and 544 bytes. `scripts/measure-context.sh --check` guards those budgets.
+Graphify answers where the code lives. RTK compacts command output. Relaybook compacts the work ledger. The always-loaded planner and executor blocks are 730 and 657 bytes. `scripts/measure-context.sh --check` guards those budgets. After `relaybook setup`, Claude Code and Cursor already know when to plan, claim, and review. `relaybook guide` prints the worked examples.
 
 ## FAQ
 

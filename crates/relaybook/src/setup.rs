@@ -54,6 +54,7 @@ pub(crate) fn run(cwd: &Path, options: Options) -> Result<Report, Error> {
     record_ledger(&root, &mut steps)?;
     record_docs(&root, &mut steps)?;
     record_commands(&root, &options, &mut steps);
+    record_skill(&root, &mut steps);
     record_prompt_hook(&root, &options, &mut steps);
     record_graphify(&root, &options, &mut steps);
     record_graphify_guards(&root, &mut steps);
@@ -74,6 +75,9 @@ pub(crate) fn render(report: &Report) -> String {
     for step in &report.steps {
         let _ = writeln!(out, "{}: {} ({})", step.name, step.status, step.detail);
     }
+    let _ = writeln!(out, "In Claude Code: Plan <feature> in the ledger");
+    let _ = writeln!(out, "In Cursor: Do the next relaybook task");
+    let _ = writeln!(out, "In Claude Code: Check that it has been done");
     out
 }
 
@@ -90,6 +94,8 @@ fn record_ledger(root: &Path, steps: &mut Vec<Step>) -> Result<(), Error> {
 }
 
 fn record_docs(root: &Path, steps: &mut Vec<Step>) -> Result<(), Error> {
+    let replacing = has_instruction_markers(&root.join("CLAUDE.md"))
+        || has_instruction_markers(&root.join("AGENTS.md"));
     let outcome = install::apply(root, true, true)?;
     let claude = outcome
         .claude
@@ -104,13 +110,19 @@ fn record_docs(root: &Path, steps: &mut Vec<Step>) -> Result<(), Error> {
     } else {
         "skipped"
     };
-    push(
-        steps,
-        "install",
-        status,
-        format!("{claude} CLAUDE.md, {cursor} AGENTS.md"),
-    );
+    let detail = if replacing && status == "done" {
+        "updated agent instructions".to_string()
+    } else {
+        format!("{claude} CLAUDE.md, {cursor} AGENTS.md")
+    };
+    push(steps, "install", status, detail);
     Ok(())
+}
+
+fn has_instruction_markers(path: &Path) -> bool {
+    std::fs::read_to_string(path).ok().is_some_and(|text| {
+        text.contains("<!-- relaybook:start -->") && text.contains("<!-- relaybook:end -->")
+    })
 }
 
 fn record_commands(root: &Path, options: &Options, steps: &mut Vec<Step>) {
@@ -156,32 +168,62 @@ fn record_one_command(
     }
 }
 
+fn record_skill(root: &Path, steps: &mut Vec<Step>) {
+    record_one_command(
+        steps,
+        "claude skill",
+        ".claude/skills/relaybook/SKILL.md",
+        crate::commands::install_skill(root),
+    );
+}
+
 fn record_prompt_hook(root: &Path, options: &Options, steps: &mut Vec<Step>) {
     if options.no_claude_hook {
         push(steps, "prompt hook", "skipped", "--no-claude-hook");
+        push(steps, "session hook", "skipped", "--no-claude-hook");
         return;
     }
     match crate::claude_hook::install(root) {
-        Ok(_) if !command_on_path("relaybook") => {
-            push(
+        Ok(installed) => {
+            record_hook_status(
                 steps,
                 "prompt hook",
-                "done",
+                installed.prompt,
+                "added UserPromptSubmit",
+                "UserPromptSubmit already installed",
                 "relaybook is not on PATH; the prompt hook stays silent until it is",
             );
-        }
-        Ok(crate::claude_hook::Status::Updated) => {
-            push(steps, "prompt hook", "done", "added UserPromptSubmit");
-        }
-        Ok(crate::claude_hook::Status::Unchanged) => {
-            push(
+            record_hook_status(
                 steps,
-                "prompt hook",
-                "skipped",
-                "UserPromptSubmit already installed",
+                "session hook",
+                installed.session,
+                "added SessionStart",
+                "SessionStart already installed",
+                "relaybook is not on PATH; the session hook stays silent until it is",
             );
         }
-        Err(err) => push(steps, "prompt hook", "failed", err.to_string()),
+        Err(err) => {
+            push(steps, "prompt hook", "failed", err.to_string());
+            push(steps, "session hook", "failed", err.to_string());
+        }
+    }
+}
+
+fn record_hook_status(
+    steps: &mut Vec<Step>,
+    name: &str,
+    status: crate::claude_hook::Status,
+    added: &str,
+    present: &str,
+    silent: &str,
+) {
+    if !command_on_path("relaybook") {
+        push(steps, name, "done", silent);
+        return;
+    }
+    match status {
+        crate::claude_hook::Status::Updated => push(steps, name, "done", added),
+        crate::claude_hook::Status::Unchanged => push(steps, name, "skipped", present),
     }
 }
 

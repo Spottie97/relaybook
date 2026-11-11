@@ -240,6 +240,32 @@ mod tests {
     }
 
     #[test]
+    fn instruction_blocks_name_the_role_and_stay_within_budget() {
+        let planner = include_str!("../templates/claude.md");
+        let executor = include_str!("../templates/agents.md");
+        assert!(planner.len() <= 1000, "{}", planner.len());
+        assert!(executor.len() <= 1000, "{}", executor.len());
+        assert!(planner.contains("You plan and review"));
+        assert!(planner.contains("add a feature"));
+        assert!(planner.contains("fix this bug"));
+        assert!(planner.contains("check it has been done"));
+        assert!(planner.contains("source of truth"));
+        assert!(planner.contains("relaybook context"));
+        assert!(planner.contains("Never claim or mark a task done"));
+        assert!(planner.contains("relaybook guide planner"));
+        assert!(executor.contains("You implement"));
+        assert!(executor.contains("next task"));
+        assert!(executor.contains("do the next task"));
+        assert!(executor.contains("work on the ledger"));
+        assert!(executor.contains("continue"));
+        assert!(executor.contains("task list --ready"));
+        assert!(executor.contains("Never work unclaimed"));
+        assert!(executor.contains("If you must deviate from the plan"));
+        assert!(executor.contains("task block"));
+        assert!(executor.contains("relaybook guide executor"));
+    }
+
+    #[test]
     fn existing_heading_is_left_unchanged() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("AGENTS.md");

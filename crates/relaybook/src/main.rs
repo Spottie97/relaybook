@@ -9,6 +9,7 @@ mod commands;
 mod exe;
 mod gitinfo;
 mod graphify;
+mod guide;
 mod hooks;
 mod install;
 mod live;

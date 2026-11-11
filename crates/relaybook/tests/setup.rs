@@ -461,6 +461,10 @@ const GUARDED_PROMPT: &str =
 const BARE_PROMPT: &str = "relaybook hook prompt";
 const POWERSHELL_PROMPT: &str =
     "if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }";
+const GUARDED_SESSION: &str =
+    "command -v relaybook >/dev/null 2>&1 && relaybook hook session || true";
+const POWERSHELL_SESSION: &str =
+    "if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook session }";
 
 #[test]
 fn setup_writes_the_guarded_prompt_hook() {
@@ -494,11 +498,18 @@ fn setup_migrates_a_bare_prompt_hook_to_the_guarded_form() {
 fn setup_keeps_an_existing_powershell_prompt_hook() {
     let dir = tempfile::tempdir().expect("tempdir");
     write_prompt(dir.path(), POWERSHELL_PROMPT, Some("powershell"));
-    let before = fs::read(settings_path(dir.path())).expect("read");
     setup_plain(dir.path(), &["setup", "--no-graphify"])
         .assert()
         .success();
-    assert_eq!(fs::read(settings_path(dir.path())).expect("read"), before);
+    let prompt = prompt_command(dir.path());
+    assert_eq!(prompt["command"], POWERSHELL_PROMPT);
+    assert_eq!(prompt["shell"], "powershell");
+    assert_default_session(&session_command(dir.path()));
+    let written = fs::read(settings_path(dir.path())).expect("read");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success();
+    assert_eq!(fs::read(settings_path(dir.path())).expect("read"), written);
 }
 
 #[test]
@@ -513,6 +524,16 @@ fn setup_writes_powershell_when_git_bash_is_absent() {
     assert_eq!(hook["shell"], "powershell");
 }
 
+fn assert_default_session(hook: &Value) {
+    if cfg!(windows) {
+        assert_eq!(hook["command"], POWERSHELL_SESSION);
+        assert_eq!(hook["shell"], "powershell");
+    } else {
+        assert_eq!(hook["command"], GUARDED_SESSION);
+        assert!(hook.get("shell").is_none(), "{hook}");
+    }
+}
+
 fn assert_default_prompt(hook: &Value) {
     if cfg!(windows) {
         assert_eq!(hook["command"], POWERSHELL_PROMPT);
@@ -521,6 +542,15 @@ fn assert_default_prompt(hook: &Value) {
         assert_eq!(hook["command"], GUARDED_PROMPT);
         assert!(hook.get("shell").is_none(), "{hook}");
     }
+}
+
+fn session_command(root: &Path) -> Value {
+    let value: Value =
+        serde_json::from_str(&fs::read_to_string(settings_path(root)).expect("read"))
+            .expect("json");
+    let sessions = value["hooks"]["SessionStart"].as_array().expect("session");
+    assert_eq!(sessions.len(), 1, "{value}");
+    sessions[0]["hooks"][0].clone()
 }
 
 fn prompt_command(root: &Path) -> Value {
@@ -553,6 +583,172 @@ fn write_prompt(root: &Path, command: &str, shell: Option<&str>) {
         "hooks": { "UserPromptSubmit": [{ "hooks": [hook] }] }
     });
     fs::write(path, serde_json::to_string_pretty(&body).expect("json")).expect("write");
+}
+
+#[test]
+fn setup_replaces_old_instruction_blocks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        dir.path().join("CLAUDE.md"),
+        "<!-- relaybook:start -->\n## Relaybook coordination (planner)\nold planner\n<!-- relaybook:end -->\n",
+    )
+    .expect("write");
+    fs::write(
+        dir.path().join("AGENTS.md"),
+        "<!-- relaybook:start -->\n## Relaybook coordination (executor)\nold executor\n<!-- relaybook:end -->\n",
+    )
+    .expect("write");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "install: done (updated agent instructions)",
+        ))
+        .stdout(predicates::str::contains(
+            "In Claude Code: Plan <feature> in the ledger",
+        ))
+        .stdout(predicates::str::contains(
+            "In Cursor: Do the next relaybook task",
+        ))
+        .stdout(predicates::str::contains(
+            "In Claude Code: Check that it has been done",
+        ));
+    let claude = fs::read_to_string(dir.path().join("CLAUDE.md")).expect("claude");
+    let agents = fs::read_to_string(dir.path().join("AGENTS.md")).expect("agents");
+    assert!(claude.contains("relaybook guide planner"), "{claude}");
+    assert!(claude.contains("source of truth"), "{claude}");
+    assert!(!claude.contains("old planner"), "{claude}");
+    assert!(agents.contains("relaybook guide executor"), "{agents}");
+    assert!(agents.contains("Never work unclaimed"), "{agents}");
+    assert!(!agents.contains("old executor"), "{agents}");
+}
+
+#[test]
+fn setup_writes_the_skill_and_uninstall_removes_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let path = dir
+        .path()
+        .join(".claude")
+        .join("skills")
+        .join("relaybook")
+        .join("SKILL.md");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude skill: done (wrote .claude/skills/relaybook/SKILL.md)",
+        ));
+    let body = fs::read_to_string(&path).expect("skill");
+    assert!(body.starts_with("---\n"), "{body}");
+    assert!(body.contains("name: relaybook"), "{body}");
+    assert!(body.contains("has been done"), "{body}");
+    assert!(body.contains("ledger"), "{body}");
+    assert!(body.contains("relaybook guide planner"), "{body}");
+    assert!(body.contains("relaybook context"), "{body}");
+    assert!(body.contains("relaybook:managed"), "{body}");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "claude skill: skipped (already installed)",
+        ));
+    assert_eq!(fs::read_to_string(&path).expect("skill"), body);
+    relaybook(dir.path())
+        .args(["uninstall", "--yes"])
+        .assert()
+        .success();
+    assert!(!path.exists(), "skill file remains");
+    assert!(!path.parent().expect("dir").exists(), "skill dir remains");
+}
+
+#[test]
+fn session_hook_is_quiet_until_work_is_waiting() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success();
+    assert_default_session(&session_command(dir.path()));
+    let silent = relaybook(dir.path())
+        .args(["hook", "session"])
+        .output()
+        .expect("session");
+    assert!(silent.status.success());
+    assert!(
+        silent.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&silent.stdout)
+    );
+    for slug in ["one", "two", "three"] {
+        relaybook(dir.path())
+            .args(["task", "create", slug, "--title", slug])
+            .assert()
+            .success();
+    }
+    for slug in ["one", "two"] {
+        relaybook(dir.path())
+            .args(["task", "claim", slug, "--by", "cursor"])
+            .assert()
+            .success();
+        relaybook(dir.path())
+            .args([
+                "task",
+                "done",
+                slug,
+                "--changed",
+                "landed",
+                "--verified",
+                "cargo test",
+                "--not-verified",
+                "live",
+                "--review",
+                "diff",
+            ])
+            .assert()
+            .success();
+    }
+    let output = relaybook(dir.path())
+        .args(["hook", "session"])
+        .output()
+        .expect("session");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "Relaybook: 1 ready task, 2 unreviewed reports. Run relaybook context.\n"
+    );
+}
+
+#[test]
+fn guide_prints_a_role_or_both() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let both = relaybook(dir.path())
+        .args(["guide"])
+        .output()
+        .expect("guide");
+    let text = String::from_utf8_lossy(&both.stdout);
+    assert!(both.status.success(), "{text}");
+    assert!(text.contains("# Planner"), "{text}");
+    assert!(text.contains("# Executor"), "{text}");
+    assert!(text.contains("depends-on login"), "{text}");
+    assert!(text.contains("planning from memory"), "{text}");
+    assert!(text.contains("working unclaimed"), "{text}");
+    assert!(text.contains("1,500 bytes"), "{text}");
+    let planner = relaybook(dir.path())
+        .args(["guide", "planner"])
+        .output()
+        .expect("planner");
+    let planner = String::from_utf8_lossy(&planner.stdout);
+    assert!(planner.contains("depends-on login"), "{planner}");
+    assert!(!planner.contains("# Executor"), "{planner}");
+    assert!(planner.len() <= 4000, "{}", planner.len());
+    let executor = relaybook(dir.path())
+        .args(["guide", "executor"])
+        .output()
+        .expect("executor");
+    let executor = String::from_utf8_lossy(&executor.stdout);
+    assert!(executor.contains("task claim login"), "{executor}");
+    assert!(!executor.contains("# Planner"), "{executor}");
+    assert!(executor.len() <= 4000, "{}", executor.len());
 }
 
 #[test]
@@ -911,6 +1107,9 @@ fn no_claude_hook_skips_the_prompt_hook() {
         .success()
         .stdout(predicates::str::contains(
             "prompt hook: skipped (--no-claude-hook)",
+        ))
+        .stdout(predicates::str::contains(
+            "session hook: skipped (--no-claude-hook)",
         ));
     assert!(!dir.path().join(".claude").join("settings.json").exists());
 }

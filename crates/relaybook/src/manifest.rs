@@ -17,6 +17,8 @@ pub(crate) struct Capture {
 const CREATED_DIRS: &[&str] = &[
     ".claude",
     ".claude/commands",
+    ".claude/skills",
+    ".claude/skills/relaybook",
     ".cursor",
     ".cursor/commands",
     ".github",
@@ -143,6 +145,7 @@ fn watched_files(root: &Path) -> Vec<String> {
         ".gitattributes".to_string(),
         ".claude/settings.json".to_string(),
         ".claude/commands/relaybook.md".to_string(),
+        ".claude/skills/relaybook/SKILL.md".to_string(),
         ".cursor/commands/relaybook.md".to_string(),
         ".github/workflows/graphify-update.yml".to_string(),
     ];
@@ -165,7 +168,10 @@ fn kind_for(file: &str) -> String {
         "hook-block".to_string()
     } else if file.ends_with("settings.json") {
         "json-entry".to_string()
-    } else if file.ends_with("graphify-update.yml") || file.ends_with("relaybook.md") {
+    } else if file.ends_with("graphify-update.yml")
+        || file.ends_with("relaybook.md")
+        || file.ends_with("SKILL.md")
+    {
         "file".to_string()
     } else {
         "block".to_string()
