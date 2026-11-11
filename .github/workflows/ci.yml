@@ -113,7 +113,7 @@ jobs:
         run: |
           bin="target/${{ matrix.target }}/release/relaybook"
           file "$bin"
-          file "$bin" | grep -q 'statically linked'
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
           set +e
           ldd_out=$(ldd "$bin" 2>&1)
           ldd_status=$?
