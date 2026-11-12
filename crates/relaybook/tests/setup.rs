@@ -1092,12 +1092,12 @@ fn setup_guards_graphify_hooks_and_ignores_local_output() {
         serde_json::from_str(&fs::read_to_string(&settings).expect("read")).expect("json");
     assert_eq!(
         value["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-        "command -v graphify >/dev/null 2>&1 && graphify hook-guard search || true"
+        graphify_guard("search")
     );
     assert_eq!(value["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 10);
     assert_eq!(
         value["hooks"]["PreToolUse"][1]["hooks"][0]["command"],
-        "command -v graphify >/dev/null 2>&1 && graphify hook-guard read --strict || true"
+        graphify_guard("read --strict")
     );
     let ignore = fs::read_to_string(dir.path().join(".gitignore")).expect("gitignore");
     assert!(ignore.contains("# relaybook:start\n"), "{ignore}");
@@ -1112,31 +1112,43 @@ fn setup_guards_graphify_hooks_and_ignores_local_output() {
         .as_str()
         .expect("command")
         .to_string();
-    let printed = posix_shell()
-        .arg("-c")
-        .arg(&wrapped)
-        .env("PATH", "/usr/bin:/bin")
-        .output()
-        .expect("wrapper");
-    assert!(printed.status.success());
-    assert_eq!(printed.stdout, b"");
-
     let fake = dir.path().join("bin");
     fs::create_dir_all(&fake).expect("mkdir");
+    let missing = run_graphify_guard(
+        &wrapped,
+        if cfg!(windows) {
+            r"C:\Windows\System32"
+        } else {
+            "/usr/bin:/bin"
+        },
+    );
+    assert!(missing.status.success(), "{missing:?}");
+    assert_eq!(missing.stdout, b"");
     fs::write(
-        fake.join("graphify"),
-        "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true}'\n",
+        fake.join(if cfg!(windows) {
+            "graphify.cmd"
+        } else {
+            "graphify"
+        }),
+        if cfg!(windows) {
+            "@echo {\"ok\":true}\r\n"
+        } else {
+            "#!/bin/sh\nprintf '%s\\n' '{\"ok\":true}'\n"
+        },
     )
     .expect("write");
-    make_executable(&fake.join("graphify"));
-    let printed = posix_shell()
-        .arg("-c")
-        .arg(&wrapped)
-        .env("PATH", format!("{}:/usr/bin:/bin", fake.display()))
-        .output()
-        .expect("wrapper");
-    assert!(printed.status.success());
-    assert_eq!(printed.stdout, b"{\"ok\":true}\n");
+    if !cfg!(windows) {
+        make_executable(&fake.join("graphify"));
+    }
+    let path = if cfg!(windows) {
+        fake.display().to_string()
+    } else {
+        format!("{}:/usr/bin:/bin", fake.display())
+    };
+    let printed = run_graphify_guard(&wrapped, &path);
+    assert!(printed.status.success(), "{printed:?}");
+    let text = String::from_utf8_lossy(&printed.stdout);
+    assert!(text.contains("{\"ok\":true}"), "{text}");
 
     let first = fs::read(&settings).expect("read");
     setup_plain(dir.path(), &["setup", "--no-graphify"])
@@ -1184,14 +1196,14 @@ fn setup_guards_graphify_hooks_under_every_event() {
         "/Users/ada/bin/notify"
     );
     let guarded = [
-        "command -v graphify >/dev/null 2>&1 && graphify hook-guard search || true",
-        "command -v graphify >/dev/null 2>&1 && graphify hook-guard compact || true",
-        "command -v graphify >/dev/null 2>&1 && graphify hook-guard startup || true",
+        graphify_guard("search"),
+        graphify_guard("compact"),
+        graphify_guard("startup"),
     ];
     let commands = hook_commands(&value);
     for expected in guarded {
         assert!(
-            commands.iter().any(|command| command == expected),
+            commands.iter().any(|command| command == &expected),
             "{commands:?}"
         );
     }
@@ -1255,6 +1267,33 @@ fn hook_commands(value: &Value) -> Vec<String> {
         }
     }
     found
+}
+
+fn graphify_guard(args: &str) -> String {
+    if cfg!(windows) {
+        format!(
+            "if (Get-Command graphify -ErrorAction SilentlyContinue) {{ graphify hook-guard {args} }}"
+        )
+    } else {
+        format!("command -v graphify >/dev/null 2>&1 && graphify hook-guard {args} || true")
+    }
+}
+
+fn run_graphify_guard(command: &str, path: &str) -> std::process::Output {
+    if cfg!(windows) {
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", command])
+            .env("PATH", path)
+            .output()
+            .expect("powershell")
+    } else {
+        posix_shell()
+            .arg("-c")
+            .arg(command)
+            .env("PATH", path)
+            .output()
+            .expect("shell")
+    }
 }
 
 fn assert_no_path_before_graphify(command: &str) {
