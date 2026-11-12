@@ -15,6 +15,7 @@ use crate::manifest::{self, Entry};
 use crate::paths;
 use crate::workflow;
 const GUARD_PREFIX: &str = "command -v graphify >/dev/null 2>&1 && graphify ";
+const POWERSHELL_GUARD_PREFIX: &str = "if (Get-Command graphify -ErrorAction SilentlyContinue) { ";
 const GRAPHIFY_NAME: &str = "graphify graph.json union merge";
 const GRAPHIFY_DRIVER: &str = "graphify merge-driver %O %A %B";
 
@@ -515,14 +516,7 @@ fn clean_settings(root: &Path) -> Result<(), String> {
         &[GUARDED_SESSION, BARE_SESSION, POWERSHELL_SESSION],
     );
     changed |= strip_planner_allow(&mut value);
-    if let Some(groups) = value
-        .pointer_mut("/hooks/PreToolUse")
-        .and_then(|value| value.as_array_mut())
-    {
-        for group in groups {
-            changed |= unguard_group(group);
-        }
-    }
+    changed |= unguard_all_hooks(&mut value);
     if !changed {
         return Ok(());
     }
@@ -728,7 +722,23 @@ fn settings_have_prompt(root: &Path) -> bool {
 fn settings_have_guard(root: &Path) -> bool {
     fs::read_to_string(root.join(".claude").join("settings.json"))
         .ok()
-        .is_some_and(|text| text.contains(GUARD_PREFIX))
+        .is_some_and(|text| text.contains(GUARD_PREFIX) || text.contains(POWERSHELL_GUARD_PREFIX))
+}
+
+fn unguard_all_hooks(value: &mut serde_json::Value) -> bool {
+    let Some(hooks) = value.get_mut("hooks").and_then(|item| item.as_object_mut()) else {
+        return false;
+    };
+    let mut changed = false;
+    for groups in hooks.values_mut() {
+        let Some(groups) = groups.as_array_mut() else {
+            continue;
+        };
+        for group in groups {
+            changed |= unguard_group(group);
+        }
+    }
+    changed
 }
 
 fn group_has_command(group: &serde_json::Value, command: &str) -> bool {
@@ -740,6 +750,19 @@ fn group_has_command(group: &serde_json::Value, command: &str) -> bool {
             .pointer("/hooks")
             .and_then(|value| value.as_array())
             .is_some_and(|hooks| hooks.len() == 1)
+}
+
+fn unguard_command(command: &str) -> Option<String> {
+    if let Some(rest) = command.strip_prefix(GUARD_PREFIX) {
+        let inner = rest.strip_suffix(" || true")?.trim();
+        return Some(format!("graphify {inner}"));
+    }
+    let rest = command.strip_prefix(POWERSHELL_GUARD_PREFIX)?;
+    let inner = rest.trim().trim_end_matches('}').trim();
+    if inner.starts_with("graphify ") || inner == "graphify" {
+        return Some(inner.to_string());
+    }
+    None
 }
 
 fn unguard_group(group: &mut serde_json::Value) -> bool {
@@ -758,14 +781,13 @@ fn unguard_group(group: &mut serde_json::Value) -> bool {
         else {
             continue;
         };
-        let Some(rest) = command.strip_prefix(GUARD_PREFIX) else {
+        let Some(restored) = unguard_command(&command) else {
             continue;
         };
-        let Some(inner) = rest.strip_suffix(" || true") else {
-            continue;
-        };
-        let restored = format!("graphify {}", inner.trim());
         if let Some(object) = hook.as_object_mut() {
+            if command.starts_with(POWERSHELL_GUARD_PREFIX) {
+                object.remove("shell");
+            }
             object.insert("command".to_string(), serde_json::Value::String(restored));
             changed = true;
         }

@@ -1082,7 +1082,7 @@ fn setup_guards_graphify_hooks_and_ignores_local_output() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "graphify guards: done (wrapped PreToolUse)",
+            "graphify guards: done (wrapped Graphify hooks)",
         ))
         .stdout(predicates::str::contains(
             "gitignore: done (ignored .claude/*.graphify-bak and graphify-out/)",
@@ -1143,12 +1143,130 @@ fn setup_guards_graphify_hooks_and_ignores_local_output() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "graphify guards: skipped (PreToolUse already guarded)",
+            "graphify guards: skipped (Graphify hooks already guarded)",
         ))
         .stdout(predicates::str::contains(
             "gitignore: skipped (already ignored)",
         ));
     assert_eq!(fs::read(&settings).expect("read"), first);
+}
+
+#[test]
+fn setup_guards_graphify_hooks_under_every_event() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    let settings = dir.path().join(".claude").join("settings.json");
+    fs::create_dir_all(settings.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &settings,
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash|Grep","hooks":[{"type":"command","command":"/tmp/graphify hook-guard search","timeout":10}]}],"SessionStart":[{"matcher":"compact","hooks":[{"type":"command","command":"/Users/ada/.local/bin/graphify hook-guard compact","timeout":5}]},{"matcher":"startup","hooks":[{"type":"command","command":"C:\\Users\\ada\\.local\\bin\\graphify.exe hook-guard startup"}]}],"Stop":[{"hooks":[{"type":"command","command":"/Users/ada/bin/notify"}]}]}}"#,
+    )
+    .expect("write");
+
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "graphify guards: done (wrapped Graphify hooks)",
+        ))
+        .stdout(predicates::str::contains(
+            "hook paths: warn (a hook command still contains an absolute home path)",
+        ));
+
+    let value: Value =
+        serde_json::from_str(&fs::read_to_string(&settings).expect("read")).expect("json");
+    assert_eq!(value["hooks"]["PreToolUse"][0]["matcher"], "Bash|Grep");
+    assert_eq!(value["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 10);
+    assert_eq!(value["hooks"]["SessionStart"][0]["matcher"], "compact");
+    assert_eq!(value["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 5);
+    assert_eq!(
+        value["hooks"]["Stop"][0]["hooks"][0]["command"],
+        "/Users/ada/bin/notify"
+    );
+    let guarded = [
+        "command -v graphify >/dev/null 2>&1 && graphify hook-guard search || true",
+        "command -v graphify >/dev/null 2>&1 && graphify hook-guard compact || true",
+        "command -v graphify >/dev/null 2>&1 && graphify hook-guard startup || true",
+    ];
+    let commands = hook_commands(&value);
+    for expected in guarded {
+        assert!(
+            commands.iter().any(|command| command == expected),
+            "{commands:?}"
+        );
+    }
+    for command in &commands {
+        if command.contains("graphify") {
+            assert_no_path_before_graphify(command);
+        }
+    }
+    let first = fs::read(&settings).expect("read");
+    setup_plain(dir.path(), &["setup", "--no-graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "graphify guards: skipped (Graphify hooks already guarded)",
+        ));
+    assert_eq!(fs::read(&settings).expect("read"), first);
+
+    fs::remove_file(dir.path().join(".relaybook").join("setup.json")).expect("manifest");
+    relaybook(dir.path())
+        .args(["uninstall", "--yes"])
+        .assert()
+        .success();
+    let restored: Value =
+        serde_json::from_str(&fs::read_to_string(&settings).expect("read")).expect("json");
+    let commands = hook_commands(&restored);
+    for expected in [
+        "graphify hook-guard search",
+        "graphify hook-guard compact",
+        "graphify hook-guard startup",
+    ] {
+        assert!(
+            commands.iter().any(|command| command == expected),
+            "{commands:?}"
+        );
+    }
+    assert!(
+        commands
+            .iter()
+            .any(|command| command == "/Users/ada/bin/notify")
+    );
+}
+
+fn hook_commands(value: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    let Some(hooks) = value["hooks"].as_object() else {
+        return found;
+    };
+    for groups in hooks.values() {
+        let Some(groups) = groups.as_array() else {
+            continue;
+        };
+        for group in groups {
+            let Some(items) = group["hooks"].as_array() else {
+                continue;
+            };
+            for hook in items {
+                if let Some(command) = hook["command"].as_str() {
+                    found.push(command.to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+fn assert_no_path_before_graphify(command: &str) {
+    if let Some(index) = command.find("graphify")
+        && index > 0
+    {
+        let previous = command.as_bytes()[index - 1];
+        assert!(
+            previous != b'/' && previous != b'\\',
+            "path before graphify in {command}"
+        );
+    }
 }
 
 #[test]
@@ -1164,7 +1282,7 @@ fn fake_graphify_install_gets_guarded() {
         .assert()
         .success()
         .stdout(predicates::str::contains(
-            "graphify guards: done (wrapped PreToolUse)",
+            "graphify guards: done (wrapped Graphify hooks)",
         ));
     let value: Value = serde_json::from_str(
         &fs::read_to_string(dir.path().join(".claude").join("settings.json")).expect("read"),

@@ -45,7 +45,7 @@ pub(crate) fn guard_graphify(root: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     let mut value = read_settings(&path)?;
-    if !guard_pretooluse(&mut value)? {
+    if !guard_all_hooks(&mut value)? {
         return Ok(false);
     }
     let text = serde_json::to_string_pretty(&value).map_err(|err| invalid(err.to_string()))?;
@@ -53,22 +53,33 @@ pub(crate) fn guard_graphify(root: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-fn guard_pretooluse(value: &mut Value) -> io::Result<bool> {
+pub(crate) fn home_path_hook_commands(root: &Path) -> io::Result<Vec<String>> {
+    let path = root.join(".claude").join("settings.json");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let value = read_settings(&path)?;
+    Ok(collect_hook_commands(&value)
+        .into_iter()
+        .filter(|command| is_home_path(command))
+        .collect())
+}
+
+fn guard_all_hooks(value: &mut Value) -> io::Result<bool> {
     let Some(hooks) = value.get_mut("hooks") else {
         return Ok(false);
     };
     let Some(hooks) = hooks.as_object_mut() else {
         return Err(invalid("hooks must be a JSON object"));
     };
-    let Some(pre_tool) = hooks.get_mut("PreToolUse") else {
-        return Ok(false);
-    };
-    let Some(groups) = pre_tool.as_array_mut() else {
-        return Err(invalid("PreToolUse must be a JSON array"));
-    };
     let mut changed = false;
-    for group in groups {
-        changed |= guard_group(group);
+    for (event, groups) in hooks {
+        let Some(groups) = groups.as_array_mut() else {
+            return Err(invalid(format!("{event} must be a JSON array")));
+        };
+        for group in groups {
+            changed |= guard_group(group);
+        }
     }
     Ok(changed)
 }
@@ -90,6 +101,12 @@ fn guard_group(group: &mut Value) -> bool {
             continue;
         };
         if let Some(object) = hook.as_object_mut() {
+            if guarded.starts_with("if (Get-Command graphify ") {
+                object.insert(
+                    "shell".to_string(),
+                    Value::String(POWERSHELL_SHELL.to_string()),
+                );
+            }
             object.insert("command".to_string(), Value::String(guarded));
             changed = true;
         }
@@ -99,16 +116,63 @@ fn guard_group(group: &mut Value) -> bool {
 
 fn guard_command(command: &str) -> Option<String> {
     let trimmed = command.trim();
-    if trimmed.starts_with("command -v graphify ") && trimmed.ends_with("|| true") {
+    let args = graphify_hook_args(trimmed)?;
+    let desired = if use_powershell() {
+        format!("if (Get-Command graphify -ErrorAction SilentlyContinue) {{ graphify {args} }}")
+    } else {
+        format!("command -v graphify >/dev/null 2>&1 && graphify {args} || true")
+    };
+    if trimmed == desired {
         return None;
     }
-    let rest = trimmed[trimmed.find("hook-guard")?..].trim();
-    if rest.is_empty() {
+    Some(desired)
+}
+
+fn graphify_hook_args(command: &str) -> Option<String> {
+    let index = command.find("hook-guard")?;
+    if !command[..index].contains("graphify") {
         return None;
     }
-    Some(format!(
-        "command -v graphify >/dev/null 2>&1 && graphify {rest} || true"
-    ))
+    let mut rest = command[index..].trim();
+    if let Some(inner) = rest.strip_suffix("|| true") {
+        rest = inner.trim();
+    }
+    rest = rest.trim_end_matches('}').trim();
+    if !rest.starts_with("hook-guard") {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+fn collect_hook_commands(value: &Value) -> Vec<String> {
+    let Some(hooks) = value.get("hooks").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for groups in hooks.values() {
+        let Some(groups) = groups.as_array() else {
+            continue;
+        };
+        for group in groups {
+            let Some(items) = group.get("hooks").and_then(Value::as_array) else {
+                continue;
+            };
+            for hook in items {
+                if let Some(command) = hook.get("command").and_then(Value::as_str) {
+                    found.push(command.to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+fn is_home_path(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    lower.contains("/users/")
+        || lower.contains("/home/")
+        || lower.contains("c:/users/")
+        || lower.contains("c:\\users\\")
 }
 
 pub(crate) struct Installed {
@@ -333,4 +397,26 @@ fn contains_command(value: &Value, command: &str) -> bool {
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{graphify_hook_args, guard_command, is_home_path};
+
+    #[test]
+    fn absolute_graphify_paths_become_a_guard_without_a_path() {
+        let unix =
+            guard_command("/Users/ada/.local/bin/graphify hook-guard compact").expect("unix");
+        assert_eq!(
+            unix,
+            "command -v graphify >/dev/null 2>&1 && graphify hook-guard compact || true"
+        );
+        assert!(!is_home_path(&unix));
+        let windows =
+            guard_command(r"C:\Users\ada\.local\bin\graphify.exe hook-guard startup").expect("win");
+        assert!(windows.contains("graphify hook-guard startup"));
+        assert!(!windows.contains('\\'));
+        assert!(graphify_hook_args("echo hook-guard").is_none());
+        assert!(guard_command(&unix).is_none());
+    }
 }

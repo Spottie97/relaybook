@@ -248,14 +248,24 @@ fn record_hook_status(
 
 fn record_graphify_guards(root: &Path, steps: &mut Vec<Step>) {
     match crate::claude_hook::guard_graphify(root) {
-        Ok(true) => push(steps, "graphify guards", "done", "wrapped PreToolUse"),
+        Ok(true) => push(steps, "graphify guards", "done", "wrapped Graphify hooks"),
         Ok(false) => push(
             steps,
             "graphify guards",
             "skipped",
-            "PreToolUse already guarded",
+            "Graphify hooks already guarded",
         ),
         Err(err) => push(steps, "graphify guards", "failed", err.to_string()),
+    }
+    match crate::claude_hook::home_path_hook_commands(root) {
+        Ok(commands) if !commands.is_empty() => push(
+            steps,
+            "hook paths",
+            "warn",
+            "a hook command still contains an absolute home path",
+        ),
+        Ok(_) => {}
+        Err(err) => push(steps, "hook paths", "failed", err.to_string()),
     }
 }
 
