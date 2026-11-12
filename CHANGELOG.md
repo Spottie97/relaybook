@@ -4,6 +4,8 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-12
+
 ### Fixed
 
 - `relaybook setup` guards Graphify hooks under every event, including `SessionStart`. An absolute `graphify` path is rewritten, so a committed `.claude/settings.json` does not leak a home directory or fail when Graphify is missing.

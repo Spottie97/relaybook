@@ -17,7 +17,7 @@ name = "relaybook"
 path = "src/main.rs"
 
 [dependencies]
-relaybook-core = { path = "../core", version = "0.3.2" }
+relaybook-core = { path = "../core", version = "0.3.3" }
 clap = { version = "4.6.7", features = ["derive"] }
 dialoguer = "0.12"
 serde = "1.0.229"
