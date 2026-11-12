@@ -1,36 +1,73 @@
 {
   "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true"
-          }
-        ]
-      }
-    ],
     "PreToolUse": [
       {
-        "matcher": "Bash|Grep",
         "hooks": [
           {
-            "type": "command",
             "command": "command -v graphify >/dev/null 2>&1 && graphify hook-guard search || true",
-            "timeout": 10
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Bash|Grep"
+      },
+      {
+        "hooks": [
+          {
+            "command": "command -v graphify >/dev/null 2>&1 && graphify hook-guard read || true",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Read|Glob"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "command -v relaybook >/dev/null 2>&1 && relaybook hook session || true",
+            "type": "command"
           }
         ]
       },
       {
-        "matcher": "Read|Glob",
         "hooks": [
           {
-            "type": "command",
-            "command": "command -v graphify >/dev/null 2>&1 && graphify hook-guard read || true",
-            "timeout": 10
+            "command": "command -v graphify >/dev/null 2>&1 && graphify hook-guard compact || true",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "compact"
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "command": "command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true",
+            "type": "command"
           }
         ]
       }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(relaybook context:*)",
+      "Bash(relaybook inbox:*)",
+      "Bash(relaybook guide:*)",
+      "Bash(relaybook status:*)",
+      "Bash(relaybook task create:*)",
+      "Bash(relaybook task list:*)",
+      "Bash(relaybook task reopen:*)",
+      "Bash(relaybook task depend:*)",
+      "Bash(relaybook step add:*)",
+      "Bash(relaybook step edit:*)",
+      "Bash(relaybook decision log:*)",
+      "Bash(relaybook report accept:*)",
+      "Bash(relaybook report note:*)"
     ]
   }
 }
