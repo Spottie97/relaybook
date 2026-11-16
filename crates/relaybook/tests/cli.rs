@@ -1135,6 +1135,116 @@ fn gated_requires_reviewer_codex() {
 }
 
 #[test]
+fn task_done_records_commit_sha() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_repo(dir.path());
+    run(dir.path(), ["init"]).assert().success();
+    let config = json_data(dir.path(), ["config", "--json"]);
+    assert_eq!(config["workflow"], json!("classic"));
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    fs::write(dir.path().join("wip.txt"), "dirty\n").expect("write");
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success()
+        .stdout("claimed auth by cursor\n");
+    let data = json_data(
+        dir.path(),
+        [
+            "task",
+            "done",
+            "auth",
+            "--changed",
+            "recorded the sha",
+            "--json",
+        ],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(data["slug"], json!("auth"));
+    assert_eq!(data["status"], json!("done"));
+    assert_eq!(data["commit_sha"], json!(head));
+
+    let db = dir.path().join(".relaybook").join("ledger.db");
+    let (commit, base, graph) = report_shas(&db);
+    assert_eq!(commit.as_deref(), Some(head.as_str()));
+    assert_eq!(base, None);
+    assert_eq!(graph, None);
+
+    run(dir.path(), ["task", "done", "auth", "--changed", "again"])
+        .assert()
+        .success()
+        .stdout("done auth\n");
+    let (again, _, _) = report_shas(&db);
+    assert_eq!(again.as_deref(), Some(head.as_str()));
+}
+
+#[test]
+fn gated_claim_and_done_require_clean_tree() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_repo(dir.path());
+    run(dir.path(), ["init"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(dir.path(), ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    run(dir.path(), ["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+
+    let dirty = dir.path().join("dirty.txt");
+    fs::write(&dirty, "wip\n").expect("dirty");
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "working tree is not clean: dirty.txt",
+        ));
+    let open = json_data(dir.path(), ["context", "auth", "--json"]);
+    assert_eq!(open["tasks"][0]["status"], "open");
+
+    fs::remove_file(&dirty).expect("clean");
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success()
+        .stdout("claimed auth by cursor\n");
+
+    fs::write(&dirty, "wip\n").expect("dirty again");
+    run(dir.path(), ["task", "done", "auth", "--changed", "shipped"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "working tree is not clean: dirty.txt",
+        ));
+    let claimed = json_data(dir.path(), ["context", "auth", "--json"]);
+    assert_eq!(claimed["tasks"][0]["status"], "claimed");
+
+    fs::remove_file(&dirty).expect("clean again");
+    let done = json_data(
+        dir.path(),
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(done["status"], json!("done"));
+    assert_eq!(done["commit_sha"], json!(head));
+    let db = dir.path().join(".relaybook").join("ledger.db");
+    let (commit, base, graph) = report_shas(&db);
+    assert_eq!(commit.as_deref(), Some(head.as_str()));
+    assert_eq!(base, None);
+    assert_eq!(graph, None);
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");
@@ -1218,6 +1328,55 @@ fn event_rows(dir: &Path) -> Vec<(i64, String, Value)> {
         .collect();
     rows.sort_by_key(|row| row.0);
     rows
+}
+
+fn git_repo(dir: &Path) {
+    git(dir, &["init", "-b", "main"]);
+    fs::write(dir.join("README.md"), "seed\n").expect("write");
+    git(dir, &["add", "README.md"]);
+    git(
+        dir,
+        &[
+            "-c",
+            "user.email=relaybook@example.com",
+            "-c",
+            "user.name=Relaybook",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "seed",
+        ],
+    );
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}
+
+fn report_shas(db: &Path) -> (Option<String>, Option<String>, Option<String>) {
+    let conn = rusqlite::Connection::open(db).expect("open");
+    conn.query_row(
+        "SELECT commit_sha, base_sha, graph_sha FROM reports WHERE kind = 'task'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .expect("report")
 }
 
 fn summarize(output: &std::process::Output) -> String {

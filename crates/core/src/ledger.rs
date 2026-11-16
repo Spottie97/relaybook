@@ -255,7 +255,16 @@ impl Ledger {
         })
     }
 
-    pub fn finish_task(&mut self, slug: &str, sections: Option<Sections>) -> Result<Task, Error> {
+    /// Mark a claimed task done and store `commit_sha` on that report.
+    ///
+    /// Pass HEAD when it can be read. This applies in every workflow. A task
+    /// that is already done keeps the SHA from the first completion.
+    pub fn finish_task(
+        &mut self,
+        slug: &str,
+        sections: Option<Sections>,
+        commit_sha: Option<&str>,
+    ) -> Result<Task, Error> {
         let slug = checked_slug(slug)?;
         self.transaction(|conn| {
             let task = load_task(conn, &slug)?;
@@ -284,9 +293,28 @@ impl Ledger {
                 .claimed_by
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            reports::insert(conn, Some(task.id), "task", &author, &body, &ts)?;
+            reports::insert(conn, Some(task.id), "task", &author, &body, &ts, commit_sha)?;
             load_task(conn, &slug)
         })
+    }
+
+    /// `reports.commit_sha` on the latest task report, if one was stored.
+    pub fn report_commit_sha(&self, slug: &str) -> Result<Option<String>, Error> {
+        let slug = checked_slug(slug)?;
+        let task = load_task(&self.conn, &slug)?;
+        let sha = self
+            .conn
+            .query_row(
+                "SELECT commit_sha FROM reports
+                 WHERE task_id = ?1 AND kind = 'task'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![task.id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(sha)
     }
 
     pub fn inbox(&self) -> Result<Vec<reports::InboxItem>, Error> {
@@ -695,7 +723,7 @@ impl Ledger {
         let body = reports::note_body(&text)?;
         self.transaction(|conn| {
             let ts = now(conn)?;
-            reports::insert(conn, None, "note", &author, &body, &ts)
+            reports::insert(conn, None, "note", &author, &body, &ts, None)
         })
     }
 

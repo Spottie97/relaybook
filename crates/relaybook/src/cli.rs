@@ -762,6 +762,7 @@ fn list_tasks(cwd: &Path, status: Option<Status>, ready: bool, all: bool) -> Res
 
 fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
+    require_gated_clean_tree(cwd, &ledger)?;
     let task = ledger.claim_task(slug, by)?;
     let agent = task.claimed_by.clone().unwrap_or_default();
     let human = render::line(&format!("claimed {} by {agent}", task.slug));
@@ -808,9 +809,31 @@ fn complete_task(
     sections: Option<relaybook_core::Sections>,
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let task = ledger.finish_task(slug, sections)?;
+    require_gated_clean_tree(cwd, &ledger)?;
+    let head = gitinfo::head(cwd);
+    let task = ledger.finish_task(slug, sections, head.as_deref())?;
+    let stored = ledger.report_commit_sha(&task.slug)?;
     let human = render::line(&format!("done {}", task.slug));
-    json_outcome(task_ack(&task), human)
+    let mut data = task_ack(&task);
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert(
+            "commit_sha".to_string(),
+            stored.map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+    }
+    json_outcome(data, human)
+}
+
+fn require_gated_clean_tree(cwd: &Path, ledger: &Ledger) -> Result<(), Fail> {
+    if ledger.settings()?.workflow != "gated" {
+        return Ok(());
+    }
+    let paths = crate::git::dirty_paths(cwd).map_err(Error::DirtyWorktree)?;
+    if paths.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::DirtyWorktree(paths.join(", ")).into())
+    }
 }
 
 fn reopen_task(cwd: &Path, slug: &str, reason: &str) -> Result<Outcome, Fail> {

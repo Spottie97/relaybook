@@ -441,6 +441,7 @@ fn oversized_report_rolls_back_the_done_status() {
                 deviations: Vec::new(),
                 review: Vec::new(),
             }),
+            None,
         )
         .expect_err("cap");
     assert!(err.to_string().starts_with("report is "));
@@ -458,9 +459,12 @@ fn oversized_report_rolls_back_the_done_status() {
                 deviations: Vec::new(),
                 review: vec!["check the inbox".to_string()],
             }),
+            None,
         )
         .expect("done");
-    let again = ledger.finish_task("auth", None).expect("already done");
+    let again = ledger
+        .finish_task("auth", None, None)
+        .expect("already done");
     assert_eq!(again.status, Status::Done);
     let conn = rusqlite::Connection::open(&path).expect("open");
     let count: i64 = conn
@@ -490,6 +494,7 @@ fn done_on_an_open_task_writes_nothing() {
                 deviations: Vec::new(),
                 review: Vec::new(),
             }),
+            None,
         )
         .expect_err("open");
     assert_eq!(
@@ -511,6 +516,48 @@ fn done_on_an_open_task_writes_nothing() {
         )
         .expect("events");
     assert_eq!(done_events, 0);
+}
+
+#[test]
+fn finish_task_records_commit_sha_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.create_task("auth", "Add auth").expect("create");
+    ledger.claim_task("auth", "cursor").expect("claim");
+    ledger
+        .finish_task("auth", None, Some("abc123"))
+        .expect("done");
+    assert_eq!(
+        ledger.report_commit_sha("auth").expect("sha").as_deref(),
+        Some("abc123")
+    );
+    ledger
+        .finish_task("auth", None, Some("def456"))
+        .expect("again");
+    assert_eq!(
+        ledger.report_commit_sha("auth").expect("sha").as_deref(),
+        Some("abc123")
+    );
+    let conn = rusqlite::Connection::open(&path).expect("open");
+    let (commit, base, graph): (Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT commit_sha, base_sha, graph_sha FROM reports WHERE kind = 'task'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("report");
+    assert_eq!(commit.as_deref(), Some("abc123"));
+    assert_eq!(base, None);
+    assert_eq!(graph, None);
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reports WHERE kind = 'task'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count");
+    assert_eq!(count, 1);
 }
 
 fn spawn_claim(

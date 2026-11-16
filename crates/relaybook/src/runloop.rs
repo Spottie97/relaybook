@@ -1051,7 +1051,7 @@ fn shared_guard(before: &Snap, after: &Snap) -> Result<(), String> {
 }
 
 fn dirty(cwd: &Path) -> Result<bool, String> {
-    Ok(!dirty_paths(cwd)?.is_empty())
+    Ok(!crate::git::dirty_paths(cwd)?.is_empty())
 }
 
 fn worktree_fingerprint(cwd: &Path) -> Result<String, String> {
@@ -1084,23 +1084,6 @@ fn content_hash(bytes: &[u8]) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
-}
-
-fn dirty_paths(cwd: &Path) -> Result<Vec<String>, String> {
-    let text = git(cwd, &["status", "--porcelain"])?;
-    Ok(text
-        .lines()
-        .filter_map(|line| {
-            let path = line.get(3..).unwrap_or(line).trim().trim_matches('"');
-            let path = path.rsplit(" -> ").next().unwrap_or(path);
-            let path = git_path(path);
-            if path == ".relaybook" || path.starts_with(".relaybook/") {
-                None
-            } else {
-                Some(path)
-            }
-        })
-        .collect())
 }
 
 fn sync_main(cwd: &Path) -> Result<(), String> {

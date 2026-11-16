@@ -488,7 +488,7 @@ fn review_record_checks_sha_fingerprint_ledger_and_body() {
 
     ledger.create_task("ship", "Ship it").expect("task");
     ledger.claim_task("ship", "cursor").expect("claim");
-    ledger.finish_task("ship", None).expect("done");
+    ledger.finish_task("ship", None, None).expect("done");
     let before = ledger
         .context(Some("ship"), 50)
         .expect("context")
@@ -737,7 +737,7 @@ fn lifecycle_covers_every_state_and_invalidates_release() {
         for slug in ["delta", "epsilon", "zeta", "eta"] {
             ledger.create_task(slug, slug).expect("task");
             ledger.claim_task(slug, "cursor").expect("claim");
-            ledger.finish_task(slug, None).expect("done");
+            ledger.finish_task(slug, None, None).expect("done");
         }
     }
     set_commit_sha(&path, "delta", "sha-delta");
@@ -790,7 +790,9 @@ fn lifecycle_covers_every_state_and_invalidates_release() {
     assert_eq!(task_phase(&claimed, "gamma"), Some(TaskPhase::Dispatched));
     assert_eq!(task_phase(&claimed, "zeta"), Some(TaskPhase::Accepted));
     assert_eq!(claimed.release, None);
-    ledger.finish_task("gamma", None).expect("clear claim");
+    ledger
+        .finish_task("gamma", None, None)
+        .expect("clear claim");
 
     let blocked = ledger
         .lifecycle("sha-head", &shas(&["sha-delta"]))
@@ -831,7 +833,7 @@ fn release_reviewed_requires_no_claimed_task() {
     let mut ledger = Ledger::initialize(&path).expect("init");
     ledger.create_task("alpha", "Accepted").expect("task");
     ledger.claim_task("alpha", "cursor").expect("claim");
-    ledger.finish_task("alpha", None).expect("done");
+    ledger.finish_task("alpha", None, None).expect("done");
     set_commit_sha(&path, "alpha", "sha-alpha");
     record_task(&mut ledger, "alpha", "sha-alpha");
     ledger.accept_report("alpha").expect("accept");
@@ -846,7 +848,9 @@ fn release_reviewed_requires_no_claimed_task() {
     assert_eq!(task_phase(&blocked, "gamma"), Some(TaskPhase::Dispatched));
     assert_eq!(blocked.release, None);
 
-    ledger.finish_task("gamma", None).expect("clear claim");
+    ledger
+        .finish_task("gamma", None, None)
+        .expect("clear claim");
     let reviewed = ledger
         .lifecycle("sha-head", &shas(&["sha-alpha"]))
         .expect("release reviewed");
@@ -982,7 +986,7 @@ fn done_task() -> (tempfile::TempDir, Ledger) {
     let mut ledger = Ledger::initialize(&path).expect("init");
     ledger.create_task("auth", "Add auth").expect("task");
     ledger.claim_task("auth", "cursor").expect("claim");
-    ledger.finish_task("auth", None).expect("done");
+    ledger.finish_task("auth", None, None).expect("done");
     (dir, ledger)
 }
 

@@ -52,11 +52,21 @@ pub fn insert(
     author: &str,
     body: &str,
     created_at: &str,
+    commit_sha: Option<&str>,
 ) -> Result<i64, Error> {
     conn.execute(
-        "INSERT INTO reports (task_id, kind, author, body, bytes, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![task_id, kind, author, body, body.len() as i64, created_at],
+        "INSERT INTO reports (
+            task_id, kind, author, body, bytes, created_at, commit_sha
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            task_id,
+            kind,
+            author,
+            body,
+            body.len() as i64,
+            created_at,
+            commit_sha
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
