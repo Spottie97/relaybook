@@ -7,6 +7,8 @@ use crate::error::Error;
 pub struct Snapshot {
     pub mode: String,
     pub gates: String,
+    pub reviewer: String,
+    pub workflow: String,
     pub max_cycles: i64,
     pub max_reopens_per_task: i64,
     pub max_agent_calls: i64,
@@ -57,6 +59,8 @@ pub fn load(conn: &Connection) -> Result<Snapshot, Error> {
     Ok(Snapshot {
         mode: value_or(conn, "mode", "manual")?,
         gates: value_or(conn, "gates", "plan")?,
+        reviewer: value_or(conn, "reviewer", "claude")?,
+        workflow: value_or(conn, "workflow", "classic")?,
         max_cycles: number_or(conn, "max_cycles", 20)?,
         max_reopens_per_task: number_or(conn, "max_reopens_per_task", 2)?,
         max_agent_calls: number_or(conn, "max_agent_calls", 60)?,
@@ -74,7 +78,7 @@ pub fn set(conn: &Connection, key: &str, value: &str) -> Result<Snapshot, Error>
         conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
         return load(conn);
     }
-    let stored = validate(key, value)?;
+    let stored = validate(conn, key, value)?;
     let ts = now(conn)?;
     conn.execute(
         "INSERT INTO settings (key, value, updated_at, updated_by)
@@ -130,9 +134,11 @@ pub fn hook_wait_line(conn: &Connection) -> Result<Option<String>, Error> {
 
 pub fn format_config(settings: &Snapshot) -> String {
     format!(
-        "mode {}\ngates {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
+        "mode {}\ngates {}\nreviewer {}\nworkflow {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
         settings.mode,
         settings.gates,
+        settings.reviewer,
+        settings.workflow,
         settings.max_cycles,
         settings.max_reopens_per_task,
         settings.max_agent_calls,
@@ -259,10 +265,12 @@ fn active_run(conn: &Connection) -> Result<Option<RunRow>, Error> {
     Ok(row)
 }
 
-fn validate(key: &str, value: &str) -> Result<String, Error> {
-    match key {
-        "mode" => one_of(key, value, &["manual", "auto"]),
-        "gates" => one_of(key, value, &["none", "plan", "plan,review"]),
+fn validate(conn: &Connection, key: &str, value: &str) -> Result<String, Error> {
+    let stored = match key {
+        "mode" => one_of(key, value, &["manual", "auto"])?,
+        "gates" => one_of(key, value, &["none", "plan", "plan,review"])?,
+        "reviewer" => one_of(key, value, &["claude", "codex"])?,
+        "workflow" => one_of(key, value, &["classic", "gated"])?,
         "max_cycles" | "max_reopens_per_task" | "max_agent_calls" | "cursor_timeout_min" => {
             let parsed = value
                 .parse::<i64>()
@@ -270,7 +278,7 @@ fn validate(key: &str, value: &str) -> Result<String, Error> {
             if parsed < 1 {
                 return Err(Error::InvalidSetting(format!("{key} must be at least 1")));
             }
-            Ok(parsed.to_string())
+            parsed.to_string()
         }
         "est_cost_cap_usd" => {
             let parsed = value
@@ -281,10 +289,33 @@ fn validate(key: &str, value: &str) -> Result<String, Error> {
                     "est_cost_cap_usd must be greater than 0".to_string(),
                 ));
             }
-            Ok(format!("{parsed:.2}"))
+            format!("{parsed:.2}")
         }
-        _ => Err(Error::InvalidSetting(format!("unknown setting: {key}"))),
+        _ => return Err(Error::InvalidSetting(format!("unknown setting: {key}"))),
+    };
+    if key == "reviewer" || key == "workflow" {
+        require_codex_for_gated(conn, key, &stored)?;
     }
+    Ok(stored)
+}
+
+fn require_codex_for_gated(conn: &Connection, key: &str, stored: &str) -> Result<(), Error> {
+    let reviewer = if key == "reviewer" {
+        stored.to_string()
+    } else {
+        value_or(conn, "reviewer", "claude")?
+    };
+    let workflow = if key == "workflow" {
+        stored.to_string()
+    } else {
+        value_or(conn, "workflow", "classic")?
+    };
+    if workflow == "gated" && reviewer != "codex" {
+        return Err(Error::InvalidSetting(
+            "workflow=gated requires reviewer=codex".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<String, Error> {

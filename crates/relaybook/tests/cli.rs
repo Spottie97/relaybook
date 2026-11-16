@@ -977,7 +977,9 @@ fn mode_and_config_use_agent_call_limits() {
         .success()
         .stdout(predicate::str::contains("max_agent_calls 60"))
         .stdout(predicate::str::contains("est_cost_cap_usd unset"))
-        .stdout(predicate::str::contains("gates plan"));
+        .stdout(predicate::str::contains("gates plan"))
+        .stdout(predicate::str::contains("reviewer claude"))
+        .stdout(predicate::str::contains("workflow classic"));
     run(dir.path(), ["config", "set", "gates", "sometimes"])
         .assert()
         .failure()
@@ -998,6 +1000,26 @@ fn mode_and_config_use_agent_call_limits() {
         .assert()
         .success()
         .stdout("est_cost_cap_usd unset\n");
+    run(dir.path(), ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success()
+        .stdout("reviewer codex\n");
+    run(dir.path(), ["config", "set", "reviewer", "claude"])
+        .assert()
+        .success()
+        .stdout("reviewer claude\n");
+    run(dir.path(), ["config", "set", "reviewer", "grok"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid reviewer: grok"));
+    run(dir.path(), ["config", "set", "workflow", "classic"])
+        .assert()
+        .success()
+        .stdout("workflow classic\n");
+    run(dir.path(), ["config", "set", "workflow", "sometimes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid workflow: sometimes"));
     run(dir.path(), ["mode", "auto"])
         .assert()
         .success()
@@ -1053,6 +1075,63 @@ fn mode_and_config_use_agent_call_limits() {
         .stdout(predicate::str::contains(
             "usage limit (claude, until 2026-11-10T18:00:00Z)",
         ));
+}
+
+#[test]
+fn gated_requires_reviewer_codex() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+
+    let config = json_data(dir.path(), ["config", "--json"]);
+    assert_eq!(config["reviewer"], json!("claude"));
+    assert_eq!(config["workflow"], json!("classic"));
+    assert_eq!(config["mode"], json!("manual"));
+
+    run(dir.path(), ["config", "set", "workflow", "gated"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "workflow=gated requires reviewer=codex",
+        ));
+    let still = json_data(dir.path(), ["config", "--json"]);
+    assert_eq!(still["reviewer"], json!("claude"));
+    assert_eq!(still["workflow"], json!("classic"));
+
+    run(dir.path(), ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success()
+        .stdout("reviewer codex\n");
+    run(dir.path(), ["config", "set", "workflow", "gated"])
+        .assert()
+        .success()
+        .stdout("workflow gated\n");
+    let gated = json_data(dir.path(), ["config", "--json"]);
+    assert_eq!(gated["reviewer"], json!("codex"));
+    assert_eq!(gated["workflow"], json!("gated"));
+
+    run(dir.path(), ["config", "set", "reviewer", "claude"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "workflow=gated requires reviewer=codex",
+        ));
+    let kept = json_data(dir.path(), ["config", "--json"]);
+    assert_eq!(kept["reviewer"], json!("codex"));
+    assert_eq!(kept["workflow"], json!("gated"));
+
+    run(dir.path(), ["config", "set", "workflow", "classic"])
+        .assert()
+        .success()
+        .stdout("workflow classic\n");
+    run(dir.path(), ["config", "set", "reviewer", "claude"])
+        .assert()
+        .success()
+        .stdout("reviewer claude\n");
+    let restored = json_data(dir.path(), ["config", "--json"]);
+    assert_eq!(restored["reviewer"], json!("claude"));
+    assert_eq!(restored["workflow"], json!("classic"));
 }
 
 #[test]

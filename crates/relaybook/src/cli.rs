@@ -1007,6 +1007,8 @@ fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
             .unwrap_or_else(|| "unset".to_string()),
         "mode" => settings.mode.clone(),
         "gates" => settings.gates.clone(),
+        "reviewer" => settings.reviewer.clone(),
+        "workflow" => settings.workflow.clone(),
         "max_cycles" => settings.max_cycles.to_string(),
         "max_reopens_per_task" => settings.max_reopens_per_task.to_string(),
         "max_agent_calls" => settings.max_agent_calls.to_string(),
