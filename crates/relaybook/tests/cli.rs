@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -2077,6 +2077,476 @@ fn graph_refresh_from_a_nested_directory_uses_the_repository_root() {
     assert!(detail.contains("graphify-out/ is tracked"), "{detail}");
 }
 
+const TASK_REVIEW_TEXT: &str =
+    r#"{"findings":"none","security":"ok","tests_checked":"cargo test","not_checked":"none"}"#;
+
+#[test]
+fn review_record_rejects_sha_mismatch_or_moved_head() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let _head = commit_gated_work(dir.path(), &fake);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.email=relaybook@example.com",
+            "-c",
+            "user.name=Relaybook",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "after the report",
+        ],
+    );
+    let started = fake_output(dir.path(), &fake, "graph", &["review", "start", "auth"]);
+    assert_failure(&started, "HEAD does not match the reported commit");
+    assert!(task_reviews(dir.path()).is_empty());
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let pending = task_reviews(dir.path());
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].0, "codex");
+    assert_eq!(pending[0].1, None);
+    assert_eq!(pending[0].2, 0);
+    assert_eq!(pending[0].3, head);
+
+    fs::write(dir.path().join("extra.txt"), "x\n").expect("extra");
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "working tree is not clean",
+    );
+    fs::remove_file(dir.path().join("extra.txt")).expect("remove");
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+
+    assert_failure(
+        &record_review(dir.path(), "codex", "abc", "approved", false),
+        "sha does not match HEAD",
+    );
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.email=relaybook@example.com",
+            "-c",
+            "user.name=Relaybook",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "move HEAD",
+        ],
+    );
+    let moved = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(moved, head);
+    assert_failure(
+        &record_review(dir.path(), "codex", &moved, "approved", false),
+        "reviewer changed the repository",
+    );
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "sha does not match HEAD",
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+}
+
+#[test]
+fn review_record_detects_ledger_write_during_review() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    run(
+        dir.path(),
+        [
+            "decision",
+            "log",
+            "auth",
+            "--why",
+            "during review",
+            "--by",
+            "orca",
+        ],
+    )
+    .assert()
+    .success();
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "ledger changed during review",
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["review", "start", "auth", "--json"],
+    );
+    let recorded = data_of(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_eq!(recorded["verdict"], json!("approved"));
+    assert_eq!(recorded["commit_sha"], json!(head));
+    assert_eq!(task_status(dir.path()), "done");
+}
+
+#[test]
+fn review_record_by_claude_in_gated_needs_tty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let output = command(dir.path())
+        .stdin(Stdio::null())
+        .args([
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "claude",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ])
+        .output()
+        .expect("output");
+    assert_failure(&output, "claude review requires confirmation at a TTY");
+    let pending = task_reviews(dir.path());
+    assert_eq!(pending[0].0, "codex");
+    assert_eq!(pending[0].1, None);
+    assert_eq!(pending[0].2, 0);
+
+    let recorded = data_of(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_eq!(recorded["reviewer"], json!("codex"));
+    assert_eq!(recorded["reviewer_override"], json!(false));
+}
+
+#[test]
+fn review_record_rejects_unconfigured_reviewer() {
+    let classic = tempfile::tempdir().expect("tempdir");
+    run(classic.path(), ["init"]).assert().success();
+    run(
+        classic.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(classic.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success();
+    run(
+        classic.path(),
+        ["task", "done", "auth", "--changed", "shipped"],
+    )
+    .assert()
+    .success();
+    assert_failure(
+        &record_review(classic.path(), "codex", "abc", "approved", false),
+        "review record requires workflow=gated",
+    );
+    assert!(task_reviews(classic.path()).is_empty());
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    assert_failure(
+        &record_review(dir.path(), "cursor", &head, "approved", false),
+        "unconfigured reviewer: cursor",
+    );
+    assert_failure(
+        &record_review(dir.path(), "orca", &head, "approved", false),
+        "unconfigured reviewer: orca",
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+    let recorded = data_of(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_eq!(recorded["reviewer"], json!("codex"));
+    assert_eq!(recorded["reviewer_override"], json!(false));
+}
+
+#[test]
+fn changes_requested_reopens_task() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let output = record_review(dir.path(), "codex", &head, "changes-requested", false);
+    assert!(output.status.success(), "{}", summarize(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("recorded auth changes_requested"),
+        "{stdout}"
+    );
+    assert_eq!(task_status(dir.path()), "open");
+    let context = run(dir.path(), ["context", "auth"]).assert().success();
+    let text = String::from_utf8(context.get_output().stdout.clone()).expect("utf8");
+    assert!(text.contains("reopened: changes requested"), "{text}");
+    assert_eq!(
+        task_reviews(dir.path())[0].1.as_deref(),
+        Some("changes_requested")
+    );
+    assert_failure(
+        &relay_output(dir.path(), &["report", "accept", "auth"]),
+        "no approved review at HEAD",
+    );
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["task", "claim", "auth", "--by", "cursor", "--json"],
+    );
+    assert_eq!(task_status(dir.path()), "claimed");
+}
+
+#[test]
+fn gated_accept_requires_valid_review() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = commit_gated_work(dir.path(), &fake);
+    assert_failure(
+        &relay_output(dir.path(), &["report", "accept", "auth"]),
+        "no approved review at HEAD",
+    );
+    fs::write(dir.path().join("scratch.txt"), "x\n").expect("scratch");
+    assert_failure(
+        &relay_output(dir.path(), &["report", "accept", "auth"]),
+        "working tree is not clean",
+    );
+    fs::remove_file(dir.path().join("scratch.txt")).expect("remove");
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["review", "start", "auth", "--json"],
+    );
+    let pending = data_of(dir.path(), &["context", "auth", "--json"]);
+    assert!(pending["latest_review"]["verdict"].is_null());
+    assert_eq!(pending["latest_review"]["commit_sha"], json!(head));
+    assert_failure(
+        &relay_output(dir.path(), &["report", "accept", "auth"]),
+        "no approved review at HEAD",
+    );
+    data_of(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.email=relaybook@example.com",
+            "-c",
+            "user.name=Relaybook",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "after approval",
+        ],
+    );
+    assert_failure(
+        &relay_output(dir.path(), &["report", "accept", "auth"]),
+        "no approved review at HEAD",
+    );
+    assert_eq!(task_report_verdict(dir.path()), None);
+    assert_eq!(task_status(dir.path()), "done");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    data_of(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    let view = data_of(dir.path(), &["context", "auth", "--json"]);
+    assert_eq!(view["latest_review"]["verdict"], json!("approved"));
+    assert_eq!(view["latest_review"]["reviewer"], json!("codex"));
+    assert_eq!(view["latest_review"]["commit_sha"], json!(head));
+    let (_, _, graph_sha) = report_shas(&dir.path().join(".relaybook").join("ledger.db"));
+    assert_eq!(view["graph_sha"], json!(graph_sha.as_deref()));
+    let shown = run(dir.path(), ["context", "auth"]).assert().success();
+    let shown = String::from_utf8(shown.get_output().stdout.clone()).expect("utf8");
+    assert!(
+        shown.contains(&format!("review approved by codex at {head}")),
+        "{shown}"
+    );
+    let graph_sha = graph_sha.expect("graph");
+    assert!(shown.contains(&format!("graph {graph_sha}")), "{shown}");
+    run(dir.path(), ["report", "accept", "auth"])
+        .assert()
+        .success()
+        .stdout("accepted auth\n");
+    assert_eq!(task_report_verdict(dir.path()).as_deref(), Some("accepted"));
+    assert_failure(
+        &relay_output(dir.path(), &["report", "accept", "auth"]),
+        "no unreviewed report: auth",
+    );
+    let note = data_of(
+        dir.path(),
+        &[
+            "report",
+            "note",
+            "--by",
+            "orca",
+            "--text",
+            "spans tasks",
+            "--json",
+        ],
+    );
+    let id = note["id"].as_i64().expect("id").to_string();
+    let accepted = relay_output(dir.path(), &["report", "accept", "--note", &id]);
+    assert!(accepted.status.success(), "{}", summarize(&accepted));
+    assert!(
+        String::from_utf8_lossy(&accepted.stdout).contains("accepted note"),
+        "{}",
+        summarize(&accepted)
+    );
+    assert_failure(
+        &relay_output(dir.path(), &["report", "accept", "--all"]),
+        "report accept --all is unavailable when workflow=gated",
+    );
+}
+
+#[test]
+fn gated_refuses_when_origin_branch_exists() {
+    let fake = GraphifyFake::install();
+    let allowed = tempfile::tempdir().expect("tempdir");
+    let head = prepare_gated_review(allowed.path(), &fake);
+    git(
+        allowed.path(),
+        &["update-ref", "refs/remotes/origin/other", &head],
+    );
+    let recorded = data_of(
+        allowed.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_eq!(recorded["verdict"], json!("approved"));
+
+    let blocked = tempfile::tempdir().expect("tempdir");
+    let head = prepare_gated_review(blocked.path(), &fake);
+    git(
+        blocked.path(),
+        &["update-ref", "refs/remotes/origin/main", &head],
+    );
+    assert_failure(
+        &record_review(blocked.path(), "codex", &head, "approved", false),
+        "refs/remotes/origin/main exists",
+    );
+    assert_eq!(task_reviews(blocked.path())[0].1, None);
+    git(
+        blocked.path(),
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
+    let recorded = data_of(
+        blocked.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_eq!(recorded["verdict"], json!("approved"));
+    assert_eq!(recorded["commit_sha"], json!(head));
+}
+
 #[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -2111,6 +2581,116 @@ fn install_leaves_an_existing_heading_unchanged() {
     run(dir.path(), ["install", "--claude"]).assert().success();
     assert_eq!(fs::read_to_string(&path).expect("read"), original);
     assert!(!original.contains("<!-- relaybook:start -->"));
+}
+
+fn commit_gated_work(dir: &Path, fake: &GraphifyFake) -> String {
+    seed_graph_task(dir);
+    fake_data(
+        dir,
+        fake,
+        "graph",
+        ["task", "claim", "auth", "--by", "cursor", "--json"],
+    );
+    fs::write(dir.join("work.txt"), "work\n").expect("work");
+    git(dir, &["add", "work.txt"]);
+    commit_index(dir, "do the work");
+    fake_data(
+        dir,
+        fake,
+        "graph",
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+fn prepare_gated_review(dir: &Path, fake: &GraphifyFake) -> String {
+    let head = commit_gated_work(dir, fake);
+    fake_data(dir, fake, "graph", ["review", "start", "auth", "--json"]);
+    head
+}
+
+fn record_review(dir: &Path, by: &str, sha: &str, verdict: &str, json: bool) -> Output {
+    let mut args = vec![
+        "review",
+        "record",
+        "auth",
+        "--by",
+        by,
+        "--sha",
+        sha,
+        "--verdict",
+        verdict,
+        "--text",
+        TASK_REVIEW_TEXT,
+    ];
+    if json {
+        args.push("--json");
+    }
+    relay_output(dir, &args)
+}
+
+fn relay_output(dir: &Path, args: &[&str]) -> Output {
+    command(dir).args(args).output().expect("output")
+}
+
+fn fake_output(dir: &Path, fake: &GraphifyFake, kind: &str, args: &[&str]) -> Output {
+    let mut cmd = command(dir);
+    fake.apply(&mut cmd, kind);
+    cmd.args(args).output().expect("output")
+}
+
+fn data_of(dir: &Path, args: &[&str]) -> Value {
+    let output = relay_output(dir, args);
+    assert!(output.status.success(), "{}", summarize(&output));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(envelope["ok"], json!(true), "{envelope}");
+    assert!(envelope["error"].is_null(), "{envelope}");
+    envelope["data"].clone()
+}
+
+fn assert_failure(output: &Output, message: &str) {
+    assert!(!output.status.success(), "{}", summarize(output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(message),
+        "missing {message} in {}",
+        summarize(output)
+    );
+}
+
+fn task_reviews(dir: &Path) -> Vec<(String, Option<String>, i64, String)> {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(db).expect("open");
+    let mut statement = conn
+        .prepare(
+            "SELECT reviewer, verdict, reviewer_override, commit_sha
+             FROM reviews
+             WHERE scope = 'task'
+             ORDER BY id",
+        )
+        .expect("prepare");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .expect("rows");
+    rows.map(|row| row.expect("row")).collect()
+}
+
+fn task_report_verdict(dir: &Path) -> Option<String> {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(db).expect("open");
+    conn.query_row(
+        "SELECT verdict FROM reports WHERE kind = 'task' ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .expect("verdict")
 }
 
 fn run(dir: &Path, args: impl IntoIterator<Item = &'static str>) -> Command {

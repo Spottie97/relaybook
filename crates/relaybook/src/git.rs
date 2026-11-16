@@ -31,6 +31,27 @@ pub(crate) fn dirty_paths(cwd: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// Fingerprint of the worktree at `cwd`. `git diff HEAD` plus each untracked
+/// file that git does not ignore. Paths under `.relaybook` are omitted.
+pub(crate) fn worktree_fingerprint(cwd: &Path) -> Result<String, String> {
+    let diff = git(cwd, &["diff", "HEAD", "--", ".", ":(exclude).relaybook"])?;
+    let untracked = git(cwd, &["ls-files", "--others", "--exclude-standard"])?;
+    let mut body = diff;
+    body.push('\n');
+    for path in untracked.lines() {
+        let path = git_path(path);
+        if path == ".relaybook" || path.starts_with(".relaybook/") {
+            continue;
+        }
+        body.push_str(&path);
+        body.push('\n');
+        let bytes = std::fs::read(cwd.join(&path)).unwrap_or_default();
+        body.push_str(&content_hash(&bytes));
+        body.push('\n');
+    }
+    Ok(content_hash(body.as_bytes()))
+}
+
 pub(crate) fn gated_dirty_paths(cwd: &Path) -> Result<Vec<String>, String> {
     let bytes = git_bytes(
         cwd,
@@ -120,6 +141,15 @@ fn push_outside_ledger(dirty: &mut Vec<String>, literal: &str) {
 
 fn ledger_path(literal: &str) -> bool {
     literal == ".relaybook" || literal.starts_with(".relaybook/")
+}
+
+fn content_hash(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 pub(crate) fn graphify_out_path(literal: &str) -> bool {

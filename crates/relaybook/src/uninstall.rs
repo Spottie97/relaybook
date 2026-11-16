@@ -831,7 +831,7 @@ fn active_run(root: &Path) -> Result<bool, String> {
         .is_some())
 }
 
-fn confirm(prompt: &str) -> Result<bool, String> {
+pub(crate) fn confirm(prompt: &str) -> Result<bool, String> {
     if !io::stdin().is_terminal() {
         println!("{prompt} re-run with --yes");
         return Ok(false);

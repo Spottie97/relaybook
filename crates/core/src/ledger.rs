@@ -669,12 +669,33 @@ impl Ledger {
 
     pub fn accept_report(&mut self, slug: &str) -> Result<usize, Error> {
         let slug = checked_slug(slug)?;
+        self.transaction(|conn| accept_unreviewed(conn, &slug))
+    }
+
+    /// Gated accept. The latest task review must be `approved` at `head`, and
+    /// that commit must be the latest task report's `commit_sha`.
+    /// `revalidate` runs inside the write transaction after the verdict is
+    /// stored. An error rolls the accept back.
+    pub fn accept_gated_report(
+        &mut self,
+        slug: &str,
+        head: &str,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<usize, Error> {
+        let slug = checked_slug(slug)?;
+        let head = required_text("head", head)?;
         self.transaction(|conn| {
             let task = load_task(conn, &slug)?;
-            let changed = reports::accept_task(conn, task.id, &now(conn)?)?;
-            if changed == 0 {
-                return Err(Error::NoUnreviewed(slug));
+            if !approved_task_review_at(conn, task.id, &head)? {
+                return Err(Error::InvalidSetting(
+                    "no approved review at HEAD".to_string(),
+                ));
             }
+            if task.status != Status::Done {
+                return Err(Error::NotDone);
+            }
+            let changed = accept_unreviewed(conn, &slug)?;
+            revalidate()?;
             Ok(changed)
         })
     }
@@ -1250,13 +1271,34 @@ impl Ledger {
         } else {
             None
         };
+        let (latest_review, graph_sha) = self.task_context_extras(slug.as_deref())?;
         Ok(Context {
             tasks,
             events,
             hidden_done,
             unreviewed_reports,
             latest_report,
+            latest_review,
+            graph_sha,
         })
+    }
+
+    /// Review row and report graph SHA for a single-task view.
+    fn task_context_extras(
+        &self,
+        slug: Option<&str>,
+    ) -> Result<(Option<serde_json::Value>, Option<String>), Error> {
+        let Some(slug) = slug else {
+            return Ok((None, None));
+        };
+        let latest_review = self
+            .latest_review("task", Some(slug))?
+            .map(|review| serde_json::to_value(review).map_err(|err| Error::Json(err.to_string())))
+            .transpose()?;
+        let graph_sha = self
+            .latest_task_report(slug)?
+            .and_then(|report| report.graph_sha);
+        Ok((latest_review, graph_sha))
     }
 
     fn scoped_tasks(
@@ -1622,6 +1664,47 @@ fn into_event(row: EventRow) -> Result<Event, Error> {
         ts: row.ts,
         kind: row.kind.parse()?,
         payload,
+    })
+}
+
+fn accept_unreviewed(conn: &Connection, slug: &str) -> Result<usize, Error> {
+    let task = load_task(conn, slug)?;
+    let changed = reports::accept_task(conn, task.id, &now(conn)?)?;
+    if changed == 0 {
+        return Err(Error::NoUnreviewed(slug.to_string()));
+    }
+    Ok(changed)
+}
+
+fn approved_task_review_at(conn: &Connection, task_id: i64, head: &str) -> Result<bool, Error> {
+    let report_sha: Option<String> = conn
+        .query_row(
+            "SELECT commit_sha FROM reports
+             WHERE task_id = ?1 AND kind = 'task'
+             ORDER BY id DESC
+             LIMIT 1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let review: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT commit_sha, verdict FROM reviews
+             WHERE scope = 'task' AND task_id = ?1
+             ORDER BY id DESC
+             LIMIT 1",
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(match review {
+        Some((sha, verdict)) => {
+            verdict.as_deref() == Some("approved")
+                && sha == head
+                && report_sha.as_deref() == Some(head)
+        }
+        None => false,
     })
 }
 

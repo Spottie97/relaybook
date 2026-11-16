@@ -154,6 +154,10 @@ pub struct Context {
     pub hidden_done: usize,
     pub unreviewed_reports: usize,
     pub latest_report: Option<serde_json::Value>,
+    /// Latest task review when the view is for one slug. Pending reviews are included.
+    pub latest_review: Option<serde_json::Value>,
+    /// `reports.graph_sha` for that slug.
+    pub graph_sha: Option<String>,
 }
 
 pub(crate) fn checked_slug(slug: &str) -> Result<String, Error> {
