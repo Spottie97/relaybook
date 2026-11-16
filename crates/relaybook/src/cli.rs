@@ -103,6 +103,12 @@ enum Command {
     Report(ReportCmd),
     /// List unreviewed reports.
     Inbox,
+    /// Refresh the graph and record the commit it was built from.
+    #[command(subcommand)]
+    Graph(GraphCmd),
+    /// Build the handoff for a done task.
+    #[command(subcommand)]
+    Review(ReviewCmd),
     /// Print or set manual/auto mode.
     Mode {
         /// `manual` or `auto`. Omit to print the current mode.
@@ -295,6 +301,25 @@ enum TaskCmd {
         #[arg(long, allow_hyphen_values = true)]
         title: String,
     },
+}
+
+#[derive(Subcommand)]
+enum GraphCmd {
+    /// Run `graphify update .` and record the commit the graph was built from.
+    Refresh {
+        /// `plan`, `implement`, `commit`, `review`, or `release-review`.
+        #[arg(long)]
+        step: String,
+        /// Task slug for `implement`, `commit`, and `review`.
+        #[arg(long)]
+        task: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReviewCmd {
+    /// Hand off one done task, including capped Graphify context.
+    Start { slug: String },
 }
 
 #[derive(Subcommand)]
@@ -548,6 +573,10 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         }
         Command::Report(ReportCmd::Note { by, text }) => add_note(&cwd, &by, text),
         Command::Inbox => show_inbox(&cwd),
+        Command::Graph(GraphCmd::Refresh { step, task }) => {
+            refresh_graph_cmd(&cwd, &step, task.as_deref())
+        }
+        Command::Review(ReviewCmd::Start { slug }) => review_start(&cwd, &slug),
         Command::Mode { value } => match value {
             Some(value) => set_mode(&cwd, &value),
             None => choose_setting(&cwd, "mode", picker::MODES, set_mode, show_mode),
@@ -762,7 +791,8 @@ fn list_tasks(cwd: &Path, status: Option<Status>, ready: bool, all: bool) -> Res
 
 fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let task = if ledger.settings()?.workflow == "gated" {
+    let gated = ledger.settings()?.workflow == "gated";
+    let task = if gated {
         require_gated_clean_tree(cwd, &ledger)?;
         ledger.claim_task_with(slug, by, || ensure_gated_clean(cwd))?
     } else {
@@ -770,7 +800,28 @@ fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
     };
     let agent = task.claimed_by.clone().unwrap_or_default();
     let human = render::line(&format!("claimed {} by {agent}", task.slug));
-    json_outcome(task_ack(&task), human)
+    let mut data = task_ack(&task);
+    if gated {
+        let refresh = if gitinfo::verified_head(cwd).is_some() {
+            record_graph_refresh(&mut ledger, cwd, "implement", Some(task.slug.as_str()))?
+        } else {
+            GraphRefresh {
+                commit_sha: String::new(),
+                graph_sha: None,
+                status: "failed".to_string(),
+                detail: Some(crate::graphify::NO_GRAPH.to_string()),
+            }
+        };
+        if let Some(fields) = data.as_object_mut() {
+            let base = if refresh.commit_sha.is_empty() {
+                None
+            } else {
+                Some(refresh.commit_sha.clone())
+            };
+            attach_graph_fields(fields, base, &refresh);
+        }
+    }
+    json_outcome(data, human)
 }
 
 fn report_sections(
@@ -813,17 +864,35 @@ fn complete_task(
     sections: Option<relaybook_core::Sections>,
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let task = if ledger.settings()?.workflow == "gated" {
+    let gated = ledger.settings()?.workflow == "gated";
+    let already_done = gated && task_is_done(&ledger, slug)?;
+    let task = if gated {
         require_gated_clean_tree(cwd, &ledger)?;
         let head = gitinfo::verified_head(cwd).ok_or(Error::NoHeadCommit)?;
         let expected = head.clone();
-        ledger.finish_task_with(slug, sections, Some(head.as_str()), move || {
-            recheck_gated_completion(cwd, &expected)
-        })?
+        if already_done {
+            ledger.finish_task_with(slug, sections, Some(head.as_str()), move || {
+                recheck_gated_completion(cwd, &expected)
+            })?
+        } else {
+            let (base, graph) = implement_anchor(&ledger, slug)?;
+            ledger.finish_task_anchored(
+                slug,
+                sections,
+                Some(head.as_str()),
+                base.as_deref(),
+                graph.as_deref(),
+                move || recheck_gated_completion(cwd, &expected),
+            )?
+        }
     } else {
         let head = gitinfo::head(cwd);
         ledger.finish_task(slug, sections, head.as_deref())?
     };
+    // The report row, including commit_sha, is committed before this refresh.
+    if gated && !already_done {
+        record_graph_refresh(&mut ledger, cwd, "commit", Some(task.slug.as_str()))?;
+    }
     let stored = ledger.report_commit_sha(&task.slug)?;
     let human = render::line(&format!("done {}", task.slug));
     let mut data = task_ack(&task);
@@ -832,6 +901,15 @@ fn complete_task(
             "commit_sha".to_string(),
             stored.map_or(serde_json::Value::Null, serde_json::Value::String),
         );
+        if gated {
+            let report = ledger.latest_task_report(&task.slug)?;
+            let (base, graph) = match report {
+                Some(report) => (report.base_sha, report.graph_sha),
+                None => (None, None),
+            };
+            fields.insert("base_sha".to_string(), json_string(base));
+            fields.insert("graph_sha".to_string(), json_string(graph));
+        }
     }
     json_outcome(data, human)
 }
@@ -860,6 +938,241 @@ fn recheck_gated_completion(cwd: &Path, expected: &str) -> Result<(), Error> {
         Some(_) => Err(Error::StaleHead),
         None => Err(Error::NoHeadCommit),
     }
+}
+
+struct GraphRefresh {
+    commit_sha: String,
+    graph_sha: Option<String>,
+    status: String,
+    detail: Option<String>,
+}
+
+fn refresh_graph_cmd(cwd: &Path, step: &str, task: Option<&str>) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let refresh = record_graph_refresh(&mut ledger, cwd, step, task)?;
+    let human = if refresh.graph_sha.is_some() {
+        render::line(&format!("graph {step} built {}", refresh.commit_sha))
+    } else {
+        render::line(&format!(
+            "graph {step} {}: {}",
+            refresh.status,
+            refresh
+                .detail
+                .as_deref()
+                .unwrap_or(crate::graphify::NO_GRAPH)
+        ))
+    };
+    json_outcome(graph_json(step, task, &refresh), human)
+}
+
+fn review_start(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    if ledger.settings()?.workflow != "gated" {
+        return Err(
+            Error::InvalidSetting("review start requires workflow=gated".to_string()).into(),
+        );
+    }
+    require_gated_clean_tree(cwd, &ledger)?;
+    let report = ledger.latest_task_report(slug)?.ok_or(Error::NotDone)?;
+    if !task_is_done(&ledger, slug)? {
+        return Err(Error::NotDone.into());
+    }
+    let Some(commit_sha) = report.commit_sha.clone() else {
+        return Err(Error::InvalidSetting("task report has no commit".to_string()).into());
+    };
+    let refresh = record_graph_refresh(&mut ledger, cwd, "review", Some(slug))?;
+    let graph_context = match report.base_sha.as_deref() {
+        Some(base) if crate::graphify::installed() => {
+            crate::graphify::graph_context(cwd, base, &commit_sha)
+        }
+        _ => crate::graphify::NO_GRAPH.to_string(),
+    };
+    let body =
+        serde_json::from_str::<serde_json::Value>(&report.body).unwrap_or(serde_json::Value::Null);
+    let range = report
+        .base_sha
+        .as_ref()
+        .map(|base| format!("{base}..{commit_sha}"));
+    let data = serde_json::json!({
+        "slug": slug,
+        "base_sha": report.base_sha,
+        "commit_sha": commit_sha,
+        "range": range,
+        "graph_sha": refresh.graph_sha,
+        "graph_status": refresh.status,
+        "detail": refresh.detail,
+        "report": body,
+        "graph_context": graph_context,
+    });
+    json_outcome(data, render::line(&format!("review start {slug}")))
+}
+
+fn record_graph_refresh(
+    ledger: &mut Ledger,
+    cwd: &Path,
+    step: &str,
+    task: Option<&str>,
+) -> Result<GraphRefresh, Fail> {
+    if ledger.settings()?.workflow != "gated" {
+        return Err(
+            Error::InvalidSetting("graph refresh requires workflow=gated".to_string()).into(),
+        );
+    }
+    let task = paired_graph_task(step, task)?;
+    let head = gitinfo::verified_head(cwd).ok_or_else(|| {
+        Fail::Core(Error::InvalidSetting(
+            "graph refresh requires a commit at HEAD".to_string(),
+        ))
+    })?;
+    let (status, detail, graph_sha) = match decide_graph_refresh(cwd, &head)? {
+        GraphOutcome::Skipped => ("skipped", Some(crate::graphify::NO_GRAPH.to_string()), None),
+        GraphOutcome::Failed(reason) => ("failed", Some(reason), None),
+        GraphOutcome::Built => ("built", None, Some(head.clone())),
+    };
+    ledger.record_graph_build(step, task, env_run_id(), &head, status, detail.as_deref())?;
+    Ok(GraphRefresh {
+        commit_sha: head,
+        graph_sha,
+        status: status.to_string(),
+        detail,
+    })
+}
+
+enum GraphOutcome {
+    Skipped,
+    Failed(String),
+    Built,
+}
+
+fn decide_graph_refresh(cwd: &Path, head: &str) -> Result<GraphOutcome, Fail> {
+    if !crate::graphify::installed() {
+        return Ok(GraphOutcome::Skipped);
+    }
+    if let Some(paths) = graph_dirty(cwd)? {
+        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(&format!(
+            "working tree is not clean: {}",
+            paths.join(", ")
+        ))));
+    }
+    if crate::git::graphify_out_tracked(cwd).map_err(invalid_setting)? {
+        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
+            "graphify-out/ is tracked",
+        )));
+    }
+    if !crate::git::graphify_out_ignored(cwd).map_err(invalid_setting)? {
+        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
+            "graphify-out/ is not gitignored",
+        )));
+    }
+    let updated = crate::graphify::run_full(cwd, &["update", "."]);
+    if !updated.ok {
+        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
+            &updated.detail,
+        )));
+    }
+    if !cwd.join("graphify-out").join("graph.json").is_file() {
+        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
+            "graphify-out/graph.json is missing",
+        )));
+    }
+    if let Some(paths) = graph_dirty(cwd)? {
+        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(&format!(
+            "working tree is not clean: {}",
+            paths.join(", ")
+        ))));
+    }
+    if gitinfo::verified_head(cwd).as_deref() != Some(head) {
+        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
+            "HEAD changed during graph refresh",
+        )));
+    }
+    Ok(GraphOutcome::Built)
+}
+
+fn graph_dirty(cwd: &Path) -> Result<Option<Vec<String>>, Fail> {
+    let paths = crate::git::gated_dirty_paths(cwd).map_err(invalid_setting)?;
+    let paths: Vec<String> = paths
+        .into_iter()
+        .filter(|path| !crate::git::graphify_out_path(path))
+        .collect();
+    if paths.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(paths))
+    }
+}
+
+fn paired_graph_task<'a>(step: &str, task: Option<&'a str>) -> Result<Option<&'a str>, Fail> {
+    match step.trim() {
+        "plan" | "release-review" => {
+            if task.is_some() {
+                Err(invalid_setting("this graph step has no task"))
+            } else {
+                Ok(None)
+            }
+        }
+        "implement" | "commit" | "review" => task
+            .map(Some)
+            .ok_or_else(|| invalid_setting("task is required for this graph step")),
+        other => Err(invalid_setting(format!("invalid graph step: {other}"))),
+    }
+}
+
+fn implement_anchor(ledger: &Ledger, slug: &str) -> Result<(Option<String>, Option<String>), Fail> {
+    let Some(build) = ledger.latest_graph_build("implement", Some(slug))? else {
+        return Ok((None, None));
+    };
+    let graph = (build.status == "built").then(|| build.commit_sha.clone());
+    Ok((Some(build.commit_sha), graph))
+}
+
+fn task_is_done(ledger: &Ledger, slug: &str) -> Result<bool, Fail> {
+    Ok(ledger
+        .list_tasks(Some(Status::Done), false, true)?
+        .iter()
+        .any(|task| task.slug == slug))
+}
+
+fn env_run_id() -> Option<i64> {
+    std::env::var("RELAYBOOK_RUN_ID")
+        .ok()
+        .and_then(|value| value.parse().ok())
+}
+
+fn invalid_setting(message: impl Into<String>) -> Fail {
+    Fail::Core(Error::InvalidSetting(message.into()))
+}
+
+fn graph_json(step: &str, task: Option<&str>, refresh: &GraphRefresh) -> serde_json::Value {
+    serde_json::json!({
+        "step": step,
+        "task": task,
+        "commit_sha": refresh.commit_sha,
+        "graph_sha": refresh.graph_sha,
+        "status": refresh.status,
+        "detail": refresh.detail,
+    })
+}
+
+fn attach_graph_fields(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    base_sha: Option<String>,
+    refresh: &GraphRefresh,
+) {
+    fields.insert("base_sha".to_string(), json_string(base_sha));
+    fields.insert(
+        "graph_sha".to_string(),
+        json_string(refresh.graph_sha.clone()),
+    );
+    fields.insert(
+        "graph_status".to_string(),
+        serde_json::Value::String(refresh.status.clone()),
+    );
+    fields.insert("detail".to_string(), json_string(refresh.detail.clone()));
+}
+
+fn json_string(value: Option<String>) -> serde_json::Value {
+    value.map_or(serde_json::Value::Null, serde_json::Value::String)
 }
 
 fn reopen_task(cwd: &Path, slug: &str, reason: &str) -> Result<Outcome, Fail> {

@@ -122,6 +122,34 @@ fn ledger_path(literal: &str) -> bool {
     literal == ".relaybook" || literal.starts_with(".relaybook/")
 }
 
+pub(crate) fn graphify_out_path(literal: &str) -> bool {
+    literal == "graphify-out" || literal.starts_with("graphify-out/")
+}
+
+pub(crate) fn graphify_out_tracked(cwd: &Path) -> Result<bool, String> {
+    let text = git(cwd, &["ls-files", "--", "graphify-out"])?;
+    Ok(!text.is_empty())
+}
+
+/// True when gitignore (or exclude) would ignore `graphify-out/graph.json`.
+/// Exit 1 means the path is not ignored. Any other failure is an error.
+pub(crate) fn graphify_out_ignored(cwd: &Path) -> Result<bool, String> {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["check-ignore", "-q", "--", "graphify-out/graph.json"])
+        .output()
+        .map_err(|err| err.to_string())?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        Some(code) => Err(format!(
+            "git check-ignore failed: {code} {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        None => Err("git check-ignore failed".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_porcelain_z;

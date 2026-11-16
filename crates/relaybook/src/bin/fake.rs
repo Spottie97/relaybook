@@ -50,10 +50,37 @@ fn graphify(args: &[String]) {
     if let Ok(log) = env::var("GRAPHIFY_LOG") {
         append(&log, &args.join(" "));
     }
+    match env::var("RELAYBOOK_FAKE_GRAPHIFY").ok().as_deref() {
+        Some("graph") => {
+            if args.first().map(String::as_str) == Some("update") {
+                write_graph();
+            }
+            return;
+        }
+        Some("affected-large") => {
+            if args.first().map(String::as_str) == Some("update") {
+                write_graph();
+            }
+            if args.first().map(String::as_str) == Some("affected") {
+                print!("{}", "a".repeat(5000));
+            }
+            return;
+        }
+        Some("fail") => {
+            eprintln!("boom");
+            std::process::exit(1);
+        }
+        _ => {}
+    }
     eprintln!("boom");
     if sibling_fail() {
         std::process::exit(1);
     }
+}
+
+fn write_graph() {
+    let _ = fs::create_dir_all("graphify-out");
+    let _ = fs::write("graphify-out/graph.json", "{}\n");
 }
 
 fn rtk(args: &[String]) {

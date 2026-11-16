@@ -45,6 +45,7 @@ pub fn note_body(text: &str) -> Result<String, Error> {
     Ok(body)
 }
 
+#[allow(clippy::too_many_arguments)] // commit, base, and graph SHAs are separate nullable columns
 pub fn insert(
     conn: &Connection,
     task_id: Option<i64>,
@@ -53,11 +54,13 @@ pub fn insert(
     body: &str,
     created_at: &str,
     commit_sha: Option<&str>,
+    base_sha: Option<&str>,
+    graph_sha: Option<&str>,
 ) -> Result<i64, Error> {
     conn.execute(
         "INSERT INTO reports (
-            task_id, kind, author, body, bytes, created_at, commit_sha
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            task_id, kind, author, body, bytes, created_at, commit_sha, base_sha, graph_sha
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             task_id,
             kind,
@@ -65,7 +68,9 @@ pub fn insert(
             body,
             body.len() as i64,
             created_at,
-            commit_sha
+            commit_sha,
+            base_sha,
+            graph_sha
         ],
     )?;
     Ok(conn.last_insert_rowid())

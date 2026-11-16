@@ -54,6 +54,15 @@ pub struct Review {
     pub recorded_at: Option<String>,
 }
 
+/// Latest task report, including the SHAs stored at completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskReport {
+    pub body: String,
+    pub commit_sha: Option<String>,
+    pub base_sha: Option<String>,
+    pub graph_sha: Option<String>,
+}
+
 /// One row of `graph_builds`. `step` is `plan`, `implement`, `commit`,
 /// `review`, or `release-review`. When `status` is `built`, `commit_sha` is
 /// the graph SHA.
@@ -286,12 +295,27 @@ impl Ledger {
     /// Same as [`Self::finish_task`]. `revalidate` runs inside this write
     /// transaction after the report insert and before commit. An error rolls
     /// the completion back, including a HEAD or cleanliness check that failed
-    /// after the lock wait.
+    /// after the lock wait. `base_sha` and `graph_sha` stay null.
     pub fn finish_task_with(
         &mut self,
         slug: &str,
         sections: Option<Sections>,
         commit_sha: Option<&str>,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<Task, Error> {
+        self.finish_task_anchored(slug, sections, commit_sha, None, None, revalidate)
+    }
+
+    /// Same as [`Self::finish_task_with`], and stores the gated claim's
+    /// `base_sha` and `graph_sha` on that report. A task that is already done
+    /// keeps the first report unchanged.
+    pub fn finish_task_anchored(
+        &mut self,
+        slug: &str,
+        sections: Option<Sections>,
+        commit_sha: Option<&str>,
+        base_sha: Option<&str>,
+        graph_sha: Option<&str>,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Task, Error> {
         let slug = checked_slug(slug)?;
@@ -322,7 +346,17 @@ impl Ledger {
                 .claimed_by
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
-            reports::insert(conn, Some(task.id), "task", &author, &body, &ts, commit_sha)?;
+            reports::insert(
+                conn,
+                Some(task.id),
+                "task",
+                &author,
+                &body,
+                &ts,
+                commit_sha,
+                base_sha,
+                graph_sha,
+            )?;
             let task = load_task(conn, &slug)?;
             revalidate()?;
             Ok(task)
@@ -346,6 +380,32 @@ impl Ledger {
             .optional()?
             .flatten();
         Ok(sha)
+    }
+
+    /// Latest `kind = 'task'` report for this slug, if one was stored.
+    pub fn latest_task_report(&self, slug: &str) -> Result<Option<TaskReport>, Error> {
+        let slug = checked_slug(slug)?;
+        let task = load_task(&self.conn, &slug)?;
+        let report = self
+            .conn
+            .query_row(
+                "SELECT body, commit_sha, base_sha, graph_sha
+                 FROM reports
+                 WHERE task_id = ?1 AND kind = 'task'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![task.id],
+                |row| {
+                    Ok(TaskReport {
+                        body: row.get(0)?,
+                        commit_sha: row.get(1)?,
+                        base_sha: row.get(2)?,
+                        graph_sha: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(report)
     }
 
     pub fn inbox(&self) -> Result<Vec<reports::InboxItem>, Error> {
@@ -703,6 +763,40 @@ impl Ledger {
         })
     }
 
+    /// Latest `graph_builds` row for this step. `task` is null for `plan` and
+    /// `release-review`.
+    pub fn latest_graph_build(
+        &self,
+        step: &str,
+        task: Option<&str>,
+    ) -> Result<Option<GraphBuild>, Error> {
+        let step = graph_step(step)?;
+        let task = match task {
+            Some(slug) => Some(checked_slug(slug)?),
+            None => None,
+        };
+        let task_id = match &task {
+            Some(slug) => Some(load_task(&self.conn, slug)?.id),
+            None => None,
+        };
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM graph_builds
+                 WHERE step = ?1
+                   AND ((?2 IS NULL AND task_id IS NULL) OR task_id = ?2)
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![step, task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => Ok(Some(load_graph_build(&self.conn, id)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Record sign-off. `sha` must equal `head`, and the latest release review
     /// at that commit must be approved. TTY confirmation stays with the CLI.
     pub fn authorize_release(
@@ -754,7 +848,7 @@ impl Ledger {
         let body = reports::note_body(&text)?;
         self.transaction(|conn| {
             let ts = now(conn)?;
-            reports::insert(conn, None, "note", &author, &body, &ts, None)
+            reports::insert(conn, None, "note", &author, &body, &ts, None, None, None)
         })
     }
 
