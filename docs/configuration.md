@@ -25,6 +25,8 @@ relaybook setup --ci
 
 Local hooks are the default. `graphify hook install` refreshes the graph after a commit and a checkout. `relaybook setup` adds post-merge and post-rewrite hooks that run `graphify update .` in the background, so `git pull` and `git pull --rebase` return immediately. `relaybook setup --no-hooks` leaves those hooks out.
 
+Relaybook does not check whether `graphify-out/graph.json` exists, whether it is current, or which Graphify version built it, and it does not record which commit the graph was built from. The auto runner never calls Graphify. Relaybook runs Graphify only from `relaybook setup`, `relaybook uninstall --graphify`, and the post-merge and post-rewrite hooks. Relaybook never runs `graphify extract`; only the opt-in workflow below does. The Graphify section of `CLAUDE.md` mentions `graphify-out/wiki/index.md`. That file exists only after `graphify export wiki`, which neither `graphify update` nor Relaybook runs. A planned workflow refreshes the graph before every agent step and records the graph's commit in each handoff. It is not built yet. See [orca-workflow.md](orca-workflow.md).
+
 `relaybook setup --ci` is the opt-in GitHub Actions path for teams that want the graph committed. Pushes that only change `graphify-out/` do not start another run. Delete `.github/workflows/graphify-update.yml` to turn that job off.
 
 The workflow opens a pull request, which needs Settings > Actions > General > Allow GitHub Actions to create and approve pull requests. A pull request opened with `GITHUB_TOKEN` does not trigger other workflows, so required checks will not run on `graphify/update`. Set the `GRAPHIFY_PR_TOKEN` secret to a fine-grained PAT or GitHub App token with contents and pull-requests write when those checks must run. Without that secret the workflow uses `GITHUB_TOKEN`.
@@ -79,6 +81,8 @@ curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh
 
 `--yes` also runs `rtk init -g` without the y/N prompt. Without a terminal and without `--yes`, the installer prints `rtk init -g` instead of editing `~/.claude/settings.json`. `relaybook setup` never installs RTK and never edits that global file. The pull hooks run `graphify update .` in the background and print nothing. Graphify's editor hook does not rewrite `relaybook` commands.
 
+Setup was last checked by hand against Graphify 0.9.111. The automated tests use a stand-in `graphify`, not the real one. The hooks that setup guards call `graphify hook-guard`, which `graphify --help` does not list, so a Graphify release can change it without notice. `graphify claude install` rewrites the Graphify section of `CLAUDE.md`, and its wording changes between Graphify versions, so running `relaybook setup` again after upgrading Graphify can leave `CLAUDE.md` modified.
+
 `scripts/measure-context.sh --check` fails when fixture context exceeds 4000 bytes, a write acknowledgement exceeds 120 bytes, or an instruction block exceeds 1000 bytes. Role prompts stay under 1200 bytes. Slash commands stay under 1500 bytes. `relaybook guide` stays under 4000 bytes per role.
 
 ## Uninstall
@@ -97,7 +101,7 @@ relaybook uninstall --yes --graphify
 | `--dry-run` | Show what would change. Write nothing |
 | `--yes` | Apply without asking |
 | `--purge` | Also delete `.relaybook/` and `graphify-out/`. Asks `y/N` unless `--yes` is set |
-| `--graphify` | Also run `graphify claude uninstall`, `graphify cursor uninstall`, and `graphify hook uninstall` |
+| `--graphify` | Also run `graphify claude uninstall`, `graphify cursor uninstall`, and `graphify hook uninstall`. Graphify's uninstall deletes `.cursor/rules/graphify.mdc`, removes `graphify-out/graph.json merge=graphify` from `.gitattributes`, and unsets `merge.graphify.*`. Relaybook ignores their exit codes. `--dry-run` lists the three commands but not these effects |
 
 What it removes, and only inside Relaybook's markers or the setup manifest:
 

@@ -1,6 +1,6 @@
 # Auto mode
 
-Manual mode is the default. Auto mode spends plan usage: Claude plans and reviews, and Cursor implements, one task at a time, on a branch. Main changes only when you merge the pull request.
+Manual mode is the default. Auto mode spends plan usage: Claude plans and reviews, and Cursor implements, one task at a time, on a branch. Main changes only when you merge the pull request, but the run branch is pushed to `origin` before that. See [Pushes and the pull request](#pushes-and-the-pull-request).
 
 Sign in to Claude Code and the Cursor CLI once. The CLI command is `cursor-agent`, or `agent` on Windows. Install it there from PowerShell with `irm 'https://cursor.com/install?win32=true' | iex`. Auto mode runs natively on Windows, and a WSL shell can use the Linux release instead. Then:
 
@@ -57,15 +57,27 @@ relaybook run --quiet docs/prd.md
 
 `relaybook run watch` prints the log so far and follows it until the run leaves `active`. A checkpoint prints `checkpoint: waiting for approval`. A usage limit prints `paused:`. A stop prints `halted:`. A finished run prints `finished`. `relaybook status` includes the latest live lines while a run is active, waiting, or paused.
 
-Stop at the next safe boundary with `relaybook mode manual`. A stopped or paused run continues with `relaybook run --resume`. `relaybook run stop` ends it. `relaybook run complete` marks the PRD covered, and the loop opens the pull request when nothing is still open. `relaybook status` shows the mode, the call count, and whether the run is waiting on approval or a usage limit.
+Stop at the next safe boundary with `relaybook mode manual`. A stopped or paused run continues with `relaybook run --resume`. `relaybook run stop` ends it. `relaybook run complete` marks the PRD covered, and the loop pushes the branch and opens the pull request when nothing is still open. `relaybook status` shows the mode, the call count, and whether the run is waiting on approval or a usage limit.
 
 ## Limits
 
 The primary limits are cycles (20), agent calls (60), reopens per task (2), and the Cursor timeout (30 minutes). Override them on a run with `--max-cycles`, `--max-agent-calls`, `--max-reopens`, and `--cursor-timeout-min`. `est_cost_cap_usd` is optional. Set the stored defaults with `relaybook config set`. See [configuration.md](configuration.md).
 
-Cursor runs with `--force` on the run branch only. Relaybook checks git before and after every agent call. A push to main, a tag, a branch switch, or a code edit by Claude stops the run. Transcripts are in `.relaybook/runs/` and are gitignored.
+Cursor runs with `--force` on the run branch only. Relaybook checks git before and after every agent call. A push to main, a push of the run branch by an agent, a tag, a branch switch, or a code edit by Claude stops the run. Transcripts are in `.relaybook/runs/` and are gitignored.
 
 A usage limit pauses the run. It does not count as a failure. Resume with `relaybook run --resume` after the limit resets. Two consecutive failures, a blocked task, or a reopen past `max_reopens_per_task` stops the run.
+
+## Pushes and the pull request
+
+When the repository has an `origin` remote, the run pushes its branch with `git push -u origin HEAD:<branch>`:
+
+- after each review that accepts a task,
+- whenever the run halts, for example at a limit, on a blocked task, or at a guardrail,
+- before it opens the pull request.
+
+When no run task is unfinished, the run pushes and runs `gh pr create --base main` without asking. Checkpoints pause after planning and after reviews only. There is no checkpoint before a push or the pull request. Without an `origin` remote nothing is pushed, but `gh pr create` still runs. Relaybook never merges and never creates a tag.
+
+The planned Orca workflow publishes nothing before sign-off, so it does not use `relaybook run`. See [orca-workflow.md](orca-workflow.md).
 
 ## PRD template
 

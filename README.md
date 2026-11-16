@@ -156,6 +156,7 @@ Graphify answers where the code lives. RTK compacts command output. Relaybook co
 - [Commands](docs/commands.md)
 - [Configuration](docs/configuration.md)
 - [Auto mode](docs/auto-mode.md)
+- [Orca workflow (planned)](docs/orca-workflow.md)
 - [Ledger](docs/ledger.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
