@@ -595,6 +595,45 @@ fn finish_task_revalidate_holds_the_write_lock_and_rolls_back() {
     assert_eq!(reports, 0);
 }
 
+#[test]
+fn claim_task_revalidate_holds_the_write_lock_and_rolls_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.create_task("auth", "Add auth").expect("create");
+
+    let db = path.clone();
+    let err = ledger
+        .claim_task_with("auth", "cursor", move || {
+            let conn = rusqlite::Connection::open(&db).expect("open");
+            conn.busy_timeout(std::time::Duration::from_millis(0))
+                .expect("busy");
+            match conn.execute_batch("BEGIN IMMEDIATE") {
+                Err(rusqlite::Error::SqliteFailure(ffi, _))
+                    if ffi.code == rusqlite::ErrorCode::DatabaseBusy =>
+                {
+                    Err(relaybook_core::Error::DirtyWorktree("race.txt".to_string()))
+                }
+                Err(err) => panic!("unexpected lock error: {err}"),
+                Ok(()) => panic!("revalidate ran without the write lock"),
+            }
+        })
+        .expect_err("rolled back");
+    assert_eq!(err.to_string(), "working tree is not clean: race.txt");
+    let task = ledger.context(Some("auth"), 20).expect("context");
+    assert_eq!(task.tasks[0].task.status, Status::Open);
+    assert_eq!(task.tasks[0].task.claimed_by, None);
+    let conn = rusqlite::Connection::open(&path).expect("open");
+    let claimed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE kind = 'claimed'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("events");
+    assert_eq!(claimed, 0);
+}
+
 fn spawn_claim(
     path: PathBuf,
     by: &'static str,

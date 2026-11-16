@@ -201,6 +201,19 @@ impl Ledger {
     }
 
     pub fn claim_task(&mut self, slug: &str, by: &str) -> Result<Task, Error> {
+        self.claim_task_with(slug, by, || Ok(()))
+    }
+
+    /// Same as [`Self::claim_task`]. `revalidate` runs inside this write
+    /// transaction after the claim is recorded and before commit. An error
+    /// rolls the claim back, including a cleanliness check that failed after
+    /// the lock wait.
+    pub fn claim_task_with(
+        &mut self,
+        slug: &str,
+        by: &str,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<Task, Error> {
         let slug = checked_slug(slug)?;
         let by = required_text("by", by)?;
         self.transaction(|conn| {
@@ -226,7 +239,9 @@ impl Ledger {
                 EventKind::Claimed,
                 serde_json::json!({ "slug": slug, "by": by }),
             )?;
-            load_task(conn, &slug)
+            let task = load_task(conn, &slug)?;
+            revalidate()?;
+            Ok(task)
         })
     }
 

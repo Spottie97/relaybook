@@ -762,8 +762,12 @@ fn list_tasks(cwd: &Path, status: Option<Status>, ready: bool, all: bool) -> Res
 
 fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    require_gated_clean_tree(cwd, &ledger)?;
-    let task = ledger.claim_task(slug, by)?;
+    let task = if ledger.settings()?.workflow == "gated" {
+        require_gated_clean_tree(cwd, &ledger)?;
+        ledger.claim_task_with(slug, by, || ensure_gated_clean(cwd))?
+    } else {
+        ledger.claim_task(slug, by)?
+    };
     let agent = task.claimed_by.clone().unwrap_or_default();
     let human = render::line(&format!("claimed {} by {agent}", task.slug));
     json_outcome(task_ack(&task), human)
@@ -836,19 +840,21 @@ fn require_gated_clean_tree(cwd: &Path, ledger: &Ledger) -> Result<(), Fail> {
     if ledger.settings()?.workflow != "gated" {
         return Ok(());
     }
+    ensure_gated_clean(cwd)?;
+    Ok(())
+}
+
+fn ensure_gated_clean(cwd: &Path) -> Result<(), Error> {
     let paths = crate::git::gated_dirty_paths(cwd).map_err(Error::DirtyWorktree)?;
     if paths.is_empty() {
         Ok(())
     } else {
-        Err(Error::DirtyWorktree(paths.join(", ")).into())
+        Err(Error::DirtyWorktree(paths.join(", ")))
     }
 }
 
 fn recheck_gated_completion(cwd: &Path, expected: &str) -> Result<(), Error> {
-    let paths = crate::git::gated_dirty_paths(cwd).map_err(Error::DirtyWorktree)?;
-    if !paths.is_empty() {
-        return Err(Error::DirtyWorktree(paths.join(", ")));
-    }
+    ensure_gated_clean(cwd)?;
     match gitinfo::verified_head(cwd).as_deref() {
         Some(sha) if sha == expected => Ok(()),
         Some(_) => Err(Error::StaleHead),

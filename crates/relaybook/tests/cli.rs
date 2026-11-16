@@ -1,6 +1,8 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1474,9 +1476,13 @@ fn gated_done_rechecks_inside_the_write_lock() {
         .assert()
         .success();
 
-    let dirty = done_during_lock(dir.path(), || {
-        fs::write(dir.path().join("race.txt"), "race\n").expect("race");
-    });
+    let dirty = during_write_lock(
+        dir.path(),
+        &["task", "done", "auth", "--changed", "shipped"],
+        || {
+            fs::write(dir.path().join("race.txt"), "race\n").expect("race");
+        },
+    );
     assert_eq!(dirty.status.code(), Some(1), "{}", summarize(&dirty));
     let stderr = String::from_utf8_lossy(&dirty.stderr);
     assert!(
@@ -1487,23 +1493,27 @@ fn gated_done_rechecks_inside_the_write_lock() {
     assert_eq!(report_count(dir.path()), 0);
     fs::remove_file(dir.path().join("race.txt")).expect("clean");
 
-    let moved = done_during_lock(dir.path(), || {
-        git(
-            dir.path(),
-            &[
-                "-c",
-                "user.email=relaybook@example.com",
-                "-c",
-                "user.name=Relaybook",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "move",
-            ],
-        );
-    });
+    let moved = during_write_lock(
+        dir.path(),
+        &["task", "done", "auth", "--changed", "shipped"],
+        || {
+            git(
+                dir.path(),
+                &[
+                    "-c",
+                    "user.email=relaybook@example.com",
+                    "-c",
+                    "user.name=Relaybook",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "move",
+                ],
+            );
+        },
+    );
     assert_eq!(moved.status.code(), Some(1), "{}", summarize(&moved));
     let stderr = String::from_utf8_lossy(&moved.stderr);
     assert!(
@@ -1518,6 +1528,103 @@ fn gated_done_rechecks_inside_the_write_lock() {
         ["task", "done", "auth", "--changed", "shipped", "--json"],
     );
     let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(done["commit_sha"], json!(head));
+}
+
+#[test]
+fn gated_claim_rechecks_inside_the_write_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_gated_task(dir.path());
+
+    let dirty = during_write_lock(
+        dir.path(),
+        &["task", "claim", "auth", "--by", "cursor"],
+        || {
+            fs::write(dir.path().join("race.txt"), "race\n").expect("race");
+        },
+    );
+    assert_eq!(dirty.status.code(), Some(1), "{}", summarize(&dirty));
+    let stderr = String::from_utf8_lossy(&dirty.stderr);
+    assert!(
+        stderr.contains("working tree is not clean: race.txt"),
+        "{stderr}"
+    );
+    assert_eq!(task_status(dir.path()), "open");
+    fs::remove_file(dir.path().join("race.txt")).expect("clean");
+
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success()
+        .stdout("claimed auth by cursor\n");
+}
+
+/// A backslash is a legal filename on Unix. Git `-z` keeps it, and folding it
+/// to `/` would hide `.relaybook\payload.rs` inside the ledger exclusion.
+#[cfg(unix)]
+#[test]
+fn gated_claim_and_done_reject_unix_backslash_filenames() {
+    const PAYLOAD: &str = ".relaybook\\payload.rs";
+    const EXTRA: &str = ".relaybook\\extra.rs";
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_gated_task(dir.path());
+    git(dir.path(), &["config", "core.protectNTFS", "false"]);
+    git(dir.path(), &["config", "core.protectHFS", "false"]);
+
+    let refuse = |args: &[&'static str], detail: &str| {
+        run(dir.path(), args.iter().copied())
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains(format!(
+                "working tree is not clean: {detail}"
+            )));
+    };
+
+    fs::write(dir.path().join(PAYLOAD), "untracked\n").expect("untracked");
+    assert_git_reports_literal(dir.path(), PAYLOAD);
+    refuse(&["task", "claim", "auth", "--by", "cursor"], PAYLOAD);
+    assert_eq!(task_status(dir.path()), "open");
+    fs::remove_file(dir.path().join(PAYLOAD)).expect("remove untracked");
+
+    fs::write(dir.path().join(PAYLOAD), "tracked\n").expect("tracked");
+    git(dir.path(), &["--literal-pathspecs", "add", "--", PAYLOAD]);
+    commit_index(dir.path(), "track payload");
+    fs::write(dir.path().join(PAYLOAD), "tracked\ndirty\n").expect("modify");
+    assert_git_reports_literal(dir.path(), PAYLOAD);
+    refuse(&["task", "claim", "auth", "--by", "cursor"], PAYLOAD);
+    assert_eq!(task_status(dir.path()), "open");
+    git(
+        dir.path(),
+        &["--literal-pathspecs", "checkout", "--", PAYLOAD],
+    );
+
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success()
+        .stdout("claimed auth by cursor\n");
+
+    fs::write(dir.path().join(EXTRA), "extra\n").expect("extra");
+    assert_git_reports_literal(dir.path(), EXTRA);
+    refuse(&["task", "done", "auth", "--changed", "shipped"], EXTRA);
+    assert_eq!(task_status(dir.path()), "claimed");
+    assert_eq!(report_count(dir.path()), 0);
+    fs::remove_file(dir.path().join(EXTRA)).expect("remove extra");
+
+    fs::write(dir.path().join(PAYLOAD), "tracked\ndirty\n").expect("modify again");
+    refuse(&["task", "done", "auth", "--changed", "shipped"], PAYLOAD);
+    assert_eq!(task_status(dir.path()), "claimed");
+    assert_eq!(report_count(dir.path()), 0);
+    git(
+        dir.path(),
+        &["--literal-pathspecs", "checkout", "--", PAYLOAD],
+    );
+
+    let done = json_data(
+        dir.path(),
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(done["status"], json!("done"));
     assert_eq!(done["commit_sha"], json!(head));
 }
 
@@ -1674,77 +1781,200 @@ fn git_stdout(dir: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
-fn done_during_lock(dir: &Path, mutate: impl FnOnce()) -> std::process::Output {
+#[cfg(unix)]
+fn assert_git_reports_literal(dir: &Path, name: &str) {
+    let status = git_stdout(
+        dir,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    );
+    let needle = name.as_bytes();
+    assert!(
+        status.windows(needle.len()).any(|window| window == needle),
+        "git status did not report {name:?}: {}",
+        String::from_utf8_lossy(&status)
+    );
+}
+
+/// Pause each `git status` from a gated command until this test can see
+/// whether that call holds the ledger write lock. The mutation then happens
+/// before `git` reads the worktree, so only a recheck inside the transaction
+/// observes it. The helper is portable: it does not read `/proc`.
+fn during_write_lock(dir: &Path, args: &[&str], mutate: impl FnOnce()) -> std::process::Output {
+    // Pause files live outside the worktree. Inside it, git would report them
+    // as untracked and the pre-check would fail before the in-lock recheck.
+    static GATES: AtomicU64 = AtomicU64::new(1);
+    let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let gate = root.join(format!(
+        "relaybook-git-gate-{}-{}",
+        std::process::id(),
+        GATES.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&gate).expect("gate");
     let db = dir.join(".relaybook").join("ledger.db");
-    let conn = rusqlite::Connection::open(&db).expect("open lock");
-    conn.busy_timeout(Duration::from_secs(5)).expect("busy");
-    conn.execute_batch("BEGIN IMMEDIATE").expect("lock");
-    let mut child = command(dir)
-        .args(["task", "done", "auth", "--changed", "shipped"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    wait_for_lock_sleep(&mut child);
+    let mut child = PausedGit::spawn(dir, &gate, args);
+    let n = child.wait_until_status_holds_lock(&db, &gate);
     mutate();
-    conn.execute_batch("COMMIT").expect("unlock");
-    drop(conn);
-    child.wait_with_output().expect("wait")
+    fs::write(gate.join(format!("release-{n}")), b"1").expect("release");
+    child.output()
 }
 
-fn wait_for_lock_sleep(child: &mut Child) {
-    let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let mut hits = 0;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("poll") {
-            panic!("done exited before the lock wait: {status}");
+struct PausedGit(Option<Child>);
+
+impl Drop for PausedGit {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
-        let wchan = fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
-        if wchan.trim() == "hrtimer_nanosleep" && !has_git_child(pid) {
-            hits += 1;
-            if hits >= 3 {
-                return;
+    }
+}
+
+impl PausedGit {
+    fn spawn(dir: &Path, gate: &Path, args: &[&str]) -> Self {
+        let child = command_with_git_shim(dir, gate)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        Self(Some(child))
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.0.as_mut().expect("child")
+    }
+
+    fn output(&mut self) -> std::process::Output {
+        self.0
+            .take()
+            .expect("child")
+            .wait_with_output()
+            .expect("wait")
+    }
+
+    fn wait_until_status_holds_lock(&mut self, db: &Path, gate: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut n = 1u32;
+        loop {
+            if !gate.join(format!("entered-{n}")).exists() {
+                if let Some(status) = self.child().try_wait().expect("poll") {
+                    let output = self.output();
+                    panic!(
+                        "exited before an in-lock git status ({status}): {}",
+                        summarize(&output)
+                    );
+                }
+                if Instant::now() >= deadline {
+                    panic!(
+                        "no git status ran inside the ledger write lock (waiting for status {n})"
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            if write_lock_held(db) {
+                return n;
+            }
+            fs::write(gate.join(format!("release-{n}")), b"1").expect("release outside status");
+            n += 1;
+            if n > 32 {
+                panic!("git status kept running outside the ledger write lock");
             }
         }
-        thread::yield_now();
     }
-    panic!("done never waited on the ledger lock (hits={hits})");
 }
 
-fn has_git_child(parent: u32) -> bool {
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return false;
+fn write_lock_held(db: &Path) -> bool {
+    let conn = rusqlite::Connection::open(db).expect("probe");
+    conn.busy_timeout(Duration::ZERO).expect("busy");
+    match conn.execute_batch("BEGIN IMMEDIATE") {
+        Ok(()) => {
+            conn.execute_batch("ROLLBACK").expect("rollback probe");
+            false
+        }
+        Err(rusqlite::Error::SqliteFailure(err, _))
+            if err.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            true
+        }
+        Err(err) => panic!("lock probe failed: {err}"),
+    }
+}
+
+fn command_with_git_shim(dir: &Path, gate: &Path) -> Command {
+    let shim_dir = git_shim_dir();
+    let original = std::env::var_os("PATH").expect("PATH");
+    let mut path = shim_dir.as_os_str().to_os_string();
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(&original);
+    let mut cmd = command(dir);
+    cmd.env("PATH", path)
+        .env("RELAYBOOK_GIT_GATE", gate)
+        .env("RELAYBOOK_REAL_GIT", real_git())
+        .env("RELAYBOOK_REAL_PATH", original);
+    cmd
+}
+
+fn git_shim_dir() -> PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let dir = root.join(format!("relaybook-git-shim-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("shim dir");
+        let binary = dir.join(if cfg!(windows) { "git.exe" } else { "git" });
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/git_shim.rs");
+        let output = Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .expect("run rustc");
+        assert!(
+            output.status.success(),
+            "rustc git shim failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        dir
+    })
+    .clone()
+}
+
+fn real_git() -> PathBuf {
+    static GIT: OnceLock<PathBuf> = OnceLock::new();
+    GIT.get_or_init(find_real_git).clone()
+}
+
+fn find_real_git() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH");
+    let skip = std::env::var_os("CARGO_TARGET_TMPDIR").map(PathBuf::from);
+    let names: &[&str] = if cfg!(windows) {
+        &["git.exe"]
+    } else {
+        &["git"]
     };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|text| text.parse::<u32>().ok())
-        else {
+    for dir in std::env::split_paths(&path) {
+        if skip.as_ref().is_some_and(|root| dir.starts_with(root)) {
             continue;
-        };
-        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
-            continue;
-        };
-        let mut is_child = false;
-        for line in status.lines() {
-            if let Some(rest) = line.strip_prefix("PPid:") {
-                is_child = rest.trim() == parent.to_string();
-                break;
+        }
+        for name in names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return candidate;
             }
         }
-        if !is_child {
-            continue;
-        }
-        let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
-            continue;
-        };
-        if comm.trim() == "git" {
-            return true;
-        }
     }
-    false
+    panic!("git is not on PATH");
 }
 
 fn git_repo(dir: &Path) {

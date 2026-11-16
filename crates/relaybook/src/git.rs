@@ -5,8 +5,11 @@
 //!
 //! `gated_dirty_paths` ignores `.relaybook` so ledger writes are not a dirty
 //! tree. It asks git for every untracked file and every submodule change, and
-//! it parses NUL-delimited porcelain without trimming. A rename counts both
-//! paths, so moving a tracked file into `.relaybook` stays dirty.
+//! it parses NUL-delimited porcelain without trimming. `-z` paths stay
+//! literal: a backslash is part of the name, and ledger exclusion is decided
+//! on that literal path. Separator folding belongs only to the historical
+//! `dirty_paths` parser. A rename counts both paths, so moving a tracked file
+//! into `.relaybook` stays dirty.
 
 use std::path::Path;
 use std::process::Command;
@@ -69,7 +72,8 @@ fn git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 
 /// Porcelain v1 `-z` records are `XY PATH\0`. A rename or copy adds the
 /// original path: `XY PATH\0ORIG\0`. `PATH` is the current path. Neither
-/// field is trimmed; a leading status space is part of `XY`.
+/// field is trimmed; a leading status space is part of `XY`. Path bytes are
+/// not unescaped: `-z` does not quote them.
 fn parse_porcelain_z(bytes: &[u8]) -> Result<Vec<String>, String> {
     let mut dirty = Vec::new();
     let mut parts = bytes.split(|byte| *byte == b'\0');
@@ -98,15 +102,24 @@ fn parse_porcelain_z(bytes: &[u8]) -> Result<Vec<String>, String> {
     Ok(dirty)
 }
 
+/// Decode one `-z` path. Git writes the bytes as stored, with `/` as the
+/// separator and no escape sequences. Folding `\` to `/` before the ledger
+/// check would treat a Unix file named `.relaybook\payload.rs` as ledger data.
 fn porcelain_path(bytes: &[u8]) -> String {
-    git_path(&String::from_utf8_lossy(bytes))
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
-fn push_outside_ledger(dirty: &mut Vec<String>, path: &str) {
-    if path == ".relaybook" || path.starts_with(".relaybook/") {
+fn push_outside_ledger(dirty: &mut Vec<String>, literal: &str) {
+    if ledger_path(literal) {
         return;
     }
-    dirty.push(path.to_string());
+    // Keep the literal path. Folding separators here would report a different
+    // filename from the one git and the worktree use.
+    dirty.push(literal.to_string());
+}
+
+fn ledger_path(literal: &str) -> bool {
+    literal == ".relaybook" || literal.starts_with(".relaybook/")
 }
 
 #[cfg(test)]
@@ -129,5 +142,35 @@ mod tests {
 
         let ledger = b"?? .relaybook/ledger.db\0";
         assert!(parse_porcelain_z(ledger).expect("ledger").is_empty());
+    }
+
+    #[test]
+    fn nul_porcelain_keeps_literal_backslash_filenames() {
+        let untracked = b"?? .relaybook\\payload.rs\0";
+        assert_eq!(
+            parse_porcelain_z(untracked).expect("untracked"),
+            vec![".relaybook\\payload.rs".to_string()]
+        );
+
+        let tracked = b" M .relaybook\\payload.rs\0";
+        assert_eq!(
+            parse_porcelain_z(tracked).expect("tracked"),
+            vec![".relaybook\\payload.rs".to_string()]
+        );
+
+        let renamed = b"R  .relaybook\\payload.rs\0src.rs\0";
+        assert_eq!(
+            parse_porcelain_z(renamed).expect("rename to backslash name"),
+            vec![".relaybook\\payload.rs".to_string(), "src.rs".to_string()]
+        );
+
+        let into_ledger = b"R  .relaybook/payload.rs\0.relaybook\\payload.rs\0";
+        assert_eq!(
+            parse_porcelain_z(into_ledger).expect("rename into ledger"),
+            vec![".relaybook\\payload.rs".to_string()]
+        );
+
+        let ordinary = b"?? .relaybook/payload.rs\0";
+        assert!(parse_porcelain_z(ordinary).expect("ledger file").is_empty());
     }
 }
