@@ -801,6 +801,38 @@ impl Ledger {
         body: &str,
         reviewer_override: bool,
     ) -> Result<Review, Error> {
+        self.record_review_with(
+            scope,
+            task,
+            reviewer,
+            sha,
+            head,
+            fingerprint,
+            verdict,
+            body,
+            reviewer_override,
+            || Ok(()),
+        )
+    }
+
+    /// Same as [`Self::record_review`]. `revalidate` runs inside this write
+    /// transaction after the verdict is stored and before commit. An error
+    /// rolls the recording back, including a repository check that failed
+    /// after the lock wait.
+    #[allow(clippy::too_many_arguments)] // same arguments as record_review, plus the recheck
+    pub fn record_review_with(
+        &mut self,
+        scope: &str,
+        task: Option<&str>,
+        reviewer: &str,
+        sha: &str,
+        head: &str,
+        fingerprint: &str,
+        verdict: &str,
+        body: &str,
+        reviewer_override: bool,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<Review, Error> {
         let scope = review_scope(scope)?;
         let reviewer = required_text("reviewer", reviewer)?;
         let sha = required_text("sha", sha)?;
@@ -856,6 +888,7 @@ impl Ledger {
                     reopen_done_task(conn, &current, "changes requested")?;
                 }
             }
+            revalidate()?;
             load_review(conn, id)
         })
     }
@@ -1284,6 +1317,10 @@ impl Ledger {
     }
 
     /// Review row and report graph SHA for a single-task view.
+    ///
+    /// Read-only opens do not migrate. A v6 ledger has no `reviews` table and
+    /// no `reports.graph_sha` column, so those extras are absent instead of
+    /// failing the read that older ledgers already supported.
     fn task_context_extras(
         &self,
         slug: Option<&str>,
@@ -1291,13 +1328,20 @@ impl Ledger {
         let Some(slug) = slug else {
             return Ok((None, None));
         };
-        let latest_review = self
-            .latest_review("task", Some(slug))?
-            .map(|review| serde_json::to_value(review).map_err(|err| Error::Json(err.to_string())))
-            .transpose()?;
-        let graph_sha = self
-            .latest_task_report(slug)?
-            .and_then(|report| report.graph_sha);
+        let latest_review = if sqlite_table_exists(&self.conn, "reviews")? {
+            self.latest_review("task", Some(slug))?
+                .map(|review| {
+                    serde_json::to_value(review).map_err(|err| Error::Json(err.to_string()))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let graph_sha = if reports_have_column(&self.conn, "graph_sha")? {
+            report_graph_sha(&self.conn, slug)?
+        } else {
+            None
+        };
         Ok((latest_review, graph_sha))
     }
 
@@ -1378,6 +1422,45 @@ impl Drop for Ledger {
     fn drop(&mut self) {
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     }
+}
+
+fn sqlite_table_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |_| Ok(1_i64),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+fn reports_have_column(conn: &Connection, column: &str) -> Result<bool, Error> {
+    let mut statement = conn.prepare("PRAGMA table_info(reports)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `reports.graph_sha` for the latest task report. Callers check the column
+/// first so a v6 `reports` table, which has no SHA columns, is not queried.
+fn report_graph_sha(conn: &Connection, slug: &str) -> Result<Option<String>, Error> {
+    let task = load_task(conn, slug)?;
+    let sha = conn
+        .query_row(
+            "SELECT graph_sha FROM reports
+             WHERE task_id = ?1 AND kind = 'task'
+             ORDER BY id DESC
+             LIMIT 1",
+            params![task.id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(sha.flatten())
 }
 
 fn configure(conn: &Connection) -> Result<(), Error> {

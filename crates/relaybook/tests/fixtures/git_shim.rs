@@ -1,5 +1,6 @@
-//! Pause `git status` so a test can mutate the worktree while Relaybook holds
-//! its ledger write lock. Other git commands run immediately.
+//! Pause one git subcommand so a test can mutate the worktree while Relaybook
+//! holds its ledger write lock. `RELAYBOOK_GIT_GATE_CMD` selects that
+//! subcommand and defaults to `status`. Other git commands run immediately.
 
 use std::env;
 use std::ffi::OsString;
@@ -15,7 +16,8 @@ fn main() {
     let real = env_var("RELAYBOOK_REAL_GIT");
     let real_path = env::var_os("RELAYBOOK_REAL_PATH");
     let args: Vec<OsString> = env::args_os().skip(1).collect();
-    if args.iter().any(|arg| arg == "status") {
+    let gate_cmd = env::var("RELAYBOOK_GIT_GATE_CMD").unwrap_or_else(|_| "status".to_string());
+    if args.iter().any(|arg| arg == gate_cmd.as_str()) {
         let n = claim_index(&gate);
         let dir = PathBuf::from(&gate);
         if let Err(err) = fs::write(dir.join(format!("entered-{n}")), b"1") {
@@ -38,6 +40,7 @@ fn main() {
         command.env("PATH", path);
     }
     command.env_remove("RELAYBOOK_GIT_GATE");
+    command.env_remove("RELAYBOOK_GIT_GATE_CMD");
     command.env_remove("RELAYBOOK_REAL_GIT");
     command.env_remove("RELAYBOOK_REAL_PATH");
     match command.status() {

@@ -634,6 +634,88 @@ fn claim_task_revalidate_holds_the_write_lock_and_rolls_back() {
     assert_eq!(claimed, 0);
 }
 
+#[test]
+fn record_review_revalidate_holds_the_write_lock_and_rolls_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.create_task("auth", "Add auth").expect("create");
+    ledger.claim_task("auth", "cursor").expect("claim");
+    ledger
+        .finish_task("auth", None, Some("abc123"))
+        .expect("done");
+    ledger
+        .start_review(
+            "task",
+            Some("auth"),
+            None,
+            "main",
+            "codex",
+            None,
+            "abc123",
+            None,
+            "fp",
+        )
+        .expect("start");
+    let body =
+        r#"{"findings":"none","security":"ok","tests_checked":"cargo test","not_checked":"none"}"#;
+    let db = path.clone();
+    let err = ledger
+        .record_review_with(
+            "task",
+            Some("auth"),
+            "codex",
+            "abc123",
+            "abc123",
+            "fp",
+            "changes_requested",
+            body,
+            false,
+            move || {
+                let conn = rusqlite::Connection::open(&db).expect("open");
+                conn.busy_timeout(std::time::Duration::from_millis(0))
+                    .expect("busy");
+                match conn.execute_batch("BEGIN IMMEDIATE") {
+                    Err(rusqlite::Error::SqliteFailure(ffi, _))
+                        if ffi.code == rusqlite::ErrorCode::DatabaseBusy =>
+                    {
+                        Err(relaybook_core::Error::InvalidSetting(
+                            "refs/remotes/origin/main exists".to_string(),
+                        ))
+                    }
+                    Err(err) => panic!("unexpected lock error: {err}"),
+                    Ok(()) => panic!("revalidate ran without the write lock"),
+                }
+            },
+        )
+        .expect_err("rolled back");
+    assert_eq!(err.to_string(), "refs/remotes/origin/main exists");
+    let pending = ledger
+        .latest_review("task", Some("auth"))
+        .expect("review")
+        .expect("row");
+    assert_eq!(pending.verdict, None);
+    assert_eq!(pending.recorded_at, None);
+    let ctx = ledger.context(Some("auth"), 20).expect("context");
+    assert_eq!(ctx.tasks[0].task.status, Status::Done);
+    let recorded = ledger
+        .record_review(
+            "task",
+            Some("auth"),
+            "codex",
+            "abc123",
+            "abc123",
+            "fp",
+            "approved",
+            body,
+            false,
+        )
+        .expect("still pending");
+    assert_eq!(recorded.verdict.as_deref(), Some("approved"));
+    let ctx = ledger.context(Some("auth"), 20).expect("context");
+    assert_eq!(ctx.tasks[0].task.status, Status::Done);
+}
+
 fn spawn_claim(
     path: PathBuf,
     by: &'static str,

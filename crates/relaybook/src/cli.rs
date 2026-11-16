@@ -1083,13 +1083,18 @@ fn review_record(
     };
     require_gated_clean_tree(cwd, &ledger)?;
     let root = repository_root(cwd)?;
-    refuse_published_branch(&root)?;
+    // Confirmation can sit at a TTY for a long time. Origin, HEAD, cleanliness,
+    // and the fingerprint are read again after it returns, and once more inside
+    // the write transaction immediately before commit.
     let reviewer_override = reviewer_override(&configured, by)?;
     require_gated_clean_tree(cwd, &ledger)?;
+    refuse_published_branch(&root)?;
     let head = gitinfo::verified_head(&root)
         .ok_or_else(|| invalid_setting("review record requires a commit at HEAD"))?;
     let fingerprint = crate::git::worktree_fingerprint(&root).map_err(invalid_setting)?;
-    let review = ledger.record_review(
+    let sha_owned = sha.trim().to_string();
+    let fingerprint_now = fingerprint.clone();
+    let review = ledger.record_review_with(
         "task",
         Some(slug),
         by.trim(),
@@ -1099,16 +1104,43 @@ fn review_record(
         verdict,
         text,
         reviewer_override,
+        move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
     )?;
     let stored = review.verdict.clone().unwrap_or_default();
     json_outcome(review, render::line(&format!("recorded {slug} {stored}")))
 }
 
 fn refuse_published_branch(root: &Path) -> Result<(), Fail> {
-    let branch = gitinfo::branch(root).ok_or_else(|| invalid_setting("a branch is required"))?;
+    published_origin(root).map_err(Fail::Core)
+}
+
+/// Cleanliness, HEAD, fingerprint, and origin-ref absence for one record
+/// attempt. `sha` and `fingerprint` were captured for this attempt; they must
+/// still describe the worktree when the verdict commits.
+fn recheck_review_record(root: &Path, sha: &str, fingerprint: &str) -> Result<(), Error> {
+    ensure_gated_clean(root)?;
+    published_origin(root)?;
+    let head = gitinfo::verified_head(root).ok_or_else(|| {
+        Error::InvalidSetting("review record requires a commit at HEAD".to_string())
+    })?;
+    if head != sha {
+        return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
+    }
+    let fresh = crate::git::worktree_fingerprint(root).map_err(Error::InvalidSetting)?;
+    if fresh != fingerprint {
+        return Err(Error::InvalidSetting(
+            "reviewer changed the repository".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn published_origin(root: &Path) -> Result<(), Error> {
+    let branch = gitinfo::branch(root)
+        .ok_or_else(|| Error::InvalidSetting("a branch is required".to_string()))?;
     let origin = format!("refs/remotes/origin/{branch}");
-    if gitinfo::rev_exists(root, &origin).map_err(invalid_setting)? {
-        return Err(invalid_setting(format!("{origin} exists")));
+    if gitinfo::rev_exists(root, &origin).map_err(Error::InvalidSetting)? {
+        return Err(Error::InvalidSetting(format!("{origin} exists")));
     }
     Ok(())
 }

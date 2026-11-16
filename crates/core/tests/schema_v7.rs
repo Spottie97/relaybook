@@ -273,6 +273,221 @@ fn v6_ledger_migrates_to_v7_with_payloads_unchanged() {
     assert_eq!(again, body);
 }
 
+const V6_CONTEXT_SCHEMA: &str = "
+CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY,
+    slug TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    claimed_by TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    run_id INTEGER
+);
+CREATE TABLE steps (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE decisions (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER NOT NULL,
+    rationale TEXT NOT NULL,
+    provenance TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE task_deps (
+    task_id INTEGER NOT NULL,
+    depends_on_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_id)
+);
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE TABLE reports (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER,
+    kind TEXT NOT NULL,
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    reviewed_at TEXT,
+    verdict TEXT,
+    review_note TEXT
+);
+";
+
+const V6_REVIEWS_TABLE: &str = "
+CREATE TABLE reviews (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('task', 'release')),
+    task_id INTEGER REFERENCES tasks(id),
+    report_id INTEGER REFERENCES reports(id),
+    run_id INTEGER,
+    branch TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    reviewer_override INTEGER NOT NULL DEFAULT 0 CHECK (reviewer_override IN (0, 1)),
+    base_sha TEXT,
+    commit_sha TEXT NOT NULL,
+    graph_sha TEXT,
+    ledger_mark TEXT NOT NULL,
+    verdict TEXT CHECK (verdict IN ('approved', 'changes_requested')),
+    body TEXT,
+    bytes INTEGER,
+    started_at TEXT NOT NULL,
+    recorded_at TEXT,
+    CHECK ((scope = 'task') = (task_id IS NOT NULL))
+);
+";
+
+fn v6_context_ledger(graph_sha: Option<&str>, with_review: bool) -> (tempfile::TempDir, PathBuf) {
+    let (dir, path) = fresh_path();
+    let conn = Connection::open(&path).expect("open");
+    conn.execute_batch(V6_CONTEXT_SCHEMA).expect("v6 schema");
+    let body = r#"{"changed":["shipped"]}"#;
+    conn.execute(
+        "INSERT INTO tasks (id, slug, title, status, created_at, updated_at)
+         VALUES (1, 'auth', 'Add auth', 'done', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+        [],
+    )
+    .expect("task");
+    conn.execute(
+        "INSERT INTO events (id, ts, kind, payload)
+         VALUES (1, '2026-01-01T00:00:00.000Z', 'task_created', '{\"slug\":\"auth\"}')",
+        [],
+    )
+    .expect("event");
+    if let Some(sha) = graph_sha {
+        conn.execute("ALTER TABLE reports ADD COLUMN graph_sha TEXT", [])
+            .expect("graph_sha");
+        conn.execute(
+            "INSERT INTO reports (id, task_id, kind, author, body, bytes, created_at, graph_sha)
+             VALUES (9, 1, 'task', 'cursor', ?1, ?2, '2026-01-01T00:00:00.000Z', ?3)",
+            rusqlite::params![body, body.len() as i64, sha],
+        )
+        .expect("report");
+    } else {
+        conn.execute(
+            "INSERT INTO reports (id, task_id, kind, author, body, bytes, created_at)
+             VALUES (9, 1, 'task', 'cursor', ?1, ?2, '2026-01-01T00:00:00.000Z')",
+            rusqlite::params![body, body.len() as i64],
+        )
+        .expect("report");
+    }
+    if with_review {
+        conn.execute_batch(V6_REVIEWS_TABLE).expect("reviews");
+        conn.execute(
+            "INSERT INTO reviews (
+                scope, task_id, branch, reviewer, reviewer_override, commit_sha, ledger_mark, started_at
+             ) VALUES ('task', 1, 'main', 'codex', 0, 'abc', '{}', '2026-01-01T00:00:00.000Z')",
+            [],
+        )
+        .expect("review");
+    }
+    conn.pragma_update(None, "user_version", 6)
+        .expect("version");
+    drop(conn);
+    (dir, path)
+}
+
+#[test]
+fn readonly_v6_context_returns_absent_review_extras() {
+    let (_dir, path) = v6_context_ledger(None, false);
+    let ledger = Ledger::open_readonly(&path).expect("readonly");
+    let listed = ledger.context(None, 5).expect("list context");
+    assert!(listed.latest_review.is_none());
+    assert_eq!(listed.graph_sha, None);
+    let ctx = ledger.context(Some("auth"), 20).expect("task context");
+    assert_eq!(ctx.tasks.len(), 1);
+    assert_eq!(ctx.tasks[0].task.slug, "auth");
+    assert_eq!(ctx.tasks[0].task.status, Status::Done);
+    assert!(ctx.latest_review.is_none());
+    assert_eq!(ctx.graph_sha, None);
+    assert!(ctx.latest_report.is_some());
+    assert_eq!(ctx.unreviewed_reports, 1);
+    assert_eq!(ctx.events.len(), 1);
+    drop(ledger);
+    assert_eq!(user_version(&path), 6);
+    assert_eq!(table_count(&path, "reviews"), 0);
+    assert!(
+        !column_names(&path, "reports")
+            .iter()
+            .any(|name| name == "graph_sha")
+    );
+
+    let (_dir, path) = v6_context_ledger(Some("graphsha"), false);
+    let ledger = Ledger::open_readonly(&path).expect("readonly");
+    let ctx = ledger.context(Some("auth"), 20).expect("graph column");
+    assert!(ctx.latest_review.is_none());
+    assert_eq!(ctx.graph_sha.as_deref(), Some("graphsha"));
+    drop(ledger);
+    assert_eq!(user_version(&path), 6);
+    assert_eq!(table_count(&path, "reviews"), 0);
+
+    let (_dir, path) = v6_context_ledger(None, true);
+    let ledger = Ledger::open_readonly(&path).expect("readonly");
+    let ctx = ledger.context(Some("auth"), 20).expect("reviews table");
+    let review = ctx.latest_review.expect("review");
+    assert_eq!(review["reviewer"].as_str(), Some("codex"));
+    assert!(review["verdict"].is_null());
+    assert_eq!(ctx.graph_sha, None);
+    drop(ledger);
+    assert_eq!(user_version(&path), 6);
+    assert!(
+        !column_names(&path, "reports")
+            .iter()
+            .any(|name| name == "graph_sha")
+    );
+}
+
+#[test]
+fn readonly_v7_context_returns_review_and_graph_sha() {
+    let (_dir, path) = fresh_path();
+    {
+        let mut ledger = Ledger::initialize(&path).expect("init");
+        ledger.create_task("auth", "Add auth").expect("create");
+        ledger.claim_task("auth", "cursor").expect("claim");
+        ledger
+            .finish_task_anchored(
+                "auth",
+                None,
+                Some("abc"),
+                Some("base"),
+                Some("graphsha"),
+                || Ok(()),
+            )
+            .expect("done");
+        ledger
+            .start_review(
+                "task",
+                Some("auth"),
+                None,
+                "main",
+                "codex",
+                Some("base"),
+                "abc",
+                Some("graphsha"),
+                "fp",
+            )
+            .expect("start");
+    }
+    let ledger = Ledger::open_readonly(&path).expect("readonly");
+    let ctx = ledger.context(Some("auth"), 10).expect("context");
+    let review = ctx.latest_review.expect("review");
+    assert_eq!(review["reviewer"].as_str(), Some("codex"));
+    assert!(review["verdict"].is_null());
+    assert_eq!(ctx.graph_sha.as_deref(), Some("graphsha"));
+    drop(ledger);
+    assert_eq!(user_version(&path), 7);
+}
+
 #[test]
 fn reviews_scope_requires_a_task_exactly_when_scope_is_task() {
     let (_dir, path) = fresh_path();

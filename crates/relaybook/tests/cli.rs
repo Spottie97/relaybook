@@ -2155,6 +2155,119 @@ fn review_record_rejects_sha_mismatch_or_moved_head() {
 }
 
 #[test]
+fn review_record_rechecks_cleanliness_inside_the_write_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    assert_record_blocked_in_lock(
+        dir.path(),
+        &head,
+        "status",
+        "working tree is not clean: race.txt",
+        || {
+            fs::write(dir.path().join("race.txt"), "race\n").expect("race");
+        },
+    );
+}
+
+#[test]
+fn review_record_rechecks_head_inside_the_write_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    assert_record_blocked_in_lock(
+        dir.path(),
+        &head,
+        "status",
+        "sha does not match HEAD",
+        || {
+            git(
+                dir.path(),
+                &[
+                    "-c",
+                    "user.email=relaybook@example.com",
+                    "-c",
+                    "user.name=Relaybook",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "move",
+                ],
+            );
+        },
+    );
+}
+
+#[test]
+fn review_record_rechecks_fingerprint_inside_the_write_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    assert_record_blocked_in_lock(
+        dir.path(),
+        &head,
+        "diff",
+        "reviewer changed the repository",
+        || {
+            fs::write(dir.path().join("work.txt"), "changed\n").expect("change");
+        },
+    );
+}
+
+#[test]
+fn review_record_rechecks_origin_inside_the_write_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    assert_record_blocked_in_lock(
+        dir.path(),
+        &head,
+        "status",
+        "refs/remotes/origin/main exists",
+        || {
+            git(
+                dir.path(),
+                &["update-ref", "refs/remotes/origin/main", &head],
+            );
+        },
+    );
+}
+
+fn assert_record_blocked_in_lock(
+    dir: &Path,
+    head: &str,
+    git_arg: &str,
+    message: &str,
+    mutate: impl FnOnce(),
+) {
+    let output = during_git_recheck(
+        dir,
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ],
+        git_arg,
+        mutate,
+    );
+    assert_failure(&output, message);
+    let pending = task_reviews(dir);
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].1, None, "{pending:?}");
+    assert_eq!(task_status(dir), "done");
+}
+
+#[test]
 fn review_record_detects_ledger_write_during_review() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = GraphifyFake::install();
@@ -2835,8 +2948,18 @@ fn assert_git_reports_literal(dir: &Path, name: &str) {
 /// before `git` reads the worktree, so only a recheck inside the transaction
 /// observes it. The helper is portable: it does not read `/proc`.
 fn during_write_lock(dir: &Path, args: &[&str], mutate: impl FnOnce()) -> std::process::Output {
-    // Pause files live outside the worktree. Inside it, git would report them
-    // as untracked and the pre-check would fail before the in-lock recheck.
+    during_git_recheck(dir, args, "status", mutate)
+}
+
+/// Same as [`during_write_lock`], pausing `git_arg` instead of `status`.
+/// `diff` is the fingerprint read. Pause files live outside the worktree so
+/// git does not report them as untracked before the in-lock recheck.
+fn during_git_recheck(
+    dir: &Path,
+    args: &[&str],
+    git_arg: &str,
+    mutate: impl FnOnce(),
+) -> std::process::Output {
     static GATES: AtomicU64 = AtomicU64::new(1);
     let root = std::env::var_os("CARGO_TARGET_TMPDIR")
         .map(PathBuf::from)
@@ -2848,8 +2971,8 @@ fn during_write_lock(dir: &Path, args: &[&str], mutate: impl FnOnce()) -> std::p
     ));
     fs::create_dir_all(&gate).expect("gate");
     let db = dir.join(".relaybook").join("ledger.db");
-    let mut child = PausedGit::spawn(dir, &gate, args);
-    let n = child.wait_until_status_holds_lock(&db, &gate);
+    let mut child = PausedGit::spawn(dir, &gate, git_arg, args);
+    let n = child.wait_until_git_holds_lock(&db, &gate, git_arg);
     mutate();
     fs::write(gate.join(format!("release-{n}")), b"1").expect("release");
     child.output()
@@ -2867,8 +2990,8 @@ impl Drop for PausedGit {
 }
 
 impl PausedGit {
-    fn spawn(dir: &Path, gate: &Path, args: &[&str]) -> Self {
-        let child = command_with_git_shim(dir, gate)
+    fn spawn(dir: &Path, gate: &Path, git_arg: &str, args: &[&str]) -> Self {
+        let child = command_with_git_shim(dir, gate, git_arg)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2889,7 +3012,7 @@ impl PausedGit {
             .expect("wait")
     }
 
-    fn wait_until_status_holds_lock(&mut self, db: &Path, gate: &Path) -> u32 {
+    fn wait_until_git_holds_lock(&mut self, db: &Path, gate: &Path, git_arg: &str) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut n = 1u32;
         loop {
@@ -2897,13 +3020,13 @@ impl PausedGit {
                 if let Some(status) = self.child().try_wait().expect("poll") {
                     let output = self.output();
                     panic!(
-                        "exited before an in-lock git status ({status}): {}",
+                        "exited before an in-lock git {git_arg} ({status}): {}",
                         summarize(&output)
                     );
                 }
                 if Instant::now() >= deadline {
                     panic!(
-                        "no git status ran inside the ledger write lock (waiting for status {n})"
+                        "no git {git_arg} ran inside the ledger write lock (waiting for {git_arg} {n})"
                     );
                 }
                 thread::sleep(Duration::from_millis(10));
@@ -2912,10 +3035,10 @@ impl PausedGit {
             if write_lock_held(db) {
                 return n;
             }
-            fs::write(gate.join(format!("release-{n}")), b"1").expect("release outside status");
+            fs::write(gate.join(format!("release-{n}")), b"1").expect("release outside lock");
             n += 1;
             if n > 32 {
-                panic!("git status kept running outside the ledger write lock");
+                panic!("git {git_arg} kept running outside the ledger write lock");
             }
         }
     }
@@ -2938,7 +3061,7 @@ fn write_lock_held(db: &Path) -> bool {
     }
 }
 
-fn command_with_git_shim(dir: &Path, gate: &Path) -> Command {
+fn command_with_git_shim(dir: &Path, gate: &Path, git_arg: &str) -> Command {
     let shim_dir = git_shim_dir();
     let original = std::env::var_os("PATH").expect("PATH");
     let mut path = shim_dir.as_os_str().to_os_string();
@@ -2947,6 +3070,7 @@ fn command_with_git_shim(dir: &Path, gate: &Path) -> Command {
     let mut cmd = command(dir);
     cmd.env("PATH", path)
         .env("RELAYBOOK_GIT_GATE", gate)
+        .env("RELAYBOOK_GIT_GATE_CMD", git_arg)
         .env("RELAYBOOK_REAL_GIT", real_git())
         .env("RELAYBOOK_REAL_PATH", original);
     cmd
