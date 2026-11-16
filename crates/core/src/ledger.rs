@@ -464,6 +464,7 @@ impl Ledger {
 
     /// Start a pending task or release review. `commit_sha` is HEAD.
     /// `fingerprint` is the worktree fingerprint captured with that HEAD.
+    /// Any older pending review for the same scope and task is dropped.
     #[allow(clippy::too_many_arguments)] // one argument per reviews column the caller supplies
     pub fn start_review(
         &mut self,
@@ -488,6 +489,12 @@ impl Ledger {
                 Some(id) => latest_task_report_id(conn, id)?,
                 None => None,
             };
+            conn.execute(
+                "DELETE FROM reviews
+                 WHERE scope = ?1 AND verdict IS NULL
+                   AND ((?2 IS NULL AND task_id IS NULL) OR task_id = ?2)",
+                params![scope, task_id],
+            )?;
             let ledger_mark = encode_mark(&capture_mark(conn)?, fingerprint)?;
             let started_at = now(conn)?;
             conn.execute(
@@ -513,8 +520,9 @@ impl Ledger {
         })
     }
 
-    /// Record the pending review. `sha` must equal `head` and the HEAD stored
-    /// at `start_review`. A task verdict of `changes_requested` reopens that task.
+    /// Record the latest review for this scope. `sha` must equal `head` and the
+    /// HEAD stored at `start_review`, and that latest review must still be
+    /// pending. A task verdict of `changes_requested` reopens that task.
     #[allow(clippy::too_many_arguments)] // sha, head, fingerprint, and the verdict are distinct
     pub fn record_review(
         &mut self,
@@ -636,8 +644,8 @@ impl Ledger {
         })
     }
 
-    /// Record sign-off. `sha` must equal `head`, and an approved release
-    /// review must exist at that commit. TTY confirmation stays with the CLI.
+    /// Record sign-off. `sha` must equal `head`, and the latest release review
+    /// at that commit must be approved. TTY confirmation stays with the CLI.
     pub fn authorize_release(
         &mut self,
         branch: &str,
@@ -654,20 +662,13 @@ impl Ledger {
             return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
         }
         self.transaction(|conn| {
-            let review_id: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM reviews
-                     WHERE scope = 'release' AND verdict = 'approved' AND commit_sha = ?1
-                     ORDER BY id DESC
-                     LIMIT 1",
-                    params![sha],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(review_id) = review_id else {
-                return Err(Error::InvalidSetting(
-                    "no approved release review".to_string(),
-                ));
+            let review_id = match crate::lifecycle::latest_release_review_at(conn, &sha)? {
+                Some(review) if review.verdict.as_deref() == Some("approved") => review.id,
+                _ => {
+                    return Err(Error::InvalidSetting(
+                        "no approved release review".to_string(),
+                    ));
+                }
             };
             let created_at = now(conn)?;
             conn.execute(
@@ -1426,18 +1427,21 @@ fn latest_task_report_id(conn: &Connection, task_id: i64) -> Result<Option<i64>,
 }
 
 fn pending_review_id(conn: &Connection, scope: &str, task_id: Option<i64>) -> Result<i64, Error> {
-    let id: Option<i64> = conn
+    let row: Option<(i64, Option<String>)> = conn
         .query_row(
-            "SELECT id FROM reviews
-             WHERE scope = ?1 AND verdict IS NULL
+            "SELECT id, verdict FROM reviews
+             WHERE scope = ?1
                AND ((?2 IS NULL AND task_id IS NULL) OR task_id = ?2)
              ORDER BY id DESC
              LIMIT 1",
             params![scope, task_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    id.ok_or_else(|| Error::InvalidSetting("no pending review".to_string()))
+    match row {
+        Some((id, None)) => Ok(id),
+        _ => Err(Error::InvalidSetting("no pending review".to_string())),
+    }
 }
 
 fn latest_review_id(

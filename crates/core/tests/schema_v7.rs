@@ -784,6 +784,14 @@ fn lifecycle_covers_every_state_and_invalidates_release() {
     assert_eq!(stale.release, None);
     assert_eq!(task_phase(&stale, "zeta"), Some(TaskPhase::Accepted));
 
+    let claimed = ledger
+        .lifecycle("sha-head", &shas(&["sha-zeta"]))
+        .expect("claimed task");
+    assert_eq!(task_phase(&claimed, "gamma"), Some(TaskPhase::Dispatched));
+    assert_eq!(task_phase(&claimed, "zeta"), Some(TaskPhase::Accepted));
+    assert_eq!(claimed.release, None);
+    ledger.finish_task("gamma", None).expect("clear claim");
+
     let blocked = ledger
         .lifecycle("sha-head", &shas(&["sha-delta"]))
         .expect("unaccepted scope");
@@ -817,6 +825,158 @@ fn lifecycle_covers_every_state_and_invalidates_release() {
     drop(dir);
 }
 
+#[test]
+fn release_reviewed_requires_no_claimed_task() {
+    let (dir, path) = fresh_path();
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.create_task("alpha", "Accepted").expect("task");
+    ledger.claim_task("alpha", "cursor").expect("claim");
+    ledger.finish_task("alpha", None).expect("done");
+    set_commit_sha(&path, "alpha", "sha-alpha");
+    record_task(&mut ledger, "alpha", "sha-alpha");
+    ledger.accept_report("alpha").expect("accept");
+    ledger.create_task("gamma", "Claimed").expect("task");
+    ledger.claim_task("gamma", "cursor").expect("claim");
+    record_release(&mut ledger, "sha-head", "approved");
+
+    let blocked = ledger
+        .lifecycle("sha-head", &shas(&["sha-alpha"]))
+        .expect("claimed blocks release");
+    assert_eq!(task_phase(&blocked, "alpha"), Some(TaskPhase::Accepted));
+    assert_eq!(task_phase(&blocked, "gamma"), Some(TaskPhase::Dispatched));
+    assert_eq!(blocked.release, None);
+
+    ledger.finish_task("gamma", None).expect("clear claim");
+    let reviewed = ledger
+        .lifecycle("sha-head", &shas(&["sha-alpha"]))
+        .expect("release reviewed");
+    assert_eq!(reviewed.release, Some(ReleasePhase::ReleaseReviewed));
+    drop(ledger);
+    drop(dir);
+}
+
+#[test]
+fn later_release_rejection_blocks_release_at_same_sha() {
+    let (_dir, mut ledger) = done_task();
+    let approval = record_release(&mut ledger, "sha-head", "approved");
+    ledger
+        .start_review(
+            "release", None, None, "feature", "codex", None, "sha-head", None, "fp",
+        )
+        .expect("newer pending");
+    let pending = ledger
+        .authorize_release("feature", "sha-head", "sha-head", "maintainer", None)
+        .expect_err("pending is not approval");
+    assert_eq!(pending.to_string(), "no approved release review");
+    assert_eq!(
+        ledger.lifecycle("sha-head", &[]).expect("pending").release,
+        None
+    );
+
+    let rejected = ledger
+        .record_review(
+            "release",
+            None,
+            "codex",
+            "sha-head",
+            "sha-head",
+            "fp",
+            "changes-requested",
+            release_review_body(),
+            false,
+        )
+        .expect("reject");
+    assert!(rejected.id > approval.id);
+    let rejected_auth = ledger
+        .authorize_release("feature", "sha-head", "sha-head", "maintainer", None)
+        .expect_err("newer rejection");
+    assert_eq!(rejected_auth.to_string(), "no approved release review");
+    assert_eq!(
+        ledger.lifecycle("sha-head", &[]).expect("rejected").release,
+        None
+    );
+
+    let again = record_release(&mut ledger, "sha-head", "approved");
+    assert_eq!(
+        ledger
+            .lifecycle("sha-head", &[])
+            .expect("reapproved")
+            .release,
+        Some(ReleasePhase::ReleaseReviewed)
+    );
+    let authorization = ledger
+        .authorize_release("feature", "sha-head", "sha-head", "maintainer", None)
+        .expect("later approval");
+    assert_eq!(authorization.review_id, again.id);
+}
+
+#[test]
+fn repeated_review_start_rejects_superseded_session() {
+    let (_dir, mut ledger) = done_task();
+    ledger
+        .start_review(
+            "task",
+            Some("auth"),
+            None,
+            "feature",
+            "codex",
+            None,
+            "aaa",
+            None,
+            "fp",
+        )
+        .expect("first");
+    ledger
+        .start_review(
+            "task",
+            Some("auth"),
+            None,
+            "feature",
+            "codex",
+            None,
+            "aaa",
+            None,
+            "fp",
+        )
+        .expect("second");
+    let approved = ledger
+        .record_review(
+            "task",
+            Some("auth"),
+            "codex",
+            "aaa",
+            "aaa",
+            "fp",
+            "approved",
+            task_review_body(),
+            false,
+        )
+        .expect("record current");
+    assert_eq!(approved.verdict.as_deref(), Some("approved"));
+    let superseded = ledger
+        .record_review(
+            "task",
+            Some("auth"),
+            "codex",
+            "aaa",
+            "aaa",
+            "fp",
+            "changes-requested",
+            task_review_body(),
+            false,
+        )
+        .expect_err("superseded");
+    assert_eq!(superseded.to_string(), "no pending review");
+    let task = &ledger.context(Some("auth"), 20).expect("context").tasks[0].task;
+    assert_eq!(task.status, Status::Done);
+    let latest = ledger
+        .latest_review("task", Some("auth"))
+        .expect("latest")
+        .expect("row");
+    assert_eq!(latest.id, approved.id);
+    assert_eq!(latest.verdict.as_deref(), Some("approved"));
+}
+
 fn done_task() -> (tempfile::TempDir, Ledger) {
     let (dir, path) = fresh_path();
     let mut ledger = Ledger::initialize(&path).expect("init");
@@ -824,6 +984,27 @@ fn done_task() -> (tempfile::TempDir, Ledger) {
     ledger.claim_task("auth", "cursor").expect("claim");
     ledger.finish_task("auth", None).expect("done");
     (dir, ledger)
+}
+
+fn record_release(ledger: &mut Ledger, sha: &str, verdict: &str) -> relaybook_core::Review {
+    ledger
+        .start_review(
+            "release", None, None, "feature", "codex", None, sha, None, "fp",
+        )
+        .expect("start");
+    ledger
+        .record_review(
+            "release",
+            None,
+            "codex",
+            sha,
+            sha,
+            "fp",
+            verdict,
+            release_review_body(),
+            false,
+        )
+        .expect("record")
 }
 
 fn record_task(ledger: &mut Ledger, slug: &str, sha: &str) {

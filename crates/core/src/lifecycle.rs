@@ -3,6 +3,8 @@
 //! Task phases use the latest task report and the latest task review.
 //! A task is in a release's scope when any of its task reports has a
 //! `commit_sha` in the caller-supplied range (`merge-base(main, HEAD)..HEAD`).
+//! Release-reviewed requires the latest release review at `head` to be
+//! approved, every in-scope task to be accepted, and no task to be claimed.
 //! Release-reviewed and signed-off are recomputed against the head the caller
 //! passes; a different head invalidates both.
 
@@ -101,7 +103,8 @@ pub fn lifecycle(
         });
         snaps.push(TaskSnap { shas, phase });
     }
-    let release = release_phase(conn, head, commits_in_range, &snaps)?;
+    let any_claimed = rows.iter().any(|row| row.status == "claimed");
+    let release = release_phase(conn, head, commits_in_range, &snaps, any_claimed)?;
     Ok(Lifecycle { tasks, release })
 }
 
@@ -143,11 +146,12 @@ fn release_phase(
     head: &str,
     commits_in_range: &[String],
     snaps: &[TaskSnap],
+    any_claimed: bool,
 ) -> Result<Option<ReleasePhase>, Error> {
     if authorization_at(conn, head)? {
         return Ok(Some(ReleasePhase::SignedOff));
     }
-    if !approved_release_at(conn, head)? {
+    if any_claimed || !approved_release_at(conn, head)? {
         return Ok(None);
     }
     for snap in snaps {
@@ -227,15 +231,36 @@ fn authorization_at(conn: &Connection, head: &str) -> Result<bool, Error> {
     Ok(id.is_some())
 }
 
-fn approved_release_at(conn: &Connection, head: &str) -> Result<bool, Error> {
-    let id: Option<i64> = conn
+/// Latest release review at `commit_sha`, including a still-pending row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReleaseReviewAt {
+    pub id: i64,
+    pub verdict: Option<String>,
+}
+
+pub(crate) fn latest_release_review_at(
+    conn: &Connection,
+    commit_sha: &str,
+) -> Result<Option<ReleaseReviewAt>, Error> {
+    let review = conn
         .query_row(
-            "SELECT id FROM reviews
-             WHERE scope = 'release' AND verdict = 'approved' AND commit_sha = ?1
+            "SELECT id, verdict FROM reviews
+             WHERE scope = 'release' AND commit_sha = ?1
+             ORDER BY id DESC
              LIMIT 1",
-            params![head],
-            |row| row.get(0),
+            params![commit_sha],
+            |row| {
+                Ok(ReleaseReviewAt {
+                    id: row.get(0)?,
+                    verdict: row.get(1)?,
+                })
+            },
         )
         .optional()?;
-    Ok(id.is_some())
+    Ok(review)
+}
+
+fn approved_release_at(conn: &Connection, head: &str) -> Result<bool, Error> {
+    Ok(latest_release_review_at(conn, head)?
+        .is_some_and(|review| review.verdict.as_deref() == Some("approved")))
 }
