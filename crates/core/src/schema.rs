@@ -2,7 +2,7 @@
 ///
 /// `events_progress_once` rejects a second progress event for the same task
 /// and commit. A null commit (no git HEAD) is not covered, so those reports append.
-pub(crate) const SCHEMA_VERSION: i64 = 6;
+pub(crate) const SCHEMA_VERSION: i64 = 7;
 
 pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS tasks (
@@ -76,7 +76,10 @@ CREATE TABLE IF NOT EXISTS reports (
     created_at TEXT NOT NULL,
     reviewed_at TEXT,
     verdict TEXT CHECK (verdict IS NULL OR verdict IN ('accepted', 'reopened')),
-    review_note TEXT
+    review_note TEXT,
+    commit_sha TEXT,
+    base_sha TEXT,
+    graph_sha TEXT
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -101,6 +104,48 @@ CREATE TABLE IF NOT EXISTS runs (
     failure_streak INTEGER NOT NULL DEFAULT 0,
     current_slug TEXT,
     complete_requested INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('task', 'release')),
+    task_id INTEGER REFERENCES tasks(id),
+    report_id INTEGER REFERENCES reports(id),
+    run_id INTEGER REFERENCES runs(id),
+    branch TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    reviewer_override INTEGER NOT NULL DEFAULT 0 CHECK (reviewer_override IN (0, 1)),
+    base_sha TEXT,
+    commit_sha TEXT NOT NULL,
+    graph_sha TEXT,
+    ledger_mark TEXT NOT NULL,
+    verdict TEXT CHECK (verdict IN ('approved', 'changes_requested')),
+    body TEXT,
+    bytes INTEGER,
+    started_at TEXT NOT NULL,
+    recorded_at TEXT,
+    CHECK ((scope = 'task') = (task_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS graph_builds (
+    id INTEGER PRIMARY KEY,
+    step TEXT NOT NULL,
+    task_id INTEGER REFERENCES tasks(id),
+    run_id INTEGER REFERENCES runs(id),
+    commit_sha TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('built', 'skipped', 'failed')),
+    detail TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS release_authorizations (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER REFERENCES runs(id),
+    branch TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    review_id INTEGER NOT NULL REFERENCES reviews(id),
+    authorized_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 ";
 
@@ -217,4 +262,49 @@ ON events (
 )
 WHERE kind = 'progress'
   AND json_extract(payload, '$.commit') IS NOT NULL;
+";
+
+/// Additive v7 tables. Report SHA columns are added with `column_exists` guards.
+pub(crate) const MIGRATE_V6_TO_V7: &str = "
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY,
+    scope TEXT NOT NULL CHECK (scope IN ('task', 'release')),
+    task_id INTEGER REFERENCES tasks(id),
+    report_id INTEGER REFERENCES reports(id),
+    run_id INTEGER REFERENCES runs(id),
+    branch TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    reviewer_override INTEGER NOT NULL DEFAULT 0 CHECK (reviewer_override IN (0, 1)),
+    base_sha TEXT,
+    commit_sha TEXT NOT NULL,
+    graph_sha TEXT,
+    ledger_mark TEXT NOT NULL,
+    verdict TEXT CHECK (verdict IN ('approved', 'changes_requested')),
+    body TEXT,
+    bytes INTEGER,
+    started_at TEXT NOT NULL,
+    recorded_at TEXT,
+    CHECK ((scope = 'task') = (task_id IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS graph_builds (
+    id INTEGER PRIMARY KEY,
+    step TEXT NOT NULL,
+    task_id INTEGER REFERENCES tasks(id),
+    run_id INTEGER REFERENCES runs(id),
+    commit_sha TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('built', 'skipped', 'failed')),
+    detail TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS release_authorizations (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER REFERENCES runs(id),
+    branch TEXT NOT NULL,
+    commit_sha TEXT NOT NULL,
+    review_id INTEGER NOT NULL REFERENCES reviews(id),
+    authorized_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 ";

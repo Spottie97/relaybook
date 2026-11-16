@@ -4,6 +4,7 @@ mod deps;
 mod error;
 mod ledger;
 pub mod legacy;
+pub mod lifecycle;
 mod migrate;
 mod model;
 mod replay;
@@ -13,7 +14,7 @@ mod schema;
 mod settings;
 
 pub use error::Error;
-pub use ledger::{Absorb, Ledger};
+pub use ledger::{Absorb, GraphBuild, Ledger, ReleaseAuthorization, Review};
 pub use legacy::{LegacyMove, migrate_legacy_ledger};
 pub use model::{
     Context, Decision, Event, EventKind, RECENT_EVENT_LIMIT, Status, Step, Task, TaskDetail,

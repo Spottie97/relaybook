@@ -27,6 +27,60 @@ pub struct Ledger {
     conn: Connection,
 }
 
+/// One row of `reviews`. `verdict` is empty while the review is pending.
+///
+/// `ledger_mark` is the stored JSON snapshot. `fingerprint` is kept in that
+/// JSON because schema v7 has no fingerprint column; it is not one of the
+/// five ledger fields compared for "ledger changed during review".
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Review {
+    pub id: i64,
+    pub scope: String,
+    pub task_id: Option<i64>,
+    pub report_id: Option<i64>,
+    pub run_id: Option<i64>,
+    pub branch: String,
+    pub reviewer: String,
+    pub reviewer_override: bool,
+    pub base_sha: Option<String>,
+    pub commit_sha: String,
+    pub graph_sha: Option<String>,
+    pub ledger_mark: String,
+    pub fingerprint: String,
+    pub verdict: Option<String>,
+    pub body: Option<serde_json::Value>,
+    pub bytes: Option<i64>,
+    pub started_at: String,
+    pub recorded_at: Option<String>,
+}
+
+/// One row of `graph_builds`. `step` is `plan`, `implement`, `commit`,
+/// `review`, or `release-review`. When `status` is `built`, `commit_sha` is
+/// the graph SHA.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GraphBuild {
+    pub id: i64,
+    pub step: String,
+    pub task_id: Option<i64>,
+    pub run_id: Option<i64>,
+    pub commit_sha: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
+/// One row of `release_authorizations`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReleaseAuthorization {
+    pub id: i64,
+    pub run_id: Option<i64>,
+    pub branch: String,
+    pub commit_sha: String,
+    pub review_id: i64,
+    pub authorized_by: String,
+    pub created_at: String,
+}
+
 impl Ledger {
     pub fn initialize(path: &std::path::Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
@@ -403,24 +457,235 @@ impl Ledger {
             if task.status != Status::Done {
                 return Err(Error::NotDone);
             }
-            let ts = now(conn)?;
-            conn.execute(
-                "UPDATE tasks SET status = 'open', updated_at = ?1 WHERE id = ?2",
-                params![ts, task.id],
-            )?;
-            insert_event(
-                conn,
-                EventKind::StatusChanged,
-                serde_json::json!({
-                    "slug": slug,
-                    "from": "done",
-                    "to": "open",
-                    "reason": reason,
-                }),
-            )?;
-            reports::mark_latest_reopened(conn, task.id, &reason, &ts)?;
+            reopen_done_task(conn, &task, &reason)?;
             load_task(conn, &slug)
         })
+    }
+
+    /// Start a pending task or release review. `commit_sha` is HEAD.
+    /// `fingerprint` is the worktree fingerprint captured with that HEAD.
+    #[allow(clippy::too_many_arguments)] // one argument per reviews column the caller supplies
+    pub fn start_review(
+        &mut self,
+        scope: &str,
+        task: Option<&str>,
+        run_id: Option<i64>,
+        branch: &str,
+        reviewer: &str,
+        base_sha: Option<&str>,
+        commit_sha: &str,
+        graph_sha: Option<&str>,
+        fingerprint: &str,
+    ) -> Result<Review, Error> {
+        let scope = review_scope(scope)?;
+        let branch = required_text("branch", branch)?;
+        let reviewer = required_text("reviewer", reviewer)?;
+        let commit_sha = required_text("commit_sha", commit_sha)?;
+        let task = checked_task_slug(scope, task)?;
+        self.transaction(|conn| {
+            let task_id = scoped_task_id(conn, scope, task.as_deref())?;
+            let report_id = match task_id {
+                Some(id) => latest_task_report_id(conn, id)?,
+                None => None,
+            };
+            let ledger_mark = encode_mark(&capture_mark(conn)?, fingerprint)?;
+            let started_at = now(conn)?;
+            conn.execute(
+                "INSERT INTO reviews (
+                    scope, task_id, report_id, run_id, branch, reviewer, reviewer_override,
+                    base_sha, commit_sha, graph_sha, ledger_mark, started_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    scope,
+                    task_id,
+                    report_id,
+                    run_id,
+                    branch,
+                    reviewer,
+                    base_sha,
+                    commit_sha,
+                    graph_sha,
+                    ledger_mark,
+                    started_at,
+                ],
+            )?;
+            load_review(conn, conn.last_insert_rowid())
+        })
+    }
+
+    /// Record the pending review. `sha` must equal `head` and the HEAD stored
+    /// at `start_review`. A task verdict of `changes_requested` reopens that task.
+    #[allow(clippy::too_many_arguments)] // sha, head, fingerprint, and the verdict are distinct
+    pub fn record_review(
+        &mut self,
+        scope: &str,
+        task: Option<&str>,
+        reviewer: &str,
+        sha: &str,
+        head: &str,
+        fingerprint: &str,
+        verdict: &str,
+        body: &str,
+        reviewer_override: bool,
+    ) -> Result<Review, Error> {
+        let scope = review_scope(scope)?;
+        let reviewer = required_text("reviewer", reviewer)?;
+        let sha = required_text("sha", sha)?;
+        let head = required_text("head", head)?;
+        let verdict = review_verdict(&required_text("verdict", verdict)?)?;
+        let task = checked_task_slug(scope, task)?;
+        let body = reports::review_body(scope, body)?;
+        if sha != head {
+            return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
+        }
+        self.transaction(|conn| {
+            let task_id = scoped_task_id(conn, scope, task.as_deref())?;
+            let id = pending_review_id(conn, scope, task_id)?;
+            let review = load_review(conn, id)?;
+            if review.commit_sha != head {
+                return Err(Error::InvalidSetting(
+                    "reviewer changed the repository".to_string(),
+                ));
+            }
+            let (stored_mark, stored_fingerprint) = decode_mark(&review.ledger_mark)?;
+            if stored_fingerprint != fingerprint {
+                return Err(Error::InvalidSetting(
+                    "reviewer changed the repository".to_string(),
+                ));
+            }
+            if capture_mark(conn)? != stored_mark {
+                return Err(Error::InvalidSetting(
+                    "ledger changed during review".to_string(),
+                ));
+            }
+            let recorded_at = now(conn)?;
+            conn.execute(
+                "UPDATE reviews
+                 SET reviewer = ?1, reviewer_override = ?2, verdict = ?3,
+                     body = ?4, bytes = ?5, recorded_at = ?6
+                 WHERE id = ?7",
+                params![
+                    reviewer,
+                    i64::from(reviewer_override),
+                    verdict,
+                    body,
+                    body.len() as i64,
+                    recorded_at,
+                    id,
+                ],
+            )?;
+            if scope == "task"
+                && verdict == "changes_requested"
+                && let Some(slug) = task.as_deref()
+            {
+                let current = load_task(conn, slug)?;
+                if current.status == Status::Done {
+                    reopen_done_task(conn, &current, "changes requested")?;
+                }
+            }
+            load_review(conn, id)
+        })
+    }
+
+    pub fn latest_review(&self, scope: &str, task: Option<&str>) -> Result<Option<Review>, Error> {
+        let scope = review_scope(scope)?;
+        let task = checked_task_slug(scope, task)?;
+        let task_id = scoped_task_id(&self.conn, scope, task.as_deref())?;
+        let id = latest_review_id(&self.conn, scope, task_id)?;
+        match id {
+            Some(id) => Ok(Some(load_review(&self.conn, id)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn record_graph_build(
+        &mut self,
+        step: &str,
+        task: Option<&str>,
+        run_id: Option<i64>,
+        commit_sha: &str,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<GraphBuild, Error> {
+        let step = graph_step(step)?;
+        let status = graph_status(status)?;
+        let commit_sha = required_text("commit_sha", commit_sha)?;
+        let detail = match detail {
+            Some(text) => Some(required_text("detail", text)?),
+            None => None,
+        };
+        let task = match task {
+            Some(slug) => Some(checked_slug(slug)?),
+            None => None,
+        };
+        self.transaction(|conn| {
+            let task_id = match &task {
+                Some(slug) => Some(load_task(conn, slug)?.id),
+                None => None,
+            };
+            let created_at = now(conn)?;
+            conn.execute(
+                "INSERT INTO graph_builds (
+                    step, task_id, run_id, commit_sha, status, detail, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    step, task_id, run_id, commit_sha, status, detail, created_at
+                ],
+            )?;
+            load_graph_build(conn, conn.last_insert_rowid())
+        })
+    }
+
+    /// Record sign-off. `sha` must equal `head`, and an approved release
+    /// review must exist at that commit. TTY confirmation stays with the CLI.
+    pub fn authorize_release(
+        &mut self,
+        branch: &str,
+        sha: &str,
+        head: &str,
+        authorized_by: &str,
+        run_id: Option<i64>,
+    ) -> Result<ReleaseAuthorization, Error> {
+        let branch = required_text("branch", branch)?;
+        let sha = required_text("sha", sha)?;
+        let head = required_text("head", head)?;
+        let authorized_by = required_text("authorized_by", authorized_by)?;
+        if sha != head {
+            return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
+        }
+        self.transaction(|conn| {
+            let review_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM reviews
+                     WHERE scope = 'release' AND verdict = 'approved' AND commit_sha = ?1
+                     ORDER BY id DESC
+                     LIMIT 1",
+                    params![sha],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(review_id) = review_id else {
+                return Err(Error::InvalidSetting(
+                    "no approved release review".to_string(),
+                ));
+            };
+            let created_at = now(conn)?;
+            conn.execute(
+                "INSERT INTO release_authorizations (
+                    run_id, branch, commit_sha, review_id, authorized_by, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![run_id, branch, sha, review_id, authorized_by, created_at],
+            )?;
+            load_authorization(conn, conn.last_insert_rowid())
+        })
+    }
+
+    pub fn lifecycle(
+        &self,
+        head: &str,
+        commits_in_range: &[String],
+    ) -> Result<crate::lifecycle::Lifecycle, Error> {
+        crate::lifecycle::lifecycle(&self.conn, head, commits_in_range)
     }
 
     pub fn add_note(&mut self, author: &str, text: &str) -> Result<i64, Error> {
@@ -1051,6 +1316,350 @@ fn into_event(row: EventRow) -> Result<Event, Error> {
     })
 }
 
+fn reopen_done_task(conn: &Connection, task: &Task, reason: &str) -> Result<(), Error> {
+    let ts = now(conn)?;
+    conn.execute(
+        "UPDATE tasks SET status = 'open', updated_at = ?1 WHERE id = ?2",
+        params![ts, task.id],
+    )?;
+    insert_event(
+        conn,
+        EventKind::StatusChanged,
+        serde_json::json!({
+            "slug": task.slug,
+            "from": "done",
+            "to": "open",
+            "reason": reason,
+        }),
+    )?;
+    reports::mark_latest_reopened(conn, task.id, reason, &ts)?;
+    Ok(())
+}
+
+fn review_scope(scope: &str) -> Result<&'static str, Error> {
+    match scope.trim() {
+        "task" => Ok("task"),
+        "release" => Ok("release"),
+        other => Err(Error::InvalidSetting(format!(
+            "invalid review scope: {other}"
+        ))),
+    }
+}
+
+fn review_verdict(verdict: &str) -> Result<&'static str, Error> {
+    match verdict {
+        "approved" => Ok("approved"),
+        "changes_requested" | "changes-requested" => Ok("changes_requested"),
+        other => Err(Error::InvalidSetting(format!("invalid verdict: {other}"))),
+    }
+}
+
+fn graph_step(step: &str) -> Result<&'static str, Error> {
+    match step.trim() {
+        "plan" => Ok("plan"),
+        "implement" => Ok("implement"),
+        "commit" => Ok("commit"),
+        "review" => Ok("review"),
+        "release-review" => Ok("release-review"),
+        other => Err(Error::InvalidSetting(format!(
+            "invalid graph step: {other}"
+        ))),
+    }
+}
+
+fn graph_status(status: &str) -> Result<&'static str, Error> {
+    match status.trim() {
+        "built" => Ok("built"),
+        "skipped" => Ok("skipped"),
+        "failed" => Ok("failed"),
+        other => Err(Error::InvalidSetting(format!(
+            "invalid graph status: {other}"
+        ))),
+    }
+}
+
+fn checked_task_slug(scope: &str, task: Option<&str>) -> Result<Option<String>, Error> {
+    match (scope, task) {
+        ("task", Some(slug)) => Ok(Some(checked_slug(slug)?)),
+        ("task", None) => Err(Error::InvalidSetting(
+            "task is required for a task review".to_string(),
+        )),
+        ("release", None) => Ok(None),
+        ("release", Some(_)) => Err(Error::InvalidSetting(
+            "a release review has no task".to_string(),
+        )),
+        _ => Err(Error::InvalidSetting(format!(
+            "invalid review scope: {scope}"
+        ))),
+    }
+}
+
+fn scoped_task_id(
+    conn: &Connection,
+    scope: &str,
+    task: Option<&str>,
+) -> Result<Option<i64>, Error> {
+    match (scope, task) {
+        ("task", Some(slug)) => Ok(Some(load_task(conn, slug)?.id)),
+        ("task", None) => Err(Error::InvalidSetting(
+            "task is required for a task review".to_string(),
+        )),
+        ("release", _) => Ok(None),
+        _ => Err(Error::InvalidSetting(format!(
+            "invalid review scope: {scope}"
+        ))),
+    }
+}
+
+fn latest_task_report_id(conn: &Connection, task_id: i64) -> Result<Option<i64>, Error> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM reports
+             WHERE task_id = ?1 AND kind = 'task'
+             ORDER BY id DESC
+             LIMIT 1",
+            params![task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+fn pending_review_id(conn: &Connection, scope: &str, task_id: Option<i64>) -> Result<i64, Error> {
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM reviews
+             WHERE scope = ?1 AND verdict IS NULL
+               AND ((?2 IS NULL AND task_id IS NULL) OR task_id = ?2)
+             ORDER BY id DESC
+             LIMIT 1",
+            params![scope, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    id.ok_or_else(|| Error::InvalidSetting("no pending review".to_string()))
+}
+
+fn latest_review_id(
+    conn: &Connection,
+    scope: &str,
+    task_id: Option<i64>,
+) -> Result<Option<i64>, Error> {
+    let id = conn
+        .query_row(
+            "SELECT id FROM reviews
+             WHERE scope = ?1
+               AND ((?2 IS NULL AND task_id IS NULL) OR task_id = ?2)
+             ORDER BY id DESC
+             LIMIT 1",
+            params![scope, task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LedgerMark {
+    events: Option<i64>,
+    reports: Option<i64>,
+    decisions: Option<i64>,
+    steps: Option<i64>,
+    tasks_updated_at: Option<String>,
+}
+
+fn capture_mark(conn: &Connection) -> Result<LedgerMark, Error> {
+    Ok(LedgerMark {
+        events: max_id(conn, "events")?,
+        reports: max_id(conn, "reports")?,
+        decisions: max_id(conn, "decisions")?,
+        steps: max_id(conn, "steps")?,
+        tasks_updated_at: conn
+            .query_row("SELECT MAX(updated_at) FROM tasks", [], |row| row.get(0))?,
+    })
+}
+
+fn max_id(conn: &Connection, table: &str) -> Result<Option<i64>, Error> {
+    let sql = match table {
+        "events" => "SELECT MAX(id) FROM events",
+        "reports" => "SELECT MAX(id) FROM reports",
+        "decisions" => "SELECT MAX(id) FROM decisions",
+        "steps" => "SELECT MAX(id) FROM steps",
+        other => {
+            return Err(Error::InvalidSetting(format!(
+                "unknown mark table: {other}"
+            )));
+        }
+    };
+    let value = conn.query_row(sql, [], |row| row.get(0))?;
+    Ok(value)
+}
+
+fn encode_mark(mark: &LedgerMark, fingerprint: &str) -> Result<String, Error> {
+    serde_json::to_string(&serde_json::json!({
+        "events": mark.events,
+        "reports": mark.reports,
+        "decisions": mark.decisions,
+        "steps": mark.steps,
+        "tasks_updated_at": mark.tasks_updated_at,
+        "fingerprint": fingerprint,
+    }))
+    .map_err(|err| Error::Json(err.to_string()))
+}
+
+fn decode_mark(text: &str) -> Result<(LedgerMark, String), Error> {
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|err| Error::Json(err.to_string()))?;
+    let number = |key: &str| value.get(key).and_then(serde_json::Value::as_i64);
+    let updated = value
+        .get("tasks_updated_at")
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let fingerprint = value
+        .get("fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok((
+        LedgerMark {
+            events: number("events"),
+            reports: number("reports"),
+            decisions: number("decisions"),
+            steps: number("steps"),
+            tasks_updated_at: updated,
+        },
+        fingerprint,
+    ))
+}
+
+struct ReviewRow {
+    id: i64,
+    scope: String,
+    task_id: Option<i64>,
+    report_id: Option<i64>,
+    run_id: Option<i64>,
+    branch: String,
+    reviewer: String,
+    reviewer_override: i64,
+    base_sha: Option<String>,
+    commit_sha: String,
+    graph_sha: Option<String>,
+    ledger_mark: String,
+    verdict: Option<String>,
+    body: Option<String>,
+    bytes: Option<i64>,
+    started_at: String,
+    recorded_at: Option<String>,
+}
+
+fn load_review(conn: &Connection, id: i64) -> Result<Review, Error> {
+    let row = conn
+        .query_row(
+            "SELECT id, scope, task_id, report_id, run_id, branch, reviewer, reviewer_override,
+                    base_sha, commit_sha, graph_sha, ledger_mark, verdict, body, bytes,
+                    started_at, recorded_at
+             FROM reviews WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(ReviewRow {
+                    id: row.get(0)?,
+                    scope: row.get(1)?,
+                    task_id: row.get(2)?,
+                    report_id: row.get(3)?,
+                    run_id: row.get(4)?,
+                    branch: row.get(5)?,
+                    reviewer: row.get(6)?,
+                    reviewer_override: row.get(7)?,
+                    base_sha: row.get(8)?,
+                    commit_sha: row.get(9)?,
+                    graph_sha: row.get(10)?,
+                    ledger_mark: row.get(11)?,
+                    verdict: row.get(12)?,
+                    body: row.get(13)?,
+                    bytes: row.get(14)?,
+                    started_at: row.get(15)?,
+                    recorded_at: row.get(16)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Err(Error::InvalidSetting(format!("no such review: {id}")));
+    };
+    let (_, fingerprint) = decode_mark(&row.ledger_mark)?;
+    let body = match row.body {
+        Some(text) => {
+            Some(serde_json::from_str(&text).map_err(|err| Error::Json(err.to_string()))?)
+        }
+        None => None,
+    };
+    Ok(Review {
+        id: row.id,
+        scope: row.scope,
+        task_id: row.task_id,
+        report_id: row.report_id,
+        run_id: row.run_id,
+        branch: row.branch,
+        reviewer: row.reviewer,
+        reviewer_override: row.reviewer_override != 0,
+        base_sha: row.base_sha,
+        commit_sha: row.commit_sha,
+        graph_sha: row.graph_sha,
+        ledger_mark: row.ledger_mark,
+        fingerprint,
+        verdict: row.verdict,
+        body,
+        bytes: row.bytes,
+        started_at: row.started_at,
+        recorded_at: row.recorded_at,
+    })
+}
+
+fn load_graph_build(conn: &Connection, id: i64) -> Result<GraphBuild, Error> {
+    let row = conn
+        .query_row(
+            "SELECT id, step, task_id, run_id, commit_sha, status, detail, created_at
+             FROM graph_builds WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(GraphBuild {
+                    id: row.get(0)?,
+                    step: row.get(1)?,
+                    task_id: row.get(2)?,
+                    run_id: row.get(3)?,
+                    commit_sha: row.get(4)?,
+                    status: row.get(5)?,
+                    detail: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()?;
+    row.ok_or_else(|| Error::InvalidSetting(format!("no such graph build: {id}")))
+}
+
+fn load_authorization(conn: &Connection, id: i64) -> Result<ReleaseAuthorization, Error> {
+    let row = conn
+        .query_row(
+            "SELECT id, run_id, branch, commit_sha, review_id, authorized_by, created_at
+             FROM release_authorizations WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(ReleaseAuthorization {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    branch: row.get(2)?,
+                    commit_sha: row.get(3)?,
+                    review_id: row.get(4)?,
+                    authorized_by: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    row.ok_or_else(|| Error::InvalidSetting(format!("no such release authorization: {id}")))
+}
+
 fn constraint_message(err: &rusqlite::Error) -> Option<&str> {
     match err {
         rusqlite::Error::SqliteFailure(_, Some(message)) => Some(message.as_str()),
@@ -1228,7 +1837,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let deps: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_deps'",
@@ -1244,7 +1853,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let stored_again: String = conn
             .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
                 row.get(0)
@@ -1299,7 +1908,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -1353,6 +1962,6 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 }

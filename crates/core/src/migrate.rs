@@ -2,7 +2,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::Error;
 use crate::schema::{
-    MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4, MIGRATE_V5_TO_V6, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4, MIGRATE_V5_TO_V6, MIGRATE_V6_TO_V7,
+    SCHEMA, SCHEMA_VERSION,
 };
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
@@ -47,6 +48,18 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
     }
     if version < 6 && table_exists(&tx, "events")? {
         tx.execute_batch(MIGRATE_V5_TO_V6)?;
+    }
+    if version < 7 {
+        if table_exists(&tx, "reports")? && !column_exists(&tx, "reports", "commit_sha")? {
+            tx.execute("ALTER TABLE reports ADD COLUMN commit_sha TEXT", [])?;
+        }
+        if table_exists(&tx, "reports")? && !column_exists(&tx, "reports", "base_sha")? {
+            tx.execute("ALTER TABLE reports ADD COLUMN base_sha TEXT", [])?;
+        }
+        if table_exists(&tx, "reports")? && !column_exists(&tx, "reports", "graph_sha")? {
+            tx.execute("ALTER TABLE reports ADD COLUMN graph_sha TEXT", [])?;
+        }
+        tx.execute_batch(MIGRATE_V6_TO_V7)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
