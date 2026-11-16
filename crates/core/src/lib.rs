@@ -14,7 +14,10 @@ mod schema;
 mod settings;
 
 pub use error::Error;
-pub use ledger::{Absorb, GraphBuild, Ledger, ReleaseAuthorization, Review, TaskReport};
+pub use ledger::{
+    Absorb, AnchoredClaim, ClaimAnchor, GraphBuild, Ledger, ReleaseAuthorization, Review,
+    TaskReport,
+};
 pub use legacy::{LegacyMove, migrate_legacy_ledger};
 pub use model::{
     Context, Decision, Event, EventKind, RECENT_EVENT_LIMIT, Status, Step, Task, TaskDetail,

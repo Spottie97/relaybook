@@ -37,6 +37,12 @@ fn kind() -> String {
 }
 
 fn graphify(args: &[String]) {
+    if let Ok(path) = env::var("GRAPHIFY_CWD_LOG") {
+        let cwd = env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        append(&path, &cwd);
+    }
     if env::var("RELAYBOOK_FAKE_GRAPHIFY").ok().as_deref() == Some("claude-settings")
         && args.first().map(String::as_str) == Some("claude")
     {

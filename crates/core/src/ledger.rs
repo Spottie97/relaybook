@@ -63,6 +63,26 @@ pub struct TaskReport {
     pub graph_sha: Option<String>,
 }
 
+/// SHAs frozen when a gated claim is recorded.
+///
+/// `graph_sha` is set only when that claim's own graph build is `built`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimAnchor {
+    pub base_sha: Option<String>,
+    pub graph_sha: Option<String>,
+}
+
+/// Result of [`Ledger::claim_task_anchored`].
+///
+/// `graph_build_id` is the `implement` row whose commit SHA is `base_sha`.
+/// It stays null when the claim had no HEAD.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnchoredClaim {
+    pub task: Task,
+    pub base_sha: Option<String>,
+    pub graph_build_id: Option<i64>,
+}
+
 /// One row of `graph_builds`. `step` is `plan`, `implement`, `commit`,
 /// `review`, or `release-review`. When `status` is `built`, `commit_sha` is
 /// the graph SHA.
@@ -252,6 +272,111 @@ impl Ledger {
             revalidate()?;
             Ok(task)
         })
+    }
+
+    /// Gated claim. The claim event stores `base_sha` and `graph_build_id`.
+    ///
+    /// `prepare` runs inside the write transaction after the task is known to
+    /// be open and before the claim is written. It returns HEAD, or `None`
+    /// when the repository has no commit. When HEAD exists, this inserts the
+    /// claim's `implement` graph row in the same transaction. Graphify runs
+    /// after commit; [`Self::set_graph_build_result`] then sets that row's
+    /// status without changing its commit SHA. Later `implement` rows do not
+    /// replace this anchor. The event log stays insert-only.
+    pub fn claim_task_anchored(
+        &mut self,
+        slug: &str,
+        by: &str,
+        run_id: Option<i64>,
+        prepare: impl FnOnce() -> Result<Option<String>, Error>,
+    ) -> Result<AnchoredClaim, Error> {
+        let slug = checked_slug(slug)?;
+        let by = required_text("by", by)?;
+        self.transaction(|conn| {
+            let task = load_task(conn, &slug)?;
+            if task.status != Status::Open {
+                return Err(Error::AlreadyClaimed);
+            }
+            if !task.needs.is_empty() {
+                return Err(Error::WaitingOn(task.needs.join(", ")));
+            }
+            let base_sha = match prepare()? {
+                Some(sha) => Some(required_text("base_sha", &sha)?),
+                None => None,
+            };
+            let ts = now(conn)?;
+            let changed = conn.execute(
+                "UPDATE tasks
+                 SET status = 'claimed', claimed_by = ?1, updated_at = ?2
+                 WHERE id = ?3 AND status = 'open'",
+                params![by, ts, task.id],
+            )?;
+            if changed == 0 {
+                return Err(Error::AlreadyClaimed);
+            }
+            let graph_build_id = match &base_sha {
+                Some(sha) => {
+                    let step = graph_step("implement")?;
+                    let status = graph_status("failed")?;
+                    let build =
+                        insert_graph_build(conn, step, Some(task.id), run_id, sha, status, None)?;
+                    Some(build.id)
+                }
+                None => None,
+            };
+            insert_event(
+                conn,
+                EventKind::Claimed,
+                serde_json::json!({
+                    "slug": slug,
+                    "by": by,
+                    "base_sha": base_sha,
+                    "graph_build_id": graph_build_id,
+                }),
+            )?;
+            let task = load_task(conn, &slug)?;
+            Ok(AnchoredClaim {
+                task,
+                base_sha,
+                graph_build_id,
+            })
+        })
+    }
+
+    /// Anchor stored for the latest claim of `slug`.
+    ///
+    /// `None` when that claim did not record one. `graph_sha` is the claim
+    /// HEAD when the linked graph row settled as `built`, and null otherwise.
+    pub fn claim_anchor(&self, slug: &str) -> Result<Option<ClaimAnchor>, Error> {
+        let slug = checked_slug(slug)?;
+        let payload: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload FROM events
+                 WHERE kind = 'claimed' AND json_extract(payload, '$.slug') = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![slug],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let Some(stored) = parse_claim_anchor(&payload)? else {
+            return Ok(None);
+        };
+        let base_sha = stored.base_sha;
+        let graph_build_id = stored.graph_build_id;
+        let built = match graph_build_id {
+            Some(id) => load_graph_build(&self.conn, id)?.status == "built",
+            None => false,
+        };
+        let graph_sha = if built { base_sha.clone() } else { None };
+        Ok(Some(ClaimAnchor {
+            base_sha,
+            graph_sha,
+        }))
     }
 
     pub fn complete_task(&mut self, slug: &str) -> Result<Task, Error> {
@@ -750,21 +875,51 @@ impl Ledger {
                 Some(slug) => Some(load_task(conn, slug)?.id),
                 None => None,
             };
-            let created_at = now(conn)?;
-            conn.execute(
-                "INSERT INTO graph_builds (
-                    step, task_id, run_id, commit_sha, status, detail, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    step, task_id, run_id, commit_sha, status, detail, created_at
-                ],
+            insert_graph_build(
+                conn,
+                step,
+                task_id,
+                run_id,
+                &commit_sha,
+                status,
+                detail.as_deref(),
+            )
+        })
+    }
+
+    /// Set `status` and `detail` on an existing graph row.
+    ///
+    /// `commit_sha` stays as it was inserted. Gated claim uses this to settle
+    /// the anchor row after Graphify, without letting a later refresh replace
+    /// that SHA.
+    pub fn set_graph_build_result(
+        &mut self,
+        id: i64,
+        status: &str,
+        detail: Option<&str>,
+    ) -> Result<GraphBuild, Error> {
+        let status = graph_status(status)?;
+        let detail = match detail {
+            Some(text) => Some(required_text("detail", text)?),
+            None => None,
+        };
+        self.transaction(|conn| {
+            let updated = conn.execute(
+                "UPDATE graph_builds SET status = ?1, detail = ?2 WHERE id = ?3",
+                params![status, detail, id],
             )?;
-            load_graph_build(conn, conn.last_insert_rowid())
+            if updated == 0 {
+                return Err(Error::InvalidSetting(format!("no such graph build: {id}")));
+            }
+            load_graph_build(conn, id)
         })
     }
 
     /// Latest `graph_builds` row for this step. `task` is null for `plan` and
     /// `release-review`.
+    ///
+    /// Not the gated claim anchor. That anchor is the claim event's
+    /// `graph_build_id`.
     pub fn latest_graph_build(
         &self,
         step: &str,
@@ -1772,6 +1927,74 @@ fn load_review(conn: &Connection, id: i64) -> Result<Review, Error> {
     })
 }
 
+fn insert_graph_build(
+    conn: &Connection,
+    step: &str,
+    task_id: Option<i64>,
+    run_id: Option<i64>,
+    commit_sha: &str,
+    status: &str,
+    detail: Option<&str>,
+) -> Result<GraphBuild, Error> {
+    let created_at = now(conn)?;
+    conn.execute(
+        "INSERT INTO graph_builds (
+            step, task_id, run_id, commit_sha, status, detail, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            step, task_id, run_id, commit_sha, status, detail, created_at
+        ],
+    )?;
+    load_graph_build(conn, conn.last_insert_rowid())
+}
+
+struct StoredClaimAnchor {
+    base_sha: Option<String>,
+    graph_build_id: Option<i64>,
+}
+
+/// `None` when this claim event has no anchor fields. Both fields are present
+/// on a gated claim, including JSON null when that SHA or row does not exist.
+fn parse_claim_anchor(payload: &str) -> Result<Option<StoredClaimAnchor>, Error> {
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|err| Error::Json(err.to_string()))?;
+    match (value.get("base_sha"), value.get("graph_build_id")) {
+        (None, None) => Ok(None),
+        (None, Some(_)) | (Some(_), None) => Err(Error::InvalidSetting(
+            "claim anchor is incomplete".to_string(),
+        )),
+        (Some(base_sha), Some(graph_build_id)) => Ok(Some(StoredClaimAnchor {
+            base_sha: anchor_sha(base_sha)?,
+            graph_build_id: anchor_id(graph_build_id)?,
+        })),
+    }
+}
+
+fn anchor_sha(value: &serde_json::Value) -> Result<Option<String>, Error> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(text) => Ok(Some(required_text("base_sha", text)?)),
+        _ => Err(Error::InvalidSetting(
+            "invalid claim anchor field: base_sha".to_string(),
+        )),
+    }
+}
+
+fn anchor_id(value: &serde_json::Value) -> Result<Option<i64>, Error> {
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(number) => match number.as_i64() {
+            Some(id) => Ok(Some(id)),
+            None => Err(Error::InvalidSetting(
+                "invalid claim anchor field: graph_build_id".to_string(),
+            )),
+        },
+        _ => Err(Error::InvalidSetting(
+            "invalid claim anchor field: graph_build_id".to_string(),
+        )),
+    }
+}
+
 fn load_graph_build(conn: &Connection, id: i64) -> Result<GraphBuild, Error> {
     let row = conn
         .query_row(
@@ -1886,6 +2109,41 @@ mod tests {
                 .to_string(),
             "already claimed"
         );
+    }
+
+    #[test]
+    fn claim_anchor_ignores_later_implement_builds() {
+        let (_dir, mut ledger) = open_ledger();
+        ledger.create_task("plain", "Plain").expect("create");
+        ledger.claim_task("plain", "cursor").expect("claim");
+        assert!(ledger.claim_anchor("plain").expect("anchor").is_none());
+
+        ledger.create_task("auth", "Add auth").expect("create");
+        ledger
+            .record_graph_build("implement", Some("auth"), None, "aaa", "built", None)
+            .expect("earlier build");
+        let claimed = ledger
+            .claim_task_anchored("auth", "cursor", None, || Ok(Some("bbb".to_string())))
+            .expect("anchored claim");
+        assert_eq!(claimed.base_sha.as_deref(), Some("bbb"));
+        let id = claimed.graph_build_id.expect("anchor row");
+        let settled = ledger
+            .set_graph_build_result(id, "built", None)
+            .expect("settle");
+        assert_eq!(settled.commit_sha, "bbb");
+        assert_eq!(settled.status, "built");
+        ledger
+            .record_graph_build("implement", Some("auth"), None, "ccc", "built", None)
+            .expect("later build");
+
+        let anchor = ledger.claim_anchor("auth").expect("anchor").expect("some");
+        assert_eq!(anchor.base_sha.as_deref(), Some("bbb"));
+        assert_eq!(anchor.graph_sha.as_deref(), Some("bbb"));
+        let replayed =
+            crate::replay::replay(&ledger.context(Some("auth"), 20).expect("context").events)
+                .expect("replay");
+        assert_eq!(replayed[0].status, Status::Claimed);
+        assert_eq!(replayed[0].claimed_by.as_deref(), Some("cursor"));
     }
 
     #[test]

@@ -1736,6 +1736,97 @@ fn gated_done_refreshes_graph_after_commit() {
 }
 
 #[test]
+fn claim_anchor_survives_a_later_implement_refresh() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_graph_task(dir.path());
+    let fake = GraphifyFake::install();
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        [
+            "graph",
+            "refresh",
+            "--step",
+            "implement",
+            "--task",
+            "auth",
+            "--json",
+        ],
+    );
+    let earlier = git(dir.path(), &["rev-parse", "HEAD"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.email=relaybook@example.com",
+            "-c",
+            "user.name=Relaybook",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "move",
+        ],
+    );
+    let claim = fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["task", "claim", "auth", "--by", "cursor", "--json"],
+    );
+    let base = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(earlier, base);
+    assert_eq!(claim["base_sha"], json!(base));
+    assert_eq!(claim["graph_sha"], json!(base));
+
+    fs::write(dir.path().join("work.txt"), "work\n").expect("work");
+    git(dir.path(), &["add", "work.txt"]);
+    commit_index(dir.path(), "do the work");
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(base, head);
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        [
+            "graph",
+            "refresh",
+            "--step",
+            "implement",
+            "--task",
+            "auth",
+            "--json",
+        ],
+    );
+    let done = fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    assert_eq!(done["commit_sha"], json!(head));
+    assert_eq!(done["base_sha"], json!(base));
+    assert_eq!(done["graph_sha"], json!(base));
+    let (commit, stored_base, stored_graph) =
+        report_shas(&dir.path().join(".relaybook").join("ledger.db"));
+    assert_eq!(commit.as_deref(), Some(head.as_str()));
+    assert_eq!(stored_base.as_deref(), Some(base.as_str()));
+    assert_eq!(stored_graph.as_deref(), Some(base.as_str()));
+
+    let review = fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["review", "start", "auth", "--json"],
+    );
+    assert_eq!(review["base_sha"], json!(base));
+    assert_eq!(review["commit_sha"], json!(head));
+    assert_eq!(review["range"], json!(format!("{base}..{head}")));
+}
+
+#[test]
 fn graph_refresh_skips_without_graphify() {
     let dir = tempfile::tempdir().expect("tempdir");
     git_repo(dir.path());
@@ -1870,6 +1961,120 @@ fn review_start_caps_graph_context() {
     let log = fake.log_text();
     assert!(log.lines().any(|line| line == "affected work.txt"), "{log}");
     assert!(!log.contains("extract"), "{log}");
+}
+
+#[test]
+fn failed_refresh_does_not_inject_a_stale_graph() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_graph_task(dir.path());
+    let fake = GraphifyFake::install();
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["task", "claim", "auth", "--by", "cursor", "--json"],
+    );
+    fs::write(dir.path().join("work.txt"), "work\n").expect("work");
+    git(dir.path(), &["add", "work.txt"]);
+    commit_index(dir.path(), "do the work");
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    assert!(dir.path().join("graphify-out").join("graph.json").is_file());
+    let review = fake_data(
+        dir.path(),
+        &fake,
+        "fail",
+        ["review", "start", "auth", "--json"],
+    );
+    assert!(review["graph_sha"].is_null(), "{review}");
+    assert_eq!(review["graph_status"], json!("failed"));
+    assert_eq!(review["graph_context"], json!("no graph"));
+    assert!(
+        !fake
+            .log_text()
+            .lines()
+            .any(|line| line.starts_with("affected ")),
+        "{}",
+        fake.log_text()
+    );
+}
+
+#[test]
+fn graph_refresh_from_a_nested_directory_uses_the_repository_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_graph_task(dir.path());
+    let nested = dir.path().join("crates").join("app");
+    fs::create_dir_all(&nested).expect("nested");
+    let fake = GraphifyFake::install();
+    let cwd_log = fake.outside("cwd.log");
+    let root = fs::canonicalize(dir.path()).expect("root");
+
+    let refreshed = fake_data_cwd(
+        &nested,
+        &fake,
+        "graph",
+        &cwd_log,
+        ["graph", "refresh", "--step", "plan", "--json"],
+    );
+    assert_eq!(refreshed["status"], json!("built"));
+    assert!(dir.path().join("graphify-out").join("graph.json").is_file());
+    assert!(!nested.join("graphify-out").exists());
+
+    fake_data_cwd(
+        &nested,
+        &fake,
+        "graph",
+        &cwd_log,
+        ["task", "claim", "auth", "--by", "cursor", "--json"],
+    );
+    fs::write(dir.path().join("work.txt"), "work\n").expect("work");
+    git(dir.path(), &["add", "work.txt"]);
+    commit_index(dir.path(), "do the work");
+    fake_data_cwd(
+        &nested,
+        &fake,
+        "graph",
+        &cwd_log,
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    let review = fake_data_cwd(
+        &nested,
+        &fake,
+        "graph",
+        &cwd_log,
+        ["review", "start", "auth", "--json"],
+    );
+    assert_eq!(review["graph_status"], json!("built"));
+    assert!(
+        fake.log_text()
+            .lines()
+            .any(|line| line == "affected work.txt"),
+        "{}",
+        fake.log_text()
+    );
+    assert!(!nested.join("graphify-out").exists());
+    let logged = fs::read_to_string(&cwd_log).expect("cwd log");
+    assert!(!logged.trim().is_empty(), "{logged}");
+    for line in logged.lines() {
+        assert_eq!(fs::canonicalize(line.trim()).expect(line), root, "{logged}");
+    }
+
+    git(dir.path(), &["add", "-f", "--", "graphify-out/graph.json"]);
+    commit_index(dir.path(), "track the graph");
+    let tracked = fake_data_cwd(
+        &nested,
+        &fake,
+        "graph",
+        &cwd_log,
+        ["graph", "refresh", "--step", "plan", "--json"],
+    );
+    assert_eq!(tracked["status"], json!("failed"));
+    let detail = tracked["detail"].as_str().expect("detail");
+    assert!(detail.contains("graphify-out/ is tracked"), "{detail}");
 }
 
 #[test]
@@ -2342,6 +2547,28 @@ impl GraphifyFake {
     fn log_text(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
+
+    fn outside(&self, name: &str) -> PathBuf {
+        self._root.path().join(name)
+    }
+}
+
+fn fake_data_cwd(
+    dir: &Path,
+    fake: &GraphifyFake,
+    kind: &str,
+    cwd_log: &Path,
+    args: impl IntoIterator<Item = &'static str>,
+) -> Value {
+    let mut cmd = command(dir);
+    fake.apply(&mut cmd, kind);
+    cmd.env("GRAPHIFY_CWD_LOG", cwd_log);
+    let output = cmd.args(args).output().expect("output");
+    assert!(output.status.success(), "{}", summarize(&output));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(envelope["ok"], json!(true), "{envelope}");
+    assert!(envelope["error"].is_null(), "{envelope}");
+    envelope["data"].clone()
 }
 
 fn fake_data(

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -792,34 +792,41 @@ fn list_tasks(cwd: &Path, status: Option<Status>, ready: bool, all: bool) -> Res
 fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let gated = ledger.settings()?.workflow == "gated";
-    let task = if gated {
+    let (task, refresh) = if gated {
         require_gated_clean_tree(cwd, &ledger)?;
-        ledger.claim_task_with(slug, by, || ensure_gated_clean(cwd))?
-    } else {
-        ledger.claim_task(slug, by)?
-    };
-    let agent = task.claimed_by.clone().unwrap_or_default();
-    let human = render::line(&format!("claimed {} by {agent}", task.slug));
-    let mut data = task_ack(&task);
-    if gated {
-        let refresh = if gitinfo::verified_head(cwd).is_some() {
-            record_graph_refresh(&mut ledger, cwd, "implement", Some(task.slug.as_str()))?
-        } else {
-            GraphRefresh {
+        let root = repository_root(cwd)?;
+        let anchored = ledger.claim_task_anchored(slug, by, env_run_id(), || {
+            ensure_gated_clean(cwd)?;
+            Ok(gitinfo::verified_head(&root))
+        })?;
+        let refresh = match (anchored.graph_build_id, anchored.base_sha.as_deref()) {
+            (Some(id), Some(head)) => settle_claim_graph(&mut ledger, &root, head, id)?,
+            (None, None) => GraphRefresh {
                 commit_sha: String::new(),
                 graph_sha: None,
                 status: "failed".to_string(),
                 detail: Some(crate::graphify::NO_GRAPH.to_string()),
+            },
+            _ => {
+                return Err(invalid_setting("claim anchor is missing its graph build"));
             }
         };
-        if let Some(fields) = data.as_object_mut() {
-            let base = if refresh.commit_sha.is_empty() {
-                None
-            } else {
-                Some(refresh.commit_sha.clone())
-            };
-            attach_graph_fields(fields, base, &refresh);
-        }
+        (anchored.task, Some(refresh))
+    } else {
+        (ledger.claim_task(slug, by)?, None)
+    };
+    let agent = task.claimed_by.clone().unwrap_or_default();
+    let human = render::line(&format!("claimed {} by {agent}", task.slug));
+    let mut data = task_ack(&task);
+    if let Some(refresh) = refresh
+        && let Some(fields) = data.as_object_mut()
+    {
+        let base = if refresh.commit_sha.is_empty() {
+            None
+        } else {
+            Some(refresh.commit_sha.clone())
+        };
+        attach_graph_fields(fields, base, &refresh);
     }
     json_outcome(data, human)
 }
@@ -981,11 +988,14 @@ fn review_start(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
         return Err(Error::InvalidSetting("task report has no commit".to_string()).into());
     };
     let refresh = record_graph_refresh(&mut ledger, cwd, "review", Some(slug))?;
-    let graph_context = match report.base_sha.as_deref() {
-        Some(base) if crate::graphify::installed() => {
-            crate::graphify::graph_context(cwd, base, &commit_sha)
+    let graph_context = if refresh.status == "built" {
+        let root = repository_root(cwd)?;
+        match report.base_sha.as_deref() {
+            Some(base) => crate::graphify::graph_context(&root, base, &commit_sha),
+            None => crate::graphify::NO_GRAPH.to_string(),
         }
-        _ => crate::graphify::NO_GRAPH.to_string(),
+    } else {
+        crate::graphify::NO_GRAPH.to_string()
     };
     let body =
         serde_json::from_str::<serde_json::Value>(&report.body).unwrap_or(serde_json::Value::Null);
@@ -1019,12 +1029,13 @@ fn record_graph_refresh(
         );
     }
     let task = paired_graph_task(step, task)?;
-    let head = gitinfo::verified_head(cwd).ok_or_else(|| {
+    let root = repository_root(cwd)?;
+    let head = gitinfo::verified_head(&root).ok_or_else(|| {
         Fail::Core(Error::InvalidSetting(
             "graph refresh requires a commit at HEAD".to_string(),
         ))
     })?;
-    let (status, detail, graph_sha) = match decide_graph_refresh(cwd, &head)? {
+    let (status, detail, graph_sha) = match decide_graph_refresh(&root, &head)? {
         GraphOutcome::Skipped => ("skipped", Some(crate::graphify::NO_GRAPH.to_string()), None),
         GraphOutcome::Failed(reason) => ("failed", Some(reason), None),
         GraphOutcome::Built => ("built", None, Some(head.clone())),
@@ -1044,49 +1055,73 @@ enum GraphOutcome {
     Built,
 }
 
-fn decide_graph_refresh(cwd: &Path, head: &str) -> Result<GraphOutcome, Fail> {
+fn decide_graph_refresh(root: &Path, head: &str) -> Result<GraphOutcome, Fail> {
     if !crate::graphify::installed() {
         return Ok(GraphOutcome::Skipped);
     }
-    if let Some(paths) = graph_dirty(cwd)? {
+    if let Some(paths) = graph_dirty(root)? {
         return Ok(GraphOutcome::Failed(crate::graphify::no_graph(&format!(
             "working tree is not clean: {}",
             paths.join(", ")
         ))));
     }
-    if crate::git::graphify_out_tracked(cwd).map_err(invalid_setting)? {
+    if crate::git::graphify_out_tracked(root).map_err(invalid_setting)? {
         return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
             "graphify-out/ is tracked",
         )));
     }
-    if !crate::git::graphify_out_ignored(cwd).map_err(invalid_setting)? {
+    if !crate::git::graphify_out_ignored(root).map_err(invalid_setting)? {
         return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
             "graphify-out/ is not gitignored",
         )));
     }
-    let updated = crate::graphify::run_full(cwd, &["update", "."]);
+    let updated = crate::graphify::run_full(root, &["update", "."]);
     if !updated.ok {
         return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
             &updated.detail,
         )));
     }
-    if !cwd.join("graphify-out").join("graph.json").is_file() {
+    if !root.join("graphify-out").join("graph.json").is_file() {
         return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
             "graphify-out/graph.json is missing",
         )));
     }
-    if let Some(paths) = graph_dirty(cwd)? {
+    if let Some(paths) = graph_dirty(root)? {
         return Ok(GraphOutcome::Failed(crate::graphify::no_graph(&format!(
             "working tree is not clean: {}",
             paths.join(", ")
         ))));
     }
-    if gitinfo::verified_head(cwd).as_deref() != Some(head) {
+    if gitinfo::verified_head(root).as_deref() != Some(head) {
         return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
             "HEAD changed during graph refresh",
         )));
     }
     Ok(GraphOutcome::Built)
+}
+
+fn repository_root(cwd: &Path) -> Result<PathBuf, Fail> {
+    gitinfo::toplevel(cwd).ok_or_else(|| invalid_setting("graph refresh requires a git repository"))
+}
+
+fn settle_claim_graph(
+    ledger: &mut Ledger,
+    root: &Path,
+    head: &str,
+    graph_build_id: i64,
+) -> Result<GraphRefresh, Fail> {
+    let (status, detail, graph_sha) = match decide_graph_refresh(root, head)? {
+        GraphOutcome::Skipped => ("skipped", Some(crate::graphify::NO_GRAPH.to_string()), None),
+        GraphOutcome::Failed(reason) => ("failed", Some(reason), None),
+        GraphOutcome::Built => ("built", None, Some(head.to_string())),
+    };
+    ledger.set_graph_build_result(graph_build_id, status, detail.as_deref())?;
+    Ok(GraphRefresh {
+        commit_sha: head.to_string(),
+        graph_sha,
+        status: status.to_string(),
+        detail,
+    })
 }
 
 fn graph_dirty(cwd: &Path) -> Result<Option<Vec<String>>, Fail> {
@@ -1119,11 +1154,10 @@ fn paired_graph_task<'a>(step: &str, task: Option<&'a str>) -> Result<Option<&'a
 }
 
 fn implement_anchor(ledger: &Ledger, slug: &str) -> Result<(Option<String>, Option<String>), Fail> {
-    let Some(build) = ledger.latest_graph_build("implement", Some(slug))? else {
-        return Ok((None, None));
-    };
-    let graph = (build.status == "built").then(|| build.commit_sha.clone());
-    Ok((Some(build.commit_sha), graph))
+    match ledger.claim_anchor(slug)? {
+        Some(anchor) => Ok((anchor.base_sha, anchor.graph_sha)),
+        None => Ok((None, None)),
+    }
 }
 
 fn task_is_done(ledger: &Ledger, slug: &str) -> Result<bool, Fail> {
