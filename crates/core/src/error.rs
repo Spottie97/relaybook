@@ -28,6 +28,8 @@ pub enum Error {
     InvalidSetting(String),
     NeedsClaim(String),
     DirtyWorktree(String),
+    NoHeadCommit,
+    StaleHead,
 }
 
 impl fmt::Display for Error {
@@ -65,6 +67,8 @@ impl fmt::Display for Error {
             Self::DirtyWorktree(detail) => {
                 write!(formatter, "working tree is not clean: {detail}")
             }
+            Self::NoHeadCommit => formatter.write_str("gated completion requires a commit at HEAD"),
+            Self::StaleHead => formatter.write_str("HEAD changed before the report was stored"),
         }
     }
 }
@@ -148,6 +152,14 @@ mod tests {
         assert_eq!(
             Error::DirtyWorktree("dirty.txt".to_string()).to_string(),
             "working tree is not clean: dirty.txt"
+        );
+        assert_eq!(
+            Error::NoHeadCommit.to_string(),
+            "gated completion requires a commit at HEAD"
+        );
+        assert_eq!(
+            Error::StaleHead.to_string(),
+            "HEAD changed before the report was stored"
         );
     }
 }

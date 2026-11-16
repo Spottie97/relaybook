@@ -10,6 +10,14 @@ pub(crate) fn head(cwd: &Path) -> Option<String> {
     git(cwd, ["rev-parse", "HEAD"])
 }
 
+/// HEAD peeled to a commit. `None` when the repository has no commit yet.
+pub(crate) fn verified_head(cwd: &Path) -> Option<String> {
+    git(
+        cwd,
+        ["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
+    )
+}
+
 fn git<const N: usize>(cwd: &Path, args: [&str; N]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")

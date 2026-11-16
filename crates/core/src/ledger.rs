@@ -265,6 +265,20 @@ impl Ledger {
         sections: Option<Sections>,
         commit_sha: Option<&str>,
     ) -> Result<Task, Error> {
+        self.finish_task_with(slug, sections, commit_sha, || Ok(()))
+    }
+
+    /// Same as [`Self::finish_task`]. `revalidate` runs inside this write
+    /// transaction after the report insert and before commit. An error rolls
+    /// the completion back, including a HEAD or cleanliness check that failed
+    /// after the lock wait.
+    pub fn finish_task_with(
+        &mut self,
+        slug: &str,
+        sections: Option<Sections>,
+        commit_sha: Option<&str>,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<Task, Error> {
         let slug = checked_slug(slug)?;
         self.transaction(|conn| {
             let task = load_task(conn, &slug)?;
@@ -294,7 +308,9 @@ impl Ledger {
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string());
             reports::insert(conn, Some(task.id), "task", &author, &body, &ts, commit_sha)?;
-            load_task(conn, &slug)
+            let task = load_task(conn, &slug)?;
+            revalidate()?;
+            Ok(task)
         })
     }
 

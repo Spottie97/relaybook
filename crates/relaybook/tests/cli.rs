@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
@@ -1245,6 +1247,281 @@ fn gated_claim_and_done_require_clean_tree() {
 }
 
 #[test]
+fn gated_claim_and_done_reject_hidden_status_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_gated_task(dir.path());
+    fs::write(dir.path().join(".gitignore"), ".relaybook/\n").expect("gitignore");
+    fs::create_dir_all(dir.path().join("a.relaybook")).expect("dir");
+    fs::write(dir.path().join("a.relaybook").join("x"), "tracked\n").expect("file");
+    fs::write(dir.path().join("src.rs"), "fn main() {}\n").expect("src");
+    commit_worktree(dir.path(), "track paths");
+
+    git(dir.path(), &["mv", "-f", "src.rs", ".relaybook/src.rs"]);
+    assert_eq!(
+        git_stdout(dir.path(), &["status", "--porcelain"]),
+        b"R  src.rs -> .relaybook/src.rs\n"
+    );
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "working tree is not clean: src.rs",
+        ));
+    assert_eq!(task_status(dir.path()), "open");
+    git(dir.path(), &["reset", "--hard"]);
+
+    fs::write(dir.path().join("a.relaybook").join("x"), "tracked\ndirty\n").expect("edit");
+    assert_eq!(
+        git_stdout(dir.path(), &["status", "--porcelain"]),
+        b" M a.relaybook/x\n"
+    );
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "working tree is not clean: a.relaybook/x",
+        ));
+    assert_eq!(task_status(dir.path()), "open");
+    git(dir.path(), &["checkout", "--", "a.relaybook/x"]);
+
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success()
+        .stdout("claimed auth by cursor\n");
+
+    git(dir.path(), &["mv", "-f", "src.rs", ".relaybook/src.rs"]);
+    run(dir.path(), ["task", "done", "auth", "--changed", "shipped"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "working tree is not clean: src.rs",
+        ));
+    assert_eq!(task_status(dir.path()), "claimed");
+    git(dir.path(), &["reset", "--hard"]);
+
+    fs::write(dir.path().join("a.relaybook").join("x"), "tracked\ndirty\n").expect("edit");
+    run(dir.path(), ["task", "done", "auth", "--changed", "shipped"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "working tree is not clean: a.relaybook/x",
+        ));
+    assert_eq!(task_status(dir.path()), "claimed");
+    git(dir.path(), &["checkout", "--", "a.relaybook/x"]);
+
+    let done = json_data(
+        dir.path(),
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(done["status"], json!("done"));
+    assert_eq!(done["commit_sha"], json!(head));
+}
+
+#[test]
+fn gated_claim_and_done_see_files_hidden_by_git_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_gated_task(dir.path());
+    fs::write(dir.path().join(".gitignore"), ".relaybook/\n").expect("gitignore");
+    git(dir.path(), &["add", ".gitignore"]);
+    commit_index(dir.path(), "ignore ledger");
+    git(dir.path(), &["config", "status.showUntrackedFiles", "no"]);
+    fs::write(dir.path().join("secret.txt"), "hidden\n").expect("secret");
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "working tree is not clean: secret.txt",
+        ));
+    assert_eq!(task_status(dir.path()), "open");
+    fs::remove_file(dir.path().join("secret.txt")).expect("remove");
+    git(
+        dir.path(),
+        &["config", "--unset", "status.showUntrackedFiles"],
+    );
+
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success()
+        .stdout("claimed auth by cursor\n");
+
+    let sub = tempfile::tempdir().expect("sub");
+    git(sub.path(), &["init", "-b", "main"]);
+    fs::write(sub.path().join("file.txt"), "sub\n").expect("subfile");
+    git(sub.path(), &["add", "file.txt"]);
+    commit_worktree(sub.path(), "sub");
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub.path().to_str().expect("utf8"),
+            "vendor",
+        ],
+    );
+    commit_index(dir.path(), "vendor");
+    fs::write(dir.path().join("vendor").join("file.txt"), "sub\ndirty\n").expect("dirty sub");
+    git(dir.path(), &["config", "submodule.vendor.ignore", "all"]);
+    git(dir.path(), &["config", "diff.ignoreSubmodules", "all"]);
+    assert_eq!(git(dir.path(), &["status", "--porcelain"]), "");
+    run(dir.path(), ["task", "done", "auth", "--changed", "shipped"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "working tree is not clean: vendor",
+        ));
+    assert_eq!(task_status(dir.path()), "claimed");
+
+    git(&dir.path().join("vendor"), &["checkout", "--", "file.txt"]);
+    assert_eq!(
+        git(
+            dir.path(),
+            &["status", "--porcelain", "--ignore-submodules=none"]
+        ),
+        ""
+    );
+    let done = json_data(
+        dir.path(),
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(done["commit_sha"], json!(head));
+}
+
+#[test]
+fn gated_done_requires_head_commit() {
+    let classic = tempfile::tempdir().expect("tempdir");
+    git(classic.path(), &["init", "-b", "main"]);
+    run(classic.path(), ["init"]).assert().success();
+    run(
+        classic.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(classic.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success();
+    let classic_done = json_data(
+        classic.path(),
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    assert_eq!(classic_done["status"], json!("done"));
+    assert!(classic_done["commit_sha"].is_null());
+    let (commit, _, _) = report_shas(&classic.path().join(".relaybook").join("ledger.db"));
+    assert_eq!(commit, None);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    git(dir.path(), &["init", "-b", "main"]);
+    run(dir.path(), ["init"]).assert().success();
+    run(
+        dir.path(),
+        ["task", "create", "auth", "--title", "Add auth"],
+    )
+    .assert()
+    .success();
+    run(dir.path(), ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    run(dir.path(), ["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success()
+        .stdout("claimed auth by cursor\n");
+    run(dir.path(), ["task", "done", "auth", "--changed", "shipped"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "gated completion requires a commit at HEAD",
+        ));
+    assert_eq!(task_status(dir.path()), "claimed");
+    assert_eq!(report_count(dir.path()), 0);
+
+    fs::write(dir.path().join("README.md"), "seed\n").expect("readme");
+    git(dir.path(), &["add", "README.md"]);
+    commit_index(dir.path(), "seed");
+    let done = json_data(
+        dir.path(),
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(done["status"], json!("done"));
+    assert_eq!(done["commit_sha"], json!(head));
+    let again = json_data(
+        dir.path(),
+        ["task", "done", "auth", "--changed", "again", "--json"],
+    );
+    assert_eq!(again["commit_sha"], json!(head));
+}
+
+#[test]
+fn gated_done_rechecks_inside_the_write_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_gated_task(dir.path());
+    run(dir.path(), ["task", "claim", "auth", "--by", "cursor"])
+        .assert()
+        .success();
+
+    let dirty = done_during_lock(dir.path(), || {
+        fs::write(dir.path().join("race.txt"), "race\n").expect("race");
+    });
+    assert_eq!(dirty.status.code(), Some(1), "{}", summarize(&dirty));
+    let stderr = String::from_utf8_lossy(&dirty.stderr);
+    assert!(
+        stderr.contains("working tree is not clean: race.txt"),
+        "{stderr}"
+    );
+    assert_eq!(task_status(dir.path()), "claimed");
+    assert_eq!(report_count(dir.path()), 0);
+    fs::remove_file(dir.path().join("race.txt")).expect("clean");
+
+    let moved = done_during_lock(dir.path(), || {
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.email=relaybook@example.com",
+                "-c",
+                "user.name=Relaybook",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "move",
+            ],
+        );
+    });
+    assert_eq!(moved.status.code(), Some(1), "{}", summarize(&moved));
+    let stderr = String::from_utf8_lossy(&moved.stderr);
+    assert!(
+        stderr.contains("HEAD changed before the report was stored"),
+        "{stderr}"
+    );
+    assert_eq!(task_status(dir.path()), "claimed");
+    assert_eq!(report_count(dir.path()), 0);
+
+    let done = json_data(
+        dir.path(),
+        ["task", "done", "auth", "--changed", "shipped", "--json"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(done["commit_sha"], json!(head));
+}
+
+#[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("CLAUDE.md");
@@ -1328,6 +1605,146 @@ fn event_rows(dir: &Path) -> Vec<(i64, String, Value)> {
         .collect();
     rows.sort_by_key(|row| row.0);
     rows
+}
+
+fn seed_gated_task(dir: &Path) {
+    git_repo(dir);
+    run(dir, ["init"]).assert().success();
+    run(dir, ["task", "create", "auth", "--title", "Add auth"])
+        .assert()
+        .success();
+    run(dir, ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    run(dir, ["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+}
+
+fn commit_worktree(dir: &Path, message: &str) {
+    git(dir, &["add", "-A"]);
+    commit_index(dir, message);
+}
+
+fn commit_index(dir: &Path, message: &str) {
+    git(
+        dir,
+        &[
+            "-c",
+            "user.email=relaybook@example.com",
+            "-c",
+            "user.name=Relaybook",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            message,
+        ],
+    );
+}
+
+fn task_status(dir: &Path) -> String {
+    let data = json_data(dir, ["context", "auth", "--json"]);
+    data["tasks"][0]["status"]
+        .as_str()
+        .expect("status")
+        .to_string()
+}
+
+fn report_count(dir: &Path) -> i64 {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(db).expect("open");
+    conn.query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+        .expect("count")
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn done_during_lock(dir: &Path, mutate: impl FnOnce()) -> std::process::Output {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(&db).expect("open lock");
+    conn.busy_timeout(Duration::from_secs(5)).expect("busy");
+    conn.execute_batch("BEGIN IMMEDIATE").expect("lock");
+    let mut child = command(dir)
+        .args(["task", "done", "auth", "--changed", "shipped"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    wait_for_lock_sleep(&mut child);
+    mutate();
+    conn.execute_batch("COMMIT").expect("unlock");
+    drop(conn);
+    child.wait_with_output().expect("wait")
+}
+
+fn wait_for_lock_sleep(child: &mut Child) {
+    let pid = child.id();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut hits = 0;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll") {
+            panic!("done exited before the lock wait: {status}");
+        }
+        let wchan = fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
+        if wchan.trim() == "hrtimer_nanosleep" && !has_git_child(pid) {
+            hits += 1;
+            if hits >= 3 {
+                return;
+            }
+        }
+        thread::yield_now();
+    }
+    panic!("done never waited on the ledger lock (hits={hits})");
+}
+
+fn has_git_child(parent: u32) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|text| text.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue;
+        };
+        let mut is_child = false;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("PPid:") {
+                is_child = rest.trim() == parent.to_string();
+                break;
+            }
+        }
+        if !is_child {
+            continue;
+        }
+        let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            continue;
+        };
+        if comm.trim() == "git" {
+            return true;
+        }
+    }
+    false
 }
 
 fn git_repo(dir: &Path) {

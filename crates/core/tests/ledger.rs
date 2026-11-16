@@ -560,6 +560,41 @@ fn finish_task_records_commit_sha_once() {
     assert_eq!(count, 1);
 }
 
+#[test]
+fn finish_task_revalidate_holds_the_write_lock_and_rolls_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.create_task("auth", "Add auth").expect("create");
+    ledger.claim_task("auth", "cursor").expect("claim");
+
+    let db = path.clone();
+    let err = ledger
+        .finish_task_with("auth", None, Some("abc123"), move || {
+            let conn = rusqlite::Connection::open(&db).expect("open");
+            conn.busy_timeout(std::time::Duration::from_millis(0))
+                .expect("busy");
+            match conn.execute_batch("BEGIN IMMEDIATE") {
+                Err(rusqlite::Error::SqliteFailure(ffi, _))
+                    if ffi.code == rusqlite::ErrorCode::DatabaseBusy =>
+                {
+                    Err(relaybook_core::Error::StaleHead)
+                }
+                Err(err) => panic!("unexpected lock error: {err}"),
+                Ok(()) => panic!("revalidate ran without the write lock"),
+            }
+        })
+        .expect_err("rolled back");
+    assert_eq!(err.to_string(), "HEAD changed before the report was stored");
+    let task = ledger.context(Some("auth"), 20).expect("context");
+    assert_eq!(task.tasks[0].task.status, Status::Claimed);
+    let conn = rusqlite::Connection::open(&path).expect("open");
+    let reports: i64 = conn
+        .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
+        .expect("reports");
+    assert_eq!(reports, 0);
+}
+
 fn spawn_claim(
     path: PathBuf,
     by: &'static str,

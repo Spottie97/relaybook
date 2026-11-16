@@ -809,9 +809,17 @@ fn complete_task(
     sections: Option<relaybook_core::Sections>,
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    require_gated_clean_tree(cwd, &ledger)?;
-    let head = gitinfo::head(cwd);
-    let task = ledger.finish_task(slug, sections, head.as_deref())?;
+    let task = if ledger.settings()?.workflow == "gated" {
+        require_gated_clean_tree(cwd, &ledger)?;
+        let head = gitinfo::verified_head(cwd).ok_or(Error::NoHeadCommit)?;
+        let expected = head.clone();
+        ledger.finish_task_with(slug, sections, Some(head.as_str()), move || {
+            recheck_gated_completion(cwd, &expected)
+        })?
+    } else {
+        let head = gitinfo::head(cwd);
+        ledger.finish_task(slug, sections, head.as_deref())?
+    };
     let stored = ledger.report_commit_sha(&task.slug)?;
     let human = render::line(&format!("done {}", task.slug));
     let mut data = task_ack(&task);
@@ -828,11 +836,23 @@ fn require_gated_clean_tree(cwd: &Path, ledger: &Ledger) -> Result<(), Fail> {
     if ledger.settings()?.workflow != "gated" {
         return Ok(());
     }
-    let paths = crate::git::dirty_paths(cwd).map_err(Error::DirtyWorktree)?;
+    let paths = crate::git::gated_dirty_paths(cwd).map_err(Error::DirtyWorktree)?;
     if paths.is_empty() {
         Ok(())
     } else {
         Err(Error::DirtyWorktree(paths.join(", ")).into())
+    }
+}
+
+fn recheck_gated_completion(cwd: &Path, expected: &str) -> Result<(), Error> {
+    let paths = crate::git::gated_dirty_paths(cwd).map_err(Error::DirtyWorktree)?;
+    if !paths.is_empty() {
+        return Err(Error::DirtyWorktree(paths.join(", ")));
+    }
+    match gitinfo::verified_head(cwd).as_deref() {
+        Some(sha) if sha == expected => Ok(()),
+        Some(_) => Err(Error::StaleHead),
+        None => Err(Error::NoHeadCommit),
     }
 }
 
