@@ -7,6 +7,7 @@ mod claude_hook;
 mod cli;
 mod commands;
 mod exe;
+mod gate;
 mod git;
 mod gitinfo;
 mod graphify;

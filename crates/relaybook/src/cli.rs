@@ -1,9 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use relaybook_core::{Error, Ledger, RECENT_EVENT_LIMIT, Status};
 
+use crate::gate;
 use crate::gitinfo;
 use crate::guide;
 use crate::install;
@@ -850,14 +851,14 @@ fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
     let gated = ledger.settings()?.workflow == "gated";
     let (task, refresh) = if gated {
         require_gated_clean_tree(cwd, &ledger)?;
-        let root = repository_root(cwd)?;
-        let anchored = ledger.claim_task_anchored(slug, by, env_run_id(), || {
-            ensure_gated_clean(cwd)?;
+        let root = gate::repository_root(cwd)?;
+        let anchored = ledger.claim_task_anchored(slug, by, gate::env_run_id(), || {
+            gate::ensure_gated_clean(cwd)?;
             Ok(gitinfo::verified_head(&root))
         })?;
         let refresh = match (anchored.graph_build_id, anchored.base_sha.as_deref()) {
-            (Some(id), Some(head)) => settle_claim_graph(&mut ledger, &root, head, id)?,
-            (None, None) => GraphRefresh {
+            (Some(id), Some(head)) => gate::settle_claim_graph(&mut ledger, &root, head, id)?,
+            (None, None) => gate::GraphRefresh {
                 commit_sha: String::new(),
                 graph_sha: None,
                 status: "failed".to_string(),
@@ -928,14 +929,14 @@ fn complete_task(
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let gated = ledger.settings()?.workflow == "gated";
-    let already_done = gated && task_is_done(&ledger, slug)?;
+    let already_done = gated && gate::task_is_done(&ledger, slug)?;
     let task = if gated {
         require_gated_clean_tree(cwd, &ledger)?;
         let head = gitinfo::verified_head(cwd).ok_or(Error::NoHeadCommit)?;
         let expected = head.clone();
         if already_done {
             ledger.finish_task_with(slug, sections, Some(head.as_str()), move || {
-                recheck_gated_completion(cwd, &expected)
+                gate::recheck_gated_completion(cwd, &expected)
             })?
         } else {
             let (base, graph) = implement_anchor(&ledger, slug)?;
@@ -945,7 +946,7 @@ fn complete_task(
                 Some(head.as_str()),
                 base.as_deref(),
                 graph.as_deref(),
-                move || recheck_gated_completion(cwd, &expected),
+                move || gate::recheck_gated_completion(cwd, &expected),
             )?
         }
     } else {
@@ -954,7 +955,7 @@ fn complete_task(
     };
     // The report row, including commit_sha, is committed before this refresh.
     if gated && !already_done {
-        record_graph_refresh(&mut ledger, cwd, "commit", Some(task.slug.as_str()))?;
+        gate::record_graph_refresh(&mut ledger, cwd, "commit", Some(task.slug.as_str()))?;
     }
     let stored = ledger.report_commit_sha(&task.slug)?;
     let human = render::line(&format!("done {}", task.slug));
@@ -981,38 +982,13 @@ fn require_gated_clean_tree(cwd: &Path, ledger: &Ledger) -> Result<(), Fail> {
     if ledger.settings()?.workflow != "gated" {
         return Ok(());
     }
-    ensure_gated_clean(cwd)?;
+    gate::ensure_gated_clean(cwd)?;
     Ok(())
-}
-
-fn ensure_gated_clean(cwd: &Path) -> Result<(), Error> {
-    let paths = crate::git::gated_dirty_paths(cwd).map_err(Error::DirtyWorktree)?;
-    if paths.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::DirtyWorktree(paths.join(", ")))
-    }
-}
-
-fn recheck_gated_completion(cwd: &Path, expected: &str) -> Result<(), Error> {
-    ensure_gated_clean(cwd)?;
-    match gitinfo::verified_head(cwd).as_deref() {
-        Some(sha) if sha == expected => Ok(()),
-        Some(_) => Err(Error::StaleHead),
-        None => Err(Error::NoHeadCommit),
-    }
-}
-
-struct GraphRefresh {
-    commit_sha: String,
-    graph_sha: Option<String>,
-    status: String,
-    detail: Option<String>,
 }
 
 fn refresh_graph_cmd(cwd: &Path, step: &str, task: Option<&str>) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let refresh = record_graph_refresh(&mut ledger, cwd, step, task)?;
+    let refresh = gate::record_graph_refresh(&mut ledger, cwd, step, task)?;
     let human = if refresh.graph_sha.is_some() {
         render::line(&format!("graph {step} built {}", refresh.commit_sha))
     } else {
@@ -1037,70 +1013,17 @@ fn review_start(cwd: &Path, slug: Option<&str>, release: bool) -> Result<Outcome
 
 fn review_start_task(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let reviewer = {
-        let settings = ledger.settings()?;
-        if settings.workflow != "gated" {
-            return Err(invalid_setting("review start requires workflow=gated"));
-        }
-        settings.reviewer
-    };
-    require_gated_clean_tree(cwd, &ledger)?;
-    let report = ledger.latest_task_report(slug)?.ok_or(Error::NotDone)?;
-    if !task_is_done(&ledger, slug)? {
-        return Err(Error::NotDone.into());
-    }
-    let Some(commit_sha) = report.commit_sha.clone() else {
-        return Err(invalid_setting("task report has no commit"));
-    };
-    let root = repository_root(cwd)?;
-    match gitinfo::verified_head(&root).as_deref() {
-        Some(head) if head == commit_sha => {}
-        Some(_) => return Err(invalid_setting("HEAD does not match the reported commit")),
-        None => return Err(invalid_setting("review start requires a commit at HEAD")),
-    }
-    let refresh = record_graph_refresh(&mut ledger, cwd, "review", Some(slug))?;
-    ensure_gated_clean(&root)?;
-    if gitinfo::verified_head(&root).as_deref() != Some(commit_sha.as_str()) {
-        return Err(invalid_setting("HEAD changed during graph refresh"));
-    }
-    let fingerprint = crate::git::worktree_fingerprint(&root).map_err(invalid_setting)?;
-    let branch =
-        gitinfo::branch(&root).ok_or_else(|| invalid_setting("review start requires a branch"))?;
-    ledger.start_review(
-        "task",
-        Some(slug),
-        env_run_id(),
-        &branch,
-        &reviewer,
-        report.base_sha.as_deref(),
-        &commit_sha,
-        refresh.graph_sha.as_deref(),
-        &fingerprint,
-    )?;
-    let graph_context = if refresh.status == "built" {
-        match report.base_sha.as_deref() {
-            Some(base) => crate::graphify::graph_context(&root, base, &commit_sha),
-            None => crate::graphify::NO_GRAPH.to_string(),
-        }
-    } else {
-        crate::graphify::NO_GRAPH.to_string()
-    };
-    let body =
-        serde_json::from_str::<serde_json::Value>(&report.body).unwrap_or(serde_json::Value::Null);
-    let range = report
-        .base_sha
-        .as_ref()
-        .map(|base| format!("{base}..{commit_sha}"));
+    let started = gate::review_start_task(&mut ledger, cwd, slug)?;
     let data = serde_json::json!({
-        "slug": slug,
-        "base_sha": report.base_sha,
-        "commit_sha": commit_sha,
-        "range": range,
-        "graph_sha": refresh.graph_sha,
-        "graph_status": refresh.status,
-        "detail": refresh.detail,
-        "report": body,
-        "graph_context": graph_context,
+        "slug": started.slug,
+        "base_sha": started.base_sha,
+        "commit_sha": started.commit_sha,
+        "range": started.range,
+        "graph_sha": started.graph_sha,
+        "graph_status": started.graph_status,
+        "detail": started.detail,
+        "report": started.report,
+        "graph_context": started.graph_context,
     });
     json_outcome(data, render::line(&format!("review start {slug}")))
 }
@@ -1129,39 +1052,7 @@ fn review_record_task(
     text: &str,
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let configured = {
-        let settings = ledger.settings()?;
-        if settings.workflow != "gated" {
-            return Err(invalid_setting("review record requires workflow=gated"));
-        }
-        settings.reviewer
-    };
-    require_gated_clean_tree(cwd, &ledger)?;
-    let root = repository_root(cwd)?;
-    // Confirmation can sit at a TTY for a long time. Origin, HEAD, cleanliness,
-    // and the fingerprint are read again after it returns, and once more inside
-    // the write transaction immediately before commit.
-    let reviewer_override = reviewer_override(&configured, by)?;
-    require_gated_clean_tree(cwd, &ledger)?;
-    refuse_published_branch(&root)?;
-    let head = gitinfo::verified_head(&root)
-        .ok_or_else(|| invalid_setting("review record requires a commit at HEAD"))?;
-    let fingerprint = crate::git::worktree_fingerprint(&root).map_err(invalid_setting)?;
-    let sha_owned = sha.trim().to_string();
-    let fingerprint_now = fingerprint.clone();
-    let review = ledger.record_review_with(
-        "task",
-        Some(slug),
-        by.trim(),
-        sha,
-        &head,
-        &fingerprint,
-        verdict,
-        text,
-        reviewer_override,
-        None,
-        move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
-    )?;
+    let review = gate::review_record_task(&mut ledger, cwd, slug, by, sha, verdict, text)?;
     let stored = review.verdict.clone().unwrap_or_default();
     json_outcome(review, render::line(&format!("recorded {slug} {stored}")))
 }
@@ -1182,49 +1073,17 @@ fn review_subject(slug: Option<&str>, release: bool) -> Result<ReviewSubject<'_>
 
 fn review_start_release(cwd: &Path) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let reviewer = {
-        let settings = ledger.settings()?;
-        if settings.workflow != "gated" {
-            return Err(invalid_setting("review start requires workflow=gated"));
-        }
-        settings.reviewer
-    };
-    let checkout = release_checkout(&ledger, cwd, "review start")?;
-    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
-    let refresh = record_graph_refresh(&mut ledger, cwd, "release-review", None)?;
-    ensure_gated_clean(&checkout.root)?;
-    if gitinfo::verified_head(&checkout.root).as_deref() != Some(checkout.range.head.as_str()) {
-        return Err(invalid_setting("HEAD changed during graph refresh"));
-    }
-    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
-    let fingerprint = crate::git::worktree_fingerprint(&checkout.root).map_err(invalid_setting)?;
-    let accepted = ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
-    ledger.start_review(
-        "release",
-        None,
-        env_run_id(),
-        &checkout.branch,
-        &reviewer,
-        Some(checkout.range.base.as_str()),
-        &checkout.range.head,
-        refresh.graph_sha.as_deref(),
-        &fingerprint,
-    )?;
-    let graph_context = if refresh.status == "built" {
-        crate::graphify::graph_context(&checkout.root, &checkout.range.base, &checkout.range.head)
-    } else {
-        crate::graphify::NO_GRAPH.to_string()
-    };
+    let started = gate::review_start_release(&mut ledger, cwd)?;
     let data = serde_json::json!({
         "slug": serde_json::Value::Null,
-        "base_sha": checkout.range.base,
-        "commit_sha": checkout.range.head,
-        "range": range_text(&checkout.range),
-        "graph_sha": refresh.graph_sha,
-        "graph_status": refresh.status,
-        "detail": refresh.detail,
-        "tasks": accepted,
-        "graph_context": graph_context,
+        "base_sha": started.base_sha,
+        "commit_sha": started.commit_sha,
+        "range": started.range,
+        "graph_sha": started.graph_sha,
+        "graph_status": started.graph_status,
+        "detail": started.detail,
+        "tasks": started.tasks,
+        "graph_context": started.graph_context,
     });
     json_outcome(data, render::line("review start release"))
 }
@@ -1237,72 +1096,9 @@ fn review_record_release(
     text: &str,
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let configured = {
-        let settings = ledger.settings()?;
-        if settings.workflow != "gated" {
-            return Err(invalid_setting("review record requires workflow=gated"));
-        }
-        settings.reviewer
-    };
-    let checkout = release_checkout(&ledger, cwd, "review record")?;
-    refuse_published_branch(&checkout.root)?;
-    let sha = sha.trim();
-    if sha != checkout.range.head {
-        return Err(invalid_setting("sha does not match HEAD"));
-    }
-    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
-    let reviewer_override = reviewer_override(&configured, by)?;
-    let checkout = release_checkout(&ledger, cwd, "review record")?;
-    refuse_published_branch(&checkout.root)?;
-    if sha != checkout.range.head {
-        return Err(invalid_setting("sha does not match HEAD"));
-    }
-    let fingerprint = crate::git::worktree_fingerprint(&checkout.root).map_err(invalid_setting)?;
-    let sha_owned = sha.to_string();
-    let fingerprint_now = fingerprint.clone();
-    let root = checkout.root.clone();
-    let commits = checkout.range.commits.clone();
-    let review = ledger.record_review_with(
-        "release",
-        None,
-        by.trim(),
-        sha,
-        &checkout.range.head,
-        &fingerprint,
-        verdict,
-        text,
-        reviewer_override,
-        Some(&commits),
-        move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
-    )?;
+    let review = gate::review_record_release(&mut ledger, cwd, by, sha, verdict, text)?;
     let stored = review.verdict.clone().unwrap_or_default();
     json_outcome(review, render::line(&format!("recorded release {stored}")))
-}
-
-struct ReleaseCheckout {
-    root: PathBuf,
-    branch: String,
-    range: gitinfo::ReleaseRange,
-}
-
-fn release_checkout(ledger: &Ledger, cwd: &Path, action: &str) -> Result<ReleaseCheckout, Fail> {
-    require_gated_clean_tree(cwd, ledger)?;
-    let root = gitinfo::toplevel(cwd)
-        .ok_or_else(|| invalid_setting(format!("{action} requires a git repository")))?;
-    let branch = require_named_branch(&root, action)?;
-    let range = gitinfo::release_range(&root).map_err(invalid_setting)?;
-    Ok(ReleaseCheckout {
-        root,
-        branch,
-        range,
-    })
-}
-
-fn require_named_branch(root: &Path, action: &str) -> Result<String, Fail> {
-    match gitinfo::branch(root).as_deref() {
-        Some(name) if name != "HEAD" => Ok(name.to_string()),
-        _ => Err(invalid_setting(format!("{action} requires a branch"))),
-    }
 }
 
 fn range_text(range: &gitinfo::ReleaseRange) -> String {
@@ -1312,9 +1108,9 @@ fn range_text(range: &gitinfo::ReleaseRange) -> String {
 fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
     let sha = sha.trim();
     let mut ledger = open_ledger(cwd)?;
-    prepare_authorize(&ledger, cwd, sha)?;
+    gate::prepare_authorize(&ledger, cwd, sha)?;
     confirm_release()?;
-    let checkout = prepare_authorize(&ledger, cwd, sha)?;
+    let checkout = gate::prepare_authorize(&ledger, cwd, sha)?;
     let root = checkout.root.clone();
     let sha_owned = sha.to_string();
     let commits = checkout.range.commits.clone();
@@ -1323,30 +1119,11 @@ fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
         sha,
         &checkout.range.head,
         "maintainer",
-        env_run_id(),
+        gate::env_run_id(),
         Some(&commits),
-        move || recheck_release_authorize(&root, &sha_owned),
+        move || gate::recheck_release_authorize(&root, &sha_owned),
     )?;
     json_outcome(authorization, render::line(&format!("authorized {sha}")))
-}
-
-fn prepare_authorize(ledger: &Ledger, cwd: &Path, sha: &str) -> Result<ReleaseCheckout, Fail> {
-    if ledger.settings()?.workflow != "gated" {
-        return Err(invalid_setting("release authorize requires workflow=gated"));
-    }
-    let checkout = release_checkout(ledger, cwd, "release authorize")?;
-    refuse_published_branch(&checkout.root)?;
-    if sha != checkout.range.head {
-        return Err(invalid_setting("sha does not match HEAD"));
-    }
-    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
-    match ledger.release_review_at(sha)? {
-        Some(review) if review.verdict.as_deref() == Some("approved") => {}
-        _ => {
-            return Err(invalid_setting("no approved release review"));
-        }
-    }
-    Ok(checkout)
 }
 
 fn confirm_release() -> Result<(), Fail> {
@@ -1360,18 +1137,6 @@ fn confirm_release() -> Result<(), Fail> {
         Ok(false) => Err(invalid_setting("release was not confirmed")),
         Err(message) => Err(invalid_setting(message)),
     }
-}
-
-fn recheck_release_authorize(root: &Path, sha: &str) -> Result<(), Error> {
-    ensure_gated_clean(root)?;
-    published_origin(root)?;
-    let head = gitinfo::verified_head(root).ok_or_else(|| {
-        Error::InvalidSetting("release authorize requires a commit at HEAD".to_string())
-    })?;
-    if head != sha {
-        return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
-    }
-    Ok(())
 }
 
 fn release_status(cwd: &Path) -> Result<Outcome, Fail> {
@@ -1417,202 +1182,6 @@ fn release_status(cwd: &Path) -> Result<Outcome, Fail> {
     )
 }
 
-fn refuse_published_branch(root: &Path) -> Result<(), Fail> {
-    published_origin(root).map_err(Fail::Core)
-}
-
-/// Cleanliness, HEAD, fingerprint, and origin-ref absence for one record
-/// attempt. `sha` and `fingerprint` were captured for this attempt; they must
-/// still describe the worktree when the verdict commits.
-fn recheck_review_record(root: &Path, sha: &str, fingerprint: &str) -> Result<(), Error> {
-    ensure_gated_clean(root)?;
-    published_origin(root)?;
-    let head = gitinfo::verified_head(root).ok_or_else(|| {
-        Error::InvalidSetting("review record requires a commit at HEAD".to_string())
-    })?;
-    if head != sha {
-        return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
-    }
-    let fresh = crate::git::worktree_fingerprint(root).map_err(Error::InvalidSetting)?;
-    if fresh != fingerprint {
-        return Err(Error::InvalidSetting(
-            "reviewer changed the repository".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn published_origin(root: &Path) -> Result<(), Error> {
-    let branch = gitinfo::branch(root)
-        .ok_or_else(|| Error::InvalidSetting("a branch is required".to_string()))?;
-    let origin = format!("refs/remotes/origin/{branch}");
-    if gitinfo::rev_exists(root, &origin).map_err(Error::InvalidSetting)? {
-        return Err(Error::InvalidSetting(format!("{origin} exists")));
-    }
-    Ok(())
-}
-
-fn reviewer_override(configured: &str, by: &str) -> Result<bool, Fail> {
-    let by = by.trim();
-    if by == configured {
-        return Ok(false);
-    }
-    if by == "claude" {
-        confirm_claude_review()?;
-        return Ok(true);
-    }
-    Err(invalid_setting(format!("unconfigured reviewer: {by}")))
-}
-
-fn confirm_claude_review() -> Result<(), Fail> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(invalid_setting(
-            "claude review requires confirmation at a TTY",
-        ));
-    }
-    match uninstall::confirm("Record this review as claude?") {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(invalid_setting("claude review was not confirmed")),
-        Err(message) => Err(invalid_setting(message)),
-    }
-}
-
-fn record_graph_refresh(
-    ledger: &mut Ledger,
-    cwd: &Path,
-    step: &str,
-    task: Option<&str>,
-) -> Result<GraphRefresh, Fail> {
-    if ledger.settings()?.workflow != "gated" {
-        return Err(
-            Error::InvalidSetting("graph refresh requires workflow=gated".to_string()).into(),
-        );
-    }
-    let task = paired_graph_task(step, task)?;
-    let root = repository_root(cwd)?;
-    let head = gitinfo::verified_head(&root).ok_or_else(|| {
-        Fail::Core(Error::InvalidSetting(
-            "graph refresh requires a commit at HEAD".to_string(),
-        ))
-    })?;
-    let (status, detail, graph_sha) = match decide_graph_refresh(&root, &head)? {
-        GraphOutcome::Skipped => ("skipped", Some(crate::graphify::NO_GRAPH.to_string()), None),
-        GraphOutcome::Failed(reason) => ("failed", Some(reason), None),
-        GraphOutcome::Built => ("built", None, Some(head.clone())),
-    };
-    ledger.record_graph_build(step, task, env_run_id(), &head, status, detail.as_deref())?;
-    Ok(GraphRefresh {
-        commit_sha: head,
-        graph_sha,
-        status: status.to_string(),
-        detail,
-    })
-}
-
-enum GraphOutcome {
-    Skipped,
-    Failed(String),
-    Built,
-}
-
-fn decide_graph_refresh(root: &Path, head: &str) -> Result<GraphOutcome, Fail> {
-    if !crate::graphify::installed() {
-        return Ok(GraphOutcome::Skipped);
-    }
-    if let Some(paths) = graph_dirty(root)? {
-        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(&format!(
-            "working tree is not clean: {}",
-            paths.join(", ")
-        ))));
-    }
-    if crate::git::graphify_out_tracked(root).map_err(invalid_setting)? {
-        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
-            "graphify-out/ is tracked",
-        )));
-    }
-    if !crate::git::graphify_out_ignored(root).map_err(invalid_setting)? {
-        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
-            "graphify-out/ is not gitignored",
-        )));
-    }
-    let updated = crate::graphify::run_full(root, &["update", "."]);
-    if !updated.ok {
-        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
-            &updated.detail,
-        )));
-    }
-    if !root.join("graphify-out").join("graph.json").is_file() {
-        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
-            "graphify-out/graph.json is missing",
-        )));
-    }
-    if let Some(paths) = graph_dirty(root)? {
-        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(&format!(
-            "working tree is not clean: {}",
-            paths.join(", ")
-        ))));
-    }
-    if gitinfo::verified_head(root).as_deref() != Some(head) {
-        return Ok(GraphOutcome::Failed(crate::graphify::no_graph(
-            "HEAD changed during graph refresh",
-        )));
-    }
-    Ok(GraphOutcome::Built)
-}
-
-fn repository_root(cwd: &Path) -> Result<PathBuf, Fail> {
-    gitinfo::toplevel(cwd).ok_or_else(|| invalid_setting("graph refresh requires a git repository"))
-}
-
-fn settle_claim_graph(
-    ledger: &mut Ledger,
-    root: &Path,
-    head: &str,
-    graph_build_id: i64,
-) -> Result<GraphRefresh, Fail> {
-    let (status, detail, graph_sha) = match decide_graph_refresh(root, head)? {
-        GraphOutcome::Skipped => ("skipped", Some(crate::graphify::NO_GRAPH.to_string()), None),
-        GraphOutcome::Failed(reason) => ("failed", Some(reason), None),
-        GraphOutcome::Built => ("built", None, Some(head.to_string())),
-    };
-    ledger.set_graph_build_result(graph_build_id, status, detail.as_deref())?;
-    Ok(GraphRefresh {
-        commit_sha: head.to_string(),
-        graph_sha,
-        status: status.to_string(),
-        detail,
-    })
-}
-
-fn graph_dirty(cwd: &Path) -> Result<Option<Vec<String>>, Fail> {
-    let paths = crate::git::gated_dirty_paths(cwd).map_err(invalid_setting)?;
-    let paths: Vec<String> = paths
-        .into_iter()
-        .filter(|path| !crate::git::graphify_out_path(path))
-        .collect();
-    if paths.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(paths))
-    }
-}
-
-fn paired_graph_task<'a>(step: &str, task: Option<&'a str>) -> Result<Option<&'a str>, Fail> {
-    match step.trim() {
-        "plan" | "release-review" => {
-            if task.is_some() {
-                Err(invalid_setting("this graph step has no task"))
-            } else {
-                Ok(None)
-            }
-        }
-        "implement" | "commit" | "review" => task
-            .map(Some)
-            .ok_or_else(|| invalid_setting("task is required for this graph step")),
-        other => Err(invalid_setting(format!("invalid graph step: {other}"))),
-    }
-}
-
 fn implement_anchor(ledger: &Ledger, slug: &str) -> Result<(Option<String>, Option<String>), Fail> {
     match ledger.claim_anchor(slug)? {
         Some(anchor) => Ok((anchor.base_sha, anchor.graph_sha)),
@@ -1620,24 +1189,11 @@ fn implement_anchor(ledger: &Ledger, slug: &str) -> Result<(Option<String>, Opti
     }
 }
 
-fn task_is_done(ledger: &Ledger, slug: &str) -> Result<bool, Fail> {
-    Ok(ledger
-        .list_tasks(Some(Status::Done), false, true)?
-        .iter()
-        .any(|task| task.slug == slug))
-}
-
-fn env_run_id() -> Option<i64> {
-    std::env::var("RELAYBOOK_RUN_ID")
-        .ok()
-        .and_then(|value| value.parse().ok())
-}
-
 fn invalid_setting(message: impl Into<String>) -> Fail {
     Fail::Core(Error::InvalidSetting(message.into()))
 }
 
-fn graph_json(step: &str, task: Option<&str>, refresh: &GraphRefresh) -> serde_json::Value {
+fn graph_json(step: &str, task: Option<&str>, refresh: &gate::GraphRefresh) -> serde_json::Value {
     serde_json::json!({
         "step": step,
         "task": task,
@@ -1651,7 +1207,7 @@ fn graph_json(step: &str, task: Option<&str>, refresh: &GraphRefresh) -> serde_j
 fn attach_graph_fields(
     fields: &mut serde_json::Map<String, serde_json::Value>,
     base_sha: Option<String>,
-    refresh: &GraphRefresh,
+    refresh: &gate::GraphRefresh,
 ) {
     fields.insert("base_sha".to_string(), json_string(base_sha));
     fields.insert(
@@ -1719,7 +1275,7 @@ fn accept_report(
             .ok_or_else(|| invalid_setting("report accept requires a commit at HEAD"))?;
         let expected = head.clone();
         ledger.accept_gated_report(slug, &head, move || {
-            recheck_gated_completion(cwd, &expected)
+            gate::recheck_gated_completion(cwd, &expected)
         })?;
     } else {
         ledger.accept_report(slug)?;

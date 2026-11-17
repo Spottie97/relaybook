@@ -1023,7 +1023,7 @@ fn snap(cwd: &Path, branch: &str) -> Result<Snap, String> {
         origin_main: git(cwd, &["rev-parse", "origin/main"]).ok(),
         origin_branch: git(cwd, &["rev-parse", &format!("origin/{branch}")]).ok(),
         tags: tag_list(cwd),
-        tree: worktree_fingerprint(cwd)?,
+        tree: crate::git::worktree_fingerprint(cwd)?,
     })
 }
 
@@ -1066,38 +1066,6 @@ fn shared_guard(before: &Snap, after: &Snap) -> Result<(), String> {
 
 fn dirty(cwd: &Path) -> Result<bool, String> {
     Ok(!crate::git::dirty_paths(cwd)?.is_empty())
-}
-
-fn worktree_fingerprint(cwd: &Path) -> Result<String, String> {
-    let diff = git(cwd, &["diff", "HEAD", "--", ".", ":(exclude).relaybook"])?;
-    let untracked = git(cwd, &["ls-files", "--others", "--exclude-standard"])?;
-    let mut body = diff;
-    body.push('\n');
-    for path in untracked.lines() {
-        let path = git_path(path);
-        if path == ".relaybook" || path.starts_with(".relaybook/") {
-            continue;
-        }
-        body.push_str(&path);
-        body.push('\n');
-        let bytes = std::fs::read(cwd.join(&path)).unwrap_or_default();
-        body.push_str(&content_hash(&bytes));
-        body.push('\n');
-    }
-    Ok(content_hash(body.as_bytes()))
-}
-
-fn git_path(path: &str) -> String {
-    path.replace('\\', "/")
-}
-
-fn content_hash(bytes: &[u8]) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{hash:016x}")
 }
 
 fn sync_main(cwd: &Path) -> Result<(), String> {
