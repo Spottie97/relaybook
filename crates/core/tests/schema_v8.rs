@@ -847,6 +847,114 @@ fn v033_statements_still_work_on_classic_v8() {
 }
 
 #[test]
+fn classic_setting_still_refuses_unstamped_update_of_gated_run() {
+    let (_dir, path) = fresh_path();
+    let run_id = {
+        let mut ledger = Ledger::initialize(&path).expect("init");
+        ledger.set_setting("reviewer", "codex").expect("reviewer");
+        ledger.set_setting("workflow", "gated").expect("gated");
+        ledger.create_task("auth", "Add auth").expect("task");
+        let run = ledger
+            .start_run("prd.md", "digest", "feature", Some("gated"))
+            .expect("run");
+        ledger
+            .set_setting_with("workflow", "classic", true)
+            .expect("classic");
+        run.id
+    };
+    let mut conn = Connection::open(&path).expect("open");
+    let setting: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'workflow'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("setting");
+    assert_eq!(setting, "classic");
+    let stored_workflow: String = conn
+        .query_row("SELECT workflow FROM runs WHERE id = ?1", [run_id], |row| {
+            row.get(0)
+        })
+        .expect("workflow");
+    assert_eq!(stored_workflow, "gated");
+    let trigger_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'relaybook_guard_run_update'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("trigger");
+    assert!(
+        trigger_sql.contains("OLD.workflow = 'gated'"),
+        "{trigger_sql}"
+    );
+    assert!(
+        trigger_sql.contains("(SELECT value FROM settings WHERE key = 'workflow') = 'gated'"),
+        "{trigger_sql}"
+    );
+    assert!(
+        trigger_sql.contains("NEW.write_stamp IS OLD.write_stamp"),
+        "{trigger_sql}"
+    );
+    let task_id: i64 = conn
+        .query_row("SELECT id FROM tasks WHERE slug = 'auth'", [], |row| {
+            row.get(0)
+        })
+        .expect("task");
+    refused(&mut conn, |tx| {
+        tx.execute(
+            "UPDATE runs SET
+                stage = ?1, cycle = ?2, agent_calls = ?3, est_cost_usd = ?4, status = ?5,
+                stop_reason = ?6, failure_streak = ?7, current_slug = ?8, complete_requested = ?9
+             WHERE id = ?10",
+            rusqlite::params![
+                "execute",
+                1_i64,
+                0_i64,
+                0_f64,
+                "active",
+                None::<String>,
+                0_i64,
+                None::<String>,
+                0_i64,
+                run_id
+            ],
+        )?;
+        Ok(())
+    });
+    let stage: String = conn
+        .query_row("SELECT stage FROM runs WHERE id = ?1", [run_id], |row| {
+            row.get(0)
+        })
+        .expect("stage");
+    assert_eq!(stage, "plan");
+    conn.execute(
+        "INSERT INTO reports (task_id, kind, author, body, bytes, created_at)
+         VALUES (?1, 'task', 'cursor', '{}', 2, '2026-01-01T00:00:00.000Z')",
+        [task_id],
+    )
+    .expect("classic report insert");
+    drop(conn);
+    {
+        let mut ledger = Ledger::open(&path).expect("open");
+        let mut saved = ledger.active_run().expect("active").expect("row");
+        saved.stage = "execute".to_string();
+        ledger.save_run(&saved).expect("stamped save");
+    }
+    let conn = Connection::open(&path).expect("open");
+    let stored: (String, i64, String) = conn
+        .query_row(
+            "SELECT stage, write_stamp, workflow FROM runs WHERE id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("saved");
+    assert_eq!(stored.0, "execute");
+    assert_eq!(stored.1, 1);
+    assert_eq!(stored.2, "gated");
+}
+
+#[test]
 fn gated_core_flow_passes_the_guards() {
     let (_dir, path) = fresh_path();
     let mut ledger = Ledger::initialize(&path).expect("init");

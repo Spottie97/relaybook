@@ -62,40 +62,43 @@ fn raise_message_reaches_the_user() {
         .stdout("claimed auth by cursor\n");
 
     let db = dir.path().join(".relaybook").join("ledger.db");
-    let conn = rusqlite::Connection::open(&db).expect("open");
-    let task_id: i64 = conn
-        .query_row("SELECT id FROM tasks WHERE slug = 'auth'", [], |row| {
-            row.get(0)
-        })
-        .expect("id");
-    let before: i64 = conn
-        .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
-        .expect("count");
-    let err = conn
-        .execute(
-            "INSERT INTO reports (task_id, kind, author, body, bytes, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                task_id,
-                "task",
-                "cursor",
-                "{}",
-                2_i64,
-                "2026-01-01T00:00:00.000Z"
-            ],
-        )
-        .expect_err("guard");
-    let shown = format!("sqlite: {err}");
-    assert_eq!(
-        shown,
-        format!("sqlite: {GUARD}"),
-        "CLI prints sqlite errors as sqlite: <message>"
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER relaybook_probe_raise
+             BEFORE INSERT ON tasks
+             BEGIN
+               SELECT RAISE(ABORT, '{GUARD}');
+             END;"
+        ))
+        .expect("probe");
+    }
+    let created = run(dir.path(), ["task", "create", "probe", "--title", "Probe"])
+        .output()
+        .expect("create");
+    assert_eq!(created.status.code(), Some(1), "{created:?}");
+    assert!(
+        created.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&created.stdout)
     );
-    let after: i64 = conn
-        .query_row("SELECT COUNT(*) FROM reports", [], |row| row.get(0))
-        .expect("count");
-    assert_eq!(after, before);
-    drop(conn);
+    assert_eq!(
+        String::from_utf8_lossy(&created.stderr),
+        format!("sqlite: {GUARD}\n")
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        let present: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE slug = 'probe'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(present, 0);
+        conn.execute("DROP TRIGGER relaybook_probe_raise", [])
+            .expect("drop probe");
+    }
 
     fs_write_seed(dir.path());
     git(dir.path(), &["add", "README.md"]);
