@@ -3043,14 +3043,64 @@ fn remote_check_checks_every_remote() {
     let head = prepare_gated_review(dir.path(), &fake);
     let _origin = bare_remote(dir.path(), "origin");
     let _backup = bare_remote(dir.path(), "backup");
-    git(dir.path(), &["push", "backup", "HEAD:refs/heads/main"]);
-    delete_ref_if_present(dir.path(), "refs/remotes/backup/main");
-    delete_ref_if_present(dir.path(), "refs/remotes/backup/HEAD");
-    assert_failure(
-        &record_review(dir.path(), "codex", &head, "approved", false),
-        "backup",
+    let listed = git(dir.path(), &["remote"]);
+    let names: Vec<String> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    let mut expected = names.clone();
+    expected.sort();
+    assert_eq!(expected, ["backup".to_string(), "origin".to_string()]);
+    let first = names[0].clone();
+    let last = names.last().expect("remote").clone();
+    assert_ne!(first, last);
+    // `git remote` sorts names, so backup is first. Publish only on the last
+    // remote: a check that stops after the first remote would accept this review.
+    git(dir.path(), &["push", &last, "HEAD:refs/heads/main"]);
+    delete_ref_if_present(dir.path(), &format!("refs/remotes/{last}/main"));
+    delete_ref_if_present(dir.path(), &format!("refs/remotes/{last}/HEAD"));
+    let untouched = git(
+        dir.path(),
+        &["ls-remote", "--quiet", "--end-of-options", &first],
     );
+    assert!(untouched.is_empty(), "{first}: {untouched}");
+    let gate = tempfile::tempdir().expect("gate");
+    let log_dir = tempfile::tempdir().expect("log");
+    let log = log_dir.path().join("git-env.log");
+    let output = command_with_git_shim(dir.path(), gate.path(), "not-a-git-command")
+        .env("RELAYBOOK_GIT_ENV_LOG", &log)
+        .args([
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ])
+        .output()
+        .expect("output");
+    assert_failure(&output, &format!("refs/heads/main exists on {last}"));
     assert_eq!(task_reviews(dir.path())[0].1, None);
+    let text = fs::read_to_string(&log).expect("env log");
+    assert_eq!(ls_remote_targets(&text), names, "{text}");
+}
+
+fn ls_remote_targets(log: &str) -> Vec<String> {
+    let marker = "ls-remote --quiet --end-of-options ";
+    log.lines()
+        .filter_map(|line| {
+            let argv = line.split_once("argv=")?.1;
+            let name = argv.split_once(marker)?.1.split_whitespace().next()?;
+            Some(name.to_string())
+        })
+        .collect()
 }
 
 #[test]
