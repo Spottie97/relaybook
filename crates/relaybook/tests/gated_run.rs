@@ -206,6 +206,32 @@ fn write_trace_wrapper(path: &Path, name: &str, target: &Path) {
 }
 
 #[cfg(unix)]
+fn write_idle_cursor(path: &Path, fake: &Path) {
+    let fake = fake.display();
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"status\" ] || [ \"$1\" = \"about\" ]; then\n  exec '{fake}' \"$@\"\nfi\nif [ -z \"$RELAYBOOK_EXECUTOR_HELD\" ] || [ -z \"$RELAYBOOK_EXECUTOR_RELEASE\" ]; then\n  echo \"executor hold is unset\" >&2\n  exit 99\nfi\n: > \"$RELAYBOOK_EXECUTOR_HELD\"\ni=0\nwhile [ ! -f \"$RELAYBOOK_EXECUTOR_RELEASE\" ]; do\n  i=$((i + 1))\n  if [ \"$i\" -gt 2000 ]; then echo \"executor hold timed out\" >&2; exit 98; fi\n  sleep 0.05\ndone\nexit 0\n"
+    );
+    fs::write(path, script).expect("wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).expect("meta").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod");
+}
+
+#[cfg(unix)]
+fn write_hold_cursor(path: &Path, fake: &Path) {
+    let fake = fake.display();
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ] || [ \"$1\" = \"status\" ] || [ \"$1\" = \"about\" ]; then\n  exec '{fake}' \"$@\"\nfi\nif [ -z \"$RELAYBOOK_EXECUTOR_HELD\" ] || [ -z \"$RELAYBOOK_EXECUTOR_RELEASE\" ]; then\n  echo \"executor hold is unset\" >&2\n  exit 99\nfi\n: > \"$RELAYBOOK_EXECUTOR_HELD\"\ni=0\nwhile [ ! -f \"$RELAYBOOK_EXECUTOR_RELEASE\" ]; do\n  i=$((i + 1))\n  if [ \"$i\" -gt 400 ]; then echo \"executor hold timed out\" >&2; exit 98; fi\n  sleep 0.05\ndone\ngit checkout main || exit 97\nexit 0\n"
+    );
+    fs::write(path, script).expect("wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).expect("meta").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod");
+}
+
+#[cfg(unix)]
 fn write_push_gate_wrapper(path: &Path, target: &Path) {
     let target = target.display();
     let script = format!(
@@ -308,7 +334,7 @@ fn seed_run(dir: &Path, branch: &str, stage: &str, status: &str) -> i64 {
     run.id
 }
 
-fn seed_stopped(dir: &Path, branch: &str, workflow: Option<&str>) {
+fn seed_stopped(dir: &Path, branch: &str, workflow: Option<&str>) -> i64 {
     let mut ledger =
         relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
     let mut run = ledger
@@ -316,6 +342,7 @@ fn seed_stopped(dir: &Path, branch: &str, workflow: Option<&str>) {
         .expect("start run");
     run.status = "stopped".to_string();
     ledger.save_run(&mut run).expect("save run");
+    run.id
 }
 
 fn assign_run(dir: &Path, slug: &str, run_id: i64) {
@@ -333,6 +360,24 @@ fn set_run_stage(dir: &Path, stage: &str) {
     let mut run = ledger.active_run().expect("active").expect("run");
     run.stage = stage.to_string();
     ledger.save_run(&mut run).expect("save");
+}
+
+fn authorization_count(dir: &Path) -> i64 {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    conn.query_row("SELECT COUNT(*) FROM release_authorizations", [], |row| {
+        row.get(0)
+    })
+    .expect("count")
+}
+
+fn run_status(dir: &Path, id: i64) -> (String, String) {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    conn.query_row(
+        "SELECT status, stage FROM runs WHERE id = ?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .expect("run")
 }
 
 fn authorization_run_id(dir: &Path) -> Option<i64> {
@@ -1049,6 +1094,322 @@ fn concurrent_approve_pushes_once_and_keeps_complete() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn guard_after_switching_to_gated_during_execute_does_not_push() {
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let repo = origin_repo();
+    relaybook(repo.path())
+        .args(["config", "set", "gates", "none"])
+        .assert()
+        .success();
+    let probes = install_probes();
+    let role = probes.log.join("cursor-agent");
+    fs::copy(env!("CARGO_BIN_EXE_fake"), &role).expect("copy cursor");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&role).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&role, permissions).expect("chmod");
+    }
+    write_hold_cursor(&probes.bin.join("cursor-agent"), &role);
+    let held = probes.log.join("executor-held");
+    let release = probes.log.join("executor-release");
+    let mut cmd = relaybook(repo.path());
+    apply_probes(&mut cmd, &probes);
+    cmd.env("RELAYBOOK_EXECUTOR_HELD", &held);
+    cmd.env("RELAYBOOK_EXECUTOR_RELEASE", &release);
+    cmd.args(["run", "--prd", "prd.md"]);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn run");
+    let started = Instant::now();
+    while !held.exists() {
+        if started.elapsed() > Duration::from_secs(15) || child.try_wait().ok().flatten().is_some()
+        {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("wait");
+            panic!(
+                "executor was not held\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    relaybook(repo.path())
+        .args(["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    relaybook(repo.path())
+        .args(["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+    fs::write(&release, "go\n").expect("release executor");
+    let output = child.wait_with_output().expect("wait run");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("workflow changed during run"), "{text}");
+    assert!(
+        bare_rev(&repo.bare, "refs/heads/relaybook/prd").is_none(),
+        "halt pushed the run branch"
+    );
+    assert!(!probes.log.join("gh.args").exists(), "{text}");
+    let row = run_row(repo.path());
+    assert_eq!(row.status, "stopped", "{row:?}");
+    assert_eq!(row.workflow.as_deref(), Some("classic"), "{row:?}");
+    assert!(
+        row.stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("workflow changed during run")),
+        "{row:?}"
+    );
+    assert_eq!(
+        head_branch(repo.path()),
+        "main",
+        "executor did not switch branches, so the guard halt was not reached"
+    );
+    #[cfg(unix)]
+    {
+        let trace = fs::read_to_string(probes.log.join("invocations")).unwrap_or_default();
+        assert!(
+            !trace.lines().any(|line| line.starts_with("git push ")),
+            "{trace}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resume_during_publish_does_not_push() {
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let repo = gated_repo();
+    let older = seed_stopped(repo.path(), "relaybook/prd", Some("gated"));
+    let (head, newer) = reviewed_release(&repo);
+    assert!(older < newer);
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    let probes = install_probes();
+    write_push_gate_wrapper(&probes.bin.join("git"), &program_on_path("git"));
+    let gate = probes.log.join("allow-push");
+    struct ReleasePush(PathBuf);
+    impl Drop for ReleasePush {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "go\n");
+        }
+    }
+    let _release = ReleasePush(gate.clone());
+
+    let mut approve = relaybook(repo.path());
+    apply_probes(&mut approve, &probes);
+    approve.env("RELAYBOOK_PUSH_GATE", &gate);
+    approve.arg("approve");
+    approve.stdout(Stdio::piped());
+    approve.stderr(Stdio::piped());
+    let mut approve = approve.spawn().expect("spawn approve");
+    let trace_path = probes.log.join("invocations");
+    let pushes = |text: &str| {
+        text.lines()
+            .filter(|line| line.starts_with("git push "))
+            .count()
+    };
+    let started = Instant::now();
+    loop {
+        let text = fs::read_to_string(&trace_path).unwrap_or_default();
+        if pushes(&text) >= 1 || started.elapsed() > Duration::from_secs(20) {
+            break;
+        }
+        if matches!(approve.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    let held = fs::read_to_string(&trace_path).unwrap_or_default();
+    assert_eq!(pushes(&held), 1, "approve did not reach push:\n{held}");
+
+    let mut resume = relaybook(repo.path());
+    apply_probes(&mut resume, &probes);
+    resume.env("RELAYBOOK_PUSH_GATE", &gate);
+    resume.args(["run", "--resume"]);
+    resume.stdout(Stdio::piped());
+    resume.stderr(Stdio::piped());
+    let mut resume = resume.spawn().expect("spawn resume");
+    let started = Instant::now();
+    let resume = loop {
+        let text = fs::read_to_string(&trace_path).unwrap_or_default();
+        let exited = matches!(resume.try_wait(), Ok(Some(_)));
+        if exited || pushes(&text) >= 2 || started.elapsed() > Duration::from_secs(15) {
+            break resume;
+        }
+        thread::sleep(Duration::from_millis(30));
+    };
+    fs::write(&gate, "go\n").expect("release push");
+    let resume_output = resume.wait_with_output().expect("wait resume");
+    let approve_output = approve.wait_with_output().expect("wait approve");
+    let resume_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&resume_output.stdout),
+        String::from_utf8_lossy(&resume_output.stderr)
+    );
+    let approve_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&approve_output.stdout),
+        String::from_utf8_lossy(&approve_output.stderr)
+    );
+    let trace = fs::read_to_string(&trace_path).unwrap_or_default();
+    assert_eq!(
+        pushes(&trace),
+        1,
+        "{trace}\nresume={resume_text}\napprove={approve_text}"
+    );
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.starts_with("gh pr create"))
+            .count(),
+        1,
+        "{trace}"
+    );
+    assert!(
+        resume_text.contains("a run is already publishing"),
+        "{resume_text}"
+    );
+    assert!(
+        approve_text.contains("opened https://example.test/pr/1"),
+        "{approve_text}"
+    );
+    let (older_status, _) = run_status(repo.path(), older);
+    assert_eq!(older_status, "stopped", "{resume_text}");
+    let (newer_status, newer_stage) = run_status(repo.path(), newer);
+    assert_eq!(newer_status, "complete", "{approve_text}");
+    assert_eq!(newer_stage, "done");
+    assert_eq!(
+        bare_rev(&repo.bare, "refs/heads/relaybook/prd").as_deref(),
+        Some(head.as_str())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_authorize_refuses_a_run_resumed_during_confirmation() {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let repo = gated_repo();
+    let dir = repo.path();
+    git(dir, &["checkout", "-b", "relaybook/prd"]);
+    fs::write(dir.join("ship.txt"), "ship\n").expect("ship");
+    git(dir, &["add", "ship.txt"]);
+    git(dir, &["commit", "-m", "ship"]);
+    let head = head_sha(dir);
+    relaybook(dir)
+        .args(["review", "start", "--release"])
+        .assert()
+        .success();
+    relaybook(dir)
+        .args([
+            "review",
+            "record",
+            "--release",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            RELEASE_REVIEW,
+        ])
+        .assert()
+        .success();
+    relaybook(dir)
+        .args(["task", "create", "work", "--title", "Work"])
+        .assert()
+        .success();
+    let run_id = seed_stopped(dir, "relaybook/prd", Some("gated"));
+    assign_run(dir, "work", run_id);
+    let mut ledger =
+        relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
+    let mut run = ledger.run_by_id(run_id).expect("run");
+    run.stage = "execute".to_string();
+    ledger.save_run(&mut run).expect("stage");
+    drop(ledger);
+    let probes = install_probes();
+    let role = probes.log.join("cursor-agent");
+    fs::copy(env!("CARGO_BIN_EXE_fake"), &role).expect("copy cursor");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&role).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&role, permissions).expect("chmod");
+    }
+    write_idle_cursor(&probes.bin.join("cursor-agent"), &role);
+    let held = probes.log.join("executor-held");
+    let release = probes.log.join("executor-release");
+    let child = std::sync::Mutex::new(None);
+    let work = dir.to_path_buf();
+    let output = authorize_while_prompted(dir, &head, || {
+        let mut cmd = relaybook(&work);
+        apply_probes(&mut cmd, &probes);
+        cmd.env("RELAYBOOK_EXECUTOR_HELD", &held);
+        cmd.env("RELAYBOOK_EXECUTOR_RELEASE", &release);
+        cmd.env("RELAYBOOK_CURSOR_TIMEOUT_SECS", "90");
+        cmd.args(["run", "--resume"]);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.process_group(0);
+        let mut resume = cmd.spawn().expect("spawn resume");
+        let started = Instant::now();
+        while !held.exists() {
+            let exited = matches!(resume.try_wait(), Ok(Some(_)));
+            if exited || started.elapsed() > Duration::from_secs(15) {
+                let _ = Command::new("kill")
+                    .args(["-KILL", "--", &format!("-{}", resume.id())])
+                    .status();
+                let output = resume.wait_with_output().expect("wait resume");
+                panic!(
+                    "executor was not held\n{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(run_row(&work).status, "active");
+        *child.lock().expect("child") = Some(resume);
+    });
+    if let Some(resume) = child.lock().expect("child").take() {
+        let killed = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", resume.id())])
+            .status()
+            .expect("kill");
+        assert!(
+            killed.success(),
+            "process group {} was not killed",
+            resume.id()
+        );
+        let _ = resume.wait_with_output();
+    }
+    assert!(!output.success, "{}", output.output);
+    assert!(output.output.contains(OWNED), "{}", output.output);
+    assert_eq!(authorization_count(repo.path()), 0);
+    assert_eq!(run_row(repo.path()).status, "active");
+    assert_eq!(head_sha(repo.path()), head);
+}
+
 struct PtyOutput {
     success: bool,
     code: u32,
@@ -1070,6 +1431,95 @@ fn typed_phrases(buf: &[u8]) -> Vec<String> {
                 .map(ToOwned::to_owned)
         })
         .collect()
+}
+
+fn authorize_while_prompted(dir: &Path, sha: &str, during: impl FnOnce()) -> PtyOutput {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use portable_pty::{
+        Child as PtyChild, ChildKiller, CommandBuilder, PtySize, native_pty_system,
+    };
+
+    let system = native_pty_system();
+    let pair = system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("pty");
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_relaybook"));
+    cmd.arg("release");
+    cmd.arg("authorize");
+    cmd.arg("--sha");
+    cmd.arg(sha);
+    cmd.cwd(dir);
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("reader");
+    let mut writer = pair.master.take_writer().expect("writer");
+    let (seen_tx, seen_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (send, recv) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 1024];
+        let mut sent = false;
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(count) => {
+                    buf.extend_from_slice(&tmp[..count]);
+                    let text = String::from_utf8_lossy(&buf);
+                    let phrases = typed_phrases(&buf);
+                    if !sent && text.contains("Authorize this release?") && !phrases.is_empty() {
+                        let _ = seen_tx.send(phrases[0].clone());
+                        if go_rx.recv_timeout(Duration::from_secs(30)).is_ok() {
+                            let line = format!("{}\n", phrases[0]);
+                            let _ = writer.write_all(line.as_bytes());
+                            let _ = writer.flush();
+                        }
+                        sent = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = send.send(buf);
+    });
+    seen_rx
+        .recv_timeout(Duration::from_secs(20))
+        .expect("authorization prompt");
+    during();
+    let _ = go_tx.send(());
+    let started = Instant::now();
+    let status = loop {
+        match PtyChild::try_wait(child.as_mut()) {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(20) => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = ChildKiller::kill(child.as_mut());
+                panic!("timed out waiting for release authorize");
+            }
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    };
+    let buf = recv
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    PtyOutput {
+        success: status.success(),
+        code: status.exit_code(),
+        output: String::from_utf8_lossy(&buf).into_owned(),
+    }
 }
 
 fn answer_at_tty(dir: &Path, args: &[&str], accept: bool) -> PtyOutput {

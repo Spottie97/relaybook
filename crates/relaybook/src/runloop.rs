@@ -50,14 +50,18 @@ pub(crate) fn execute(cwd: &Path, launch: Launch) -> RunOutput {
     if let Err(err) = apply_overrides(&db, &launch) {
         return fail(&err);
     }
-    if launch.approve || launch.resume {
-        if let Err(err) = reopen_run(&db, cwd, launch.approve) {
-            return fail(&err);
+    let run_id = if launch.approve || launch.resume {
+        match reopen_run(&db, cwd, launch.approve) {
+            Ok(id) => id,
+            Err(err) => return fail(&err),
         }
-    } else if let Err(err) = begin_run(&db, cwd, launch.prd.as_deref(), launch.new_only) {
-        return fail(&err);
-    }
-    drive(&db, cwd, launch.quiet)
+    } else {
+        match begin_run(&db, cwd, launch.prd.as_deref(), launch.new_only) {
+            Ok(id) => id,
+            Err(err) => return fail(&err),
+        }
+    };
+    drive(&db, cwd, launch.quiet, run_id)
 }
 
 fn complete_run(db: &Path) -> RunOutput {
@@ -126,7 +130,7 @@ fn apply_overrides(db: &Path, launch: &Launch) -> Result<(), String> {
     Ok(())
 }
 
-fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Result<(), String> {
+fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Result<i64, String> {
     let accounts = agents::preflight()?;
     let mut ledger = Ledger::open(db).map_err(|err| err.to_string())?;
     let settings = ledger.settings().map_err(|err| err.to_string())?;
@@ -171,6 +175,7 @@ fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Resul
             Some(settings.workflow.as_str()),
         )
         .map_err(|err| err.to_string())?;
+    let run_id = run.id;
     if !new_only {
         let adopted = match adopt_existing(&mut ledger, run.id) {
             Ok(adopted) => adopted,
@@ -192,7 +197,7 @@ fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Resul
         }
     }
     println!("{}", agents::account_line(&accounts));
-    Ok(())
+    Ok(run_id)
 }
 
 fn adopt_existing(ledger: &mut Ledger, run_id: i64) -> Result<Vec<String>, String> {
@@ -311,7 +316,7 @@ fn add_to_run(db: &Path, slugs: &[String]) -> RunOutput {
     ok(&lines.join("\n"))
 }
 
-fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<(), String> {
+fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<i64, String> {
     let accounts = agents::preflight()?;
     let mut ledger = Ledger::open(db).map_err(|err| err.to_string())?;
     let Some(mut run) = ledger.resumable_run().map_err(|err| err.to_string())? else {
@@ -341,7 +346,7 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<(), String> {
         if !approve {
             run.stop_reason = None;
         }
-        ledger.save_run(&mut run).map_err(|err| err.to_string())?;
+        ledger.claim_run(&mut run).map_err(|err| err.to_string())?;
         if let Err(err) = git(cwd, &["checkout", &run.branch]) {
             let output = halt(cwd, &mut ledger, &mut run, &err);
             return Err(output.text.trim_end().to_string());
@@ -361,14 +366,14 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<(), String> {
         if !approve {
             run.stop_reason = None;
         }
-        ledger.save_run(&mut run).map_err(|err| err.to_string())?;
+        ledger.claim_run(&mut run).map_err(|err| err.to_string())?;
         git(cwd, &["checkout", &run.branch])?;
     }
     println!("{}", agents::account_line(&accounts));
-    Ok(())
+    Ok(run.id)
 }
 
-fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
+fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
     let mut transcript = 1_u32;
     let mut session = None;
     loop {
@@ -380,11 +385,9 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             Ok(settings) => settings,
             Err(err) => return fail(&err.to_string()),
         };
-        let Some(mut run) = (match ledger.active_run() {
+        let mut run = match load_live(&ledger, run_id) {
             Ok(run) => run,
-            Err(err) => return fail(&err.to_string()),
-        }) else {
-            return fail("no active run");
+            Err(err) => return fail(&err),
         };
         if workflow_changed(&run, &settings) {
             return stop_workflow_mismatch(&mut ledger, &mut run);
@@ -456,9 +459,9 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             transcript += 1;
             if let Err(err) = guard_claude(cwd, &before, gated) {
                 close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
-                return halt_db(db, cwd, &err);
+                return halt_db(db, cwd, run_id, &err);
             }
-            if let Some(output) = take_agent(db, cwd, &result, "claude") {
+            if let Some(output) = take_agent(db, cwd, run_id, &result, "claude") {
                 close_live(
                     &mut session,
                     cwd,
@@ -472,17 +475,15 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             }
             if matches!(result, AgentResult::Failed { .. }) {
                 close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "failed");
-                return bump_failure(db, cwd, quiet);
+                return bump_failure(db, cwd, quiet, run_id);
             }
             let mut ledger = match Ledger::open(db) {
                 Ok(ledger) => ledger,
                 Err(err) => return fail(&err.to_string()),
             };
-            let Some(mut run) = (match ledger.active_run() {
+            let mut run = match load_live(&ledger, run_id) {
                 Ok(run) => run,
-                Err(err) => return fail(&err.to_string()),
-            }) else {
-                return fail("no active run");
+                Err(err) => return fail(&err),
             };
             note_cost(&mut run, &result);
             if let Some(output) = absorb_after_plan(cwd, &mut ledger, &mut run) {
@@ -560,9 +561,9 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             transcript += 1;
             if let Err(err) = guard_claude(cwd, &before, false) {
                 close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
-                return halt_db(db, cwd, &err);
+                return halt_db(db, cwd, run_id, &err);
             }
-            if let Some(output) = take_agent(db, cwd, &result, "claude") {
+            if let Some(output) = take_agent(db, cwd, run_id, &result, "claude") {
                 close_live(
                     &mut session,
                     cwd,
@@ -576,17 +577,15 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             }
             if matches!(result, AgentResult::Failed { .. }) {
                 close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "failed");
-                return bump_failure(db, cwd, quiet);
+                return bump_failure(db, cwd, quiet, run_id);
             }
             let mut ledger = match Ledger::open(db) {
                 Ok(ledger) => ledger,
                 Err(err) => return fail(&err.to_string()),
             };
-            let Some(mut run) = (match ledger.active_run() {
+            let mut run = match load_live(&ledger, run_id) {
                 Ok(run) => run,
-                Err(err) => return fail(&err.to_string()),
-            }) else {
-                return fail("no active run");
+                Err(err) => return fail(&err),
             };
             note_cost(&mut run, &result);
             let gates = ledger.settings().map(|item| item.gates).unwrap_or_default();
@@ -597,7 +596,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
                         return fail(&err.to_string());
                     }
                     close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "failed");
-                    return bump_failure(db, cwd, quiet);
+                    return bump_failure(db, cwd, quiet, run_id);
                 }
             };
             run.failure_streak = 0;
@@ -726,9 +725,9 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
         transcript += 1;
         if let Err(err) = guard_cursor(cwd, &before, &branch, gated) {
             close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
-            return halt_db(db, cwd, &err);
+            return halt_db(db, cwd, run_id, &err);
         }
-        if let Some(output) = take_agent(db, cwd, &result, "cursor") {
+        if let Some(output) = take_agent(db, cwd, run_id, &result, "cursor") {
             close_live(
                 &mut session,
                 cwd,
@@ -744,11 +743,9 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             Ok(ledger) => ledger,
             Err(err) => return fail(&err.to_string()),
         };
-        let Some(mut run) = (match ledger.active_run() {
+        let mut run = match load_live(&ledger, run_id) {
             Ok(run) => run,
-            Err(err) => return fail(&err.to_string()),
-        }) else {
-            return fail("no active run");
+            Err(err) => return fail(&err),
         };
         let tasks = ledger.run_tasks(run.id).unwrap_or_default();
         let task = tasks.iter().find(|task| task.slug == slug);
@@ -850,10 +847,13 @@ fn after_review(
         }
         return Control::Stay;
     }
-    if !is_gated(run)
-        && let Err(err) = push_branch(cwd, &run.branch)
-    {
-        return Control::Return(halt(cwd, ledger, run, &err));
+    if !is_gated(run) {
+        if let Some(output) = refuse_workflow_change(ledger, run) {
+            return Control::Return(output);
+        }
+        if let Err(err) = push_branch(cwd, &run.branch) {
+            return Control::Return(halt(cwd, ledger, run, &err));
+        }
     }
     let tasks = ledger.run_tasks(run.id).unwrap_or_default();
     if run.complete_requested && !relaybook_core::unfinished_run(&tasks) {
@@ -871,6 +871,9 @@ fn after_review(
 }
 
 fn finish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
+    if let Some(output) = refuse_workflow_change(ledger, run) {
+        return output;
+    }
     if let Err(err) = push_branch(cwd, &run.branch) {
         return halt(cwd, ledger, run, &err);
     }
@@ -891,15 +894,17 @@ fn finish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
 }
 
 fn halt(cwd: &Path, ledger: &mut Ledger, run: &mut Run, reason: &str) -> RunOutput {
+    if let Some(output) = refuse_workflow_change(ledger, run) {
+        return output;
+    }
     if !is_gated(run) {
         let _ = push_branch(cwd, &run.branch);
     }
     stop_run(ledger, run, reason)
 }
 
-/// A workflow mismatch stops the run and does not push. `halt` would push
-/// when the stored workflow is classic or unset, which would publish a run
-/// after the ledger had switched to gated.
+/// A workflow mismatch stops the run and does not push. A stored classic or
+/// unset workflow would otherwise publish after the setting switched to gated.
 fn stop_workflow_mismatch(ledger: &mut Ledger, run: &mut Run) -> RunOutput {
     stop_run(ledger, run, "workflow changed during run")
 }
@@ -913,23 +918,32 @@ fn stop_run(ledger: &mut Ledger, run: &mut Run, reason: &str) -> RunOutput {
     fail(&format!("stopped: {reason}; relaybook run --resume"))
 }
 
-fn halt_db(db: &Path, cwd: &Path, reason: &str) -> RunOutput {
+fn halt_db(db: &Path, cwd: &Path, run_id: i64, reason: &str) -> RunOutput {
     let Ok(mut ledger) = Ledger::open(db) else {
         return fail(reason);
     };
-    let Ok(Some(mut run)) = ledger.active_run() else {
+    let Ok(mut run) = ledger.run_by_id(run_id) else {
         return fail(reason);
     };
+    if !run_is_live(&run) {
+        return fail(reason);
+    }
     halt(cwd, &mut ledger, &mut run, reason)
 }
 
-fn bump_failure(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
+fn bump_failure(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
     let Ok(mut ledger) = Ledger::open(db) else {
         return fail("no ledger");
     };
-    let Ok(Some(mut run)) = ledger.active_run() else {
+    let Ok(mut run) = ledger.run_by_id(run_id) else {
         return fail("no active run");
     };
+    if !run_is_live(&run) {
+        return fail("no active run");
+    }
+    if let Some(output) = refuse_workflow_change(&mut ledger, &mut run) {
+        return output;
+    }
     run.failure_streak += 1;
     if run.failure_streak >= 2 {
         run.status = "stopped".to_string();
@@ -942,18 +956,30 @@ fn bump_failure(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
     if let Err(err) = ledger.save_run(&mut run) {
         return fail(&err.to_string());
     }
-    drive(db, cwd, quiet)
+    drive(db, cwd, quiet, run_id)
 }
 
-fn take_agent(db: &Path, cwd: &Path, result: &AgentResult, cli: &str) -> Option<RunOutput> {
+fn take_agent(
+    db: &Path,
+    cwd: &Path,
+    run_id: i64,
+    result: &AgentResult,
+    cli: &str,
+) -> Option<RunOutput> {
     match result {
         AgentResult::UsageLimit { reset_at, .. } => {
             let Ok(mut ledger) = Ledger::open(db) else {
                 return Some(fail("no ledger"));
             };
-            let Ok(Some(mut run)) = ledger.active_run() else {
+            let Ok(mut run) = ledger.run_by_id(run_id) else {
                 return Some(fail("no active run"));
             };
+            if !run_is_live(&run) {
+                return Some(fail("no active run"));
+            }
+            if let Some(output) = refuse_workflow_change(&mut ledger, &mut run) {
+                return Some(output);
+            }
             run.status = "paused".to_string();
             run.failure_streak = 0;
             run.stop_reason = Some(match reset_at {
@@ -971,7 +997,7 @@ fn take_agent(db: &Path, cwd: &Path, result: &AgentResult, cli: &str) -> Option<
             };
             Some(ok(&line))
         }
-        AgentResult::TimedOut => Some(halt_db(db, cwd, "timeout")),
+        AgentResult::TimedOut => Some(halt_db(db, cwd, run_id, "timeout")),
         AgentResult::Failed { .. } => None,
         AgentResult::Finished { .. } => None,
     }
@@ -1171,6 +1197,30 @@ fn workflow_changed(run: &Run, settings: &relaybook_core::Settings) -> bool {
     frozen_workflow(run) != settings.workflow
 }
 
+fn run_is_live(run: &Run) -> bool {
+    matches!(run.status.as_str(), "active" | "waiting" | "paused")
+}
+
+fn load_live(ledger: &Ledger, run_id: i64) -> Result<Run, String> {
+    let run = ledger.run_by_id(run_id).map_err(|err| err.to_string())?;
+    if !run_is_live(&run) {
+        return Err("no active run".to_string());
+    }
+    Ok(run)
+}
+
+/// Stop without pushing when the live setting no longer matches the run.
+/// A settings read failure also skips the push.
+fn refuse_workflow_change(ledger: &mut Ledger, run: &mut Run) -> Option<RunOutput> {
+    match ledger.settings() {
+        Ok(settings) if workflow_changed(run, &settings) => {
+            Some(stop_workflow_mismatch(ledger, run))
+        }
+        Ok(_) => None,
+        Err(err) => Some(fail(&err.to_string())),
+    }
+}
+
 fn signoff_wait(cwd: &Path) -> String {
     let head = git(cwd, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string());
     format!("waiting for sign-off: relaybook release authorize --sha {head}")
@@ -1223,11 +1273,14 @@ fn enter_release_review(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOu
 }
 
 fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
+    if let Some(output) = refuse_workflow_change(ledger, run) {
+        return output;
+    }
     // Take the run before any publish screen. A stale snapshot fails here
     // and must not push or save over the owner.
     run.stage = "publish".to_string();
     run.status = "active".to_string();
-    if let Err(err) = ledger.save_run(run) {
+    if let Err(err) = ledger.claim_run(run) {
         return fail(&err.to_string());
     }
     let head = match git(cwd, &["rev-parse", "HEAD"]) {
@@ -1254,6 +1307,9 @@ fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
         .any(|line| line == "origin");
     if !origin {
         return halt(cwd, ledger, run, "origin is missing");
+    }
+    if let Some(output) = refuse_workflow_change(ledger, run) {
+        return output;
     }
     let spec = format!("{head}:refs/heads/{}", run.branch);
     if let Err(err) = git(cwd, &["push", "--no-follow-tags", "-u", "origin", &spec]) {
@@ -1473,11 +1529,12 @@ mod tests {
                 .expect("run");
             assert_eq!(run.status, "active");
             assert_eq!(run.workflow.as_deref(), workflow);
+            let run_id = run.id;
             ledger.set_setting("reviewer", "codex").expect("reviewer");
             ledger.set_setting("workflow", "gated").expect("gated");
             drop(ledger);
 
-            let output = drive(&db, &work, true);
+            let output = drive(&db, &work, true, run_id);
             assert_eq!(output.code, 1, "{}", output.text);
             assert!(
                 output.text.contains("workflow changed during run"),
@@ -1497,5 +1554,123 @@ mod tests {
                 Some("workflow changed during run")
             );
         }
+    }
+
+    #[test]
+    fn halt_does_not_push_a_classic_run_after_the_workflow_changes() {
+        let root = tempfile::tempdir().expect("temp");
+        let bare = root.path().join("origin.git");
+        let work = root.path().join("work");
+        fs::create_dir(&work).expect("work");
+        git(
+            root.path(),
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "relaybook@example.com"]);
+        git(&work, &["config", "user.name", "Relaybook"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
+        fs::write(work.join("README.md"), "seed\n").expect("write");
+        git(&work, &["add", "README.md"]);
+        git(&work, &["commit", "-m", "seed"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&work, &["push", "-u", "origin", "main"]);
+        git(&work, &["checkout", "-b", "relaybook/prd"]);
+        fs::write(work.join("ship.txt"), "ship\n").expect("ship");
+        git(&work, &["add", "ship.txt"]);
+        git(&work, &["commit", "-m", "ship"]);
+        let db = work.join(".relaybook").join("ledger.db");
+        let mut ledger = relaybook_core::Ledger::initialize(&db).expect("init");
+        ledger.set_setting("mode", "auto").expect("mode");
+        let mut run = ledger
+            .start_run("prd.md", "abc", "relaybook/prd", Some("classic"))
+            .expect("run");
+        run.stage = "execute".to_string();
+        ledger.save_run(&mut run).expect("save");
+        ledger.set_setting("reviewer", "codex").expect("reviewer");
+        ledger.set_setting("workflow", "gated").expect("gated");
+
+        let output = super::halt(&work, &mut ledger, &mut run, "timeout");
+        assert_eq!(output.code, 1, "{}", output.text);
+        assert!(
+            output.text.contains("workflow changed during run"),
+            "{}",
+            output.text
+        );
+        assert!(
+            !output.text.contains("timeout"),
+            "timeout halt published the classic reason: {}",
+            output.text
+        );
+        assert!(!bare_has(&bare, "refs/heads/relaybook/prd"));
+        let stored = ledger.latest_run().expect("latest").expect("row");
+        assert_eq!(stored.status, "stopped");
+        assert_eq!(stored.workflow.as_deref(), Some("classic"));
+        assert_eq!(
+            stored.stop_reason.as_deref(),
+            Some("workflow changed during run")
+        );
+    }
+
+    #[test]
+    fn drive_follows_the_claimed_run_when_a_newer_run_is_publishing() {
+        let root = tempfile::tempdir().expect("temp");
+        let bare = root.path().join("origin.git");
+        let work = root.path().join("work");
+        fs::create_dir(&work).expect("work");
+        git(
+            root.path(),
+            &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+        );
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "relaybook@example.com"]);
+        git(&work, &["config", "user.name", "Relaybook"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
+        fs::write(work.join("README.md"), "seed\n").expect("write");
+        git(&work, &["add", "README.md"]);
+        git(&work, &["commit", "-m", "seed"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&work, &["push", "-u", "origin", "main"]);
+        git(&work, &["checkout", "-b", "relaybook/prd"]);
+        fs::write(work.join("ship.txt"), "ship\n").expect("ship");
+        git(&work, &["add", "ship.txt"]);
+        git(&work, &["commit", "-m", "ship"]);
+        let db = work.join(".relaybook").join("ledger.db");
+        let mut ledger = relaybook_core::Ledger::initialize(&db).expect("init");
+        ledger.set_setting("mode", "auto").expect("mode");
+        ledger.set_setting("reviewer", "codex").expect("reviewer");
+        ledger.set_setting("workflow", "gated").expect("gated");
+        let mut older = ledger
+            .start_run("prd.md", "abc", "relaybook/prd", Some("gated"))
+            .expect("older");
+        older.stage = "release_review".to_string();
+        ledger.save_run(&mut older).expect("older stage");
+        let mut newer = ledger
+            .start_run("prd.md", "abc", "relaybook/prd", Some("gated"))
+            .expect("newer");
+        newer.stage = "publish".to_string();
+        ledger.save_run(&mut newer).expect("newer stage");
+        let older_id = older.id;
+        let newer_id = newer.id;
+        drop(ledger);
+
+        let output = drive(&db, &work, true, older_id);
+        assert_eq!(output.code, 1, "{}", output.text);
+        assert!(
+            output.text.contains("codex routing not built"),
+            "{}",
+            output.text
+        );
+        assert!(!bare_has(&bare, "refs/heads/relaybook/prd"));
+        let ledger = relaybook_core::Ledger::open(&db).expect("open");
+        let older = ledger.run_by_id(older_id).expect("older");
+        let newer = ledger.run_by_id(newer_id).expect("newer");
+        assert_eq!(older.status, "stopped");
+        assert_eq!(
+            older.stop_reason.as_deref(),
+            Some("codex routing not built")
+        );
+        assert_eq!(newer.status, "active");
+        assert_eq!(newer.stage, "publish");
     }
 }

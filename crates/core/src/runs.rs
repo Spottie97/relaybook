@@ -58,6 +58,18 @@ pub fn resumable(conn: &Connection) -> Result<Option<Run>, Error> {
     Ok(row)
 }
 
+/// The run that currently owns publication, if one is `active` at `publish`.
+pub fn publishing(conn: &Connection) -> Result<Option<Run>, Error> {
+    let row = conn
+        .query_row(
+            &select_run("WHERE status = 'active' AND stage = 'publish' ORDER BY id DESC LIMIT 1"),
+            [],
+            read_run,
+        )
+        .optional()?;
+    Ok(row)
+}
+
 pub fn insert(
     conn: &Connection,
     prd_path: &str,

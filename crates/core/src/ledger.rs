@@ -803,6 +803,10 @@ impl Ledger {
         crate::runs::active(&self.conn)
     }
 
+    pub fn run_by_id(&self, id: i64) -> Result<crate::runs::Run, Error> {
+        crate::runs::load(&self.conn, id)
+    }
+
     pub fn latest_run(&self) -> Result<Option<crate::runs::Run>, Error> {
         crate::runs::latest(&self.conn)
     }
@@ -828,6 +832,24 @@ impl Ledger {
 
     pub fn save_run(&mut self, run: &mut crate::runs::Run) -> Result<(), Error> {
         self.transaction(|conn| crate::runs::save(conn, run))
+    }
+
+    /// Saves `run` unless a different run already owns publication.
+    ///
+    /// The owner check and the compare-and-swap share one immediate
+    /// transaction, so a resume cannot activate another row while a publish
+    /// claim is committed.
+    pub fn claim_run(&mut self, run: &mut crate::runs::Run) -> Result<(), Error> {
+        self.transaction(|conn| {
+            if let Some(owner) = crate::runs::publishing(conn)?
+                && owner.id != run.id
+            {
+                return Err(Error::InvalidSetting(
+                    "a run is already publishing".to_string(),
+                ));
+            }
+            crate::runs::save(conn, run)
+        })
     }
 
     pub fn run_tasks(&self, run_id: i64) -> Result<Vec<Task>, Error> {
@@ -1240,8 +1262,12 @@ impl Ledger {
     /// be claimed. `method` is `tty-typed` with no evidence, or
     /// `tty-typed+signed-tag` with evidence. The current `signoff` setting is
     /// read again inside this write transaction: `signed-tag` refuses any
-    /// other method. `revalidate` runs inside the write transaction after the
-    /// row is inserted and before commit.
+    /// other method. The same transaction derives `run_id` from the live gated
+    /// run: a run waiting at `gate_release` on `branch` supplies its id, and
+    /// any other live gated run refuses the write. The caller-supplied id is
+    /// kept when no gated run is live, or when the waiting run is on another
+    /// branch. `revalidate` runs inside the write transaction after the row
+    /// is inserted and before commit.
     #[allow(clippy::too_many_arguments)] // sha, head, the range, and the recheck are distinct
     pub fn authorize_release_with(
         &mut self,
@@ -1277,6 +1303,7 @@ impl Ledger {
                 }
             };
             let created_at = now(conn)?;
+            let run_id = stored_authorization_run_id(conn, &branch, run_id)?;
             conn.execute(
                 "INSERT INTO release_authorizations (
                     run_id, branch, commit_sha, review_id, authorized_by, created_at,
@@ -1718,6 +1745,31 @@ fn refuse_live_gated_run(conn: &Connection) -> Result<(), Error> {
             Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
         }
         _ => Ok(()),
+    }
+}
+
+/// `run_id` for a release authorization, decided while the write lock is held.
+///
+/// A gated run waiting at `gate_release` on `branch` supplies its id even when
+/// `supplied` is null. A gated run waiting at `gate_release` on another branch
+/// keeps `supplied`. Any other live gated run refuses. With no live gated run,
+/// `supplied` is stored unchanged.
+fn stored_authorization_run_id(
+    conn: &Connection,
+    branch: &str,
+    supplied: Option<i64>,
+) -> Result<Option<i64>, Error> {
+    match crate::runs::active(conn)? {
+        Some(run) if run.workflow.as_deref() == Some("gated") => {
+            if run.status == "waiting" && run.stage == "gate_release" && run.branch == branch {
+                Ok(Some(run.id))
+            } else if run.status == "waiting" && run.stage == "gate_release" {
+                Ok(supplied)
+            } else {
+                Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
+            }
+        }
+        _ => Ok(supplied),
     }
 }
 

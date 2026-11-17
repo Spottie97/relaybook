@@ -1023,3 +1023,85 @@ fn ownership_writes_see_a_gated_run_that_appeared_before_the_write() {
         )
         .expect("free task is not owned");
 }
+
+const RELEASE_BODY: &str = r#"{"findings":"none","security":"ok","tests_checked":"cargo test","not_checked":"none","prd_covered":true,"gaps":"none"}"#;
+
+#[test]
+fn authorize_release_derives_run_id_and_refuses_a_live_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.set_setting("reviewer", "codex").expect("reviewer");
+    ledger.set_setting("workflow", "gated").expect("gated");
+    ledger
+        .start_review(
+            "release", None, None, "feature", "codex", None, "abc", None, "fp",
+        )
+        .expect("start");
+    ledger
+        .record_review(
+            "release",
+            None,
+            "codex",
+            "abc",
+            "abc",
+            "fp",
+            "approved",
+            RELEASE_BODY,
+            false,
+        )
+        .expect("record");
+    let mut run = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("run");
+    let err = ledger
+        .authorize_release("feature", "abc", "abc", "maintainer", None)
+        .expect_err("active run stores no null id");
+    assert_eq!(err.to_string(), OWNED);
+    let err = ledger
+        .authorize_release("feature", "abc", "abc", "maintainer", Some(run.id))
+        .expect_err("active run");
+    assert_eq!(err.to_string(), OWNED);
+    let auths: i64 = rusqlite::Connection::open(&path)
+        .expect("open")
+        .query_row("SELECT COUNT(*) FROM release_authorizations", [], |row| {
+            row.get(0)
+        })
+        .expect("count");
+    assert_eq!(auths, 0);
+
+    run.stage = "gate_release".to_string();
+    run.status = "waiting".to_string();
+    ledger.save_run(&mut run).expect("wait");
+    let auth = ledger
+        .authorize_release("feature", "abc", "abc", "maintainer", None)
+        .expect("authorize");
+    assert_eq!(auth.run_id, Some(run.id));
+}
+
+#[test]
+fn claim_run_rejects_a_different_run_while_publishing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.set_setting("reviewer", "codex").expect("reviewer");
+    ledger.set_setting("workflow", "gated").expect("gated");
+    let mut older = ledger
+        .start_run("old.md", "digest", "feature", Some("gated"))
+        .expect("older");
+    older.status = "stopped".to_string();
+    ledger.save_run(&mut older).expect("stop");
+    let mut newer = ledger
+        .start_run("new.md", "digest", "feature", Some("gated"))
+        .expect("newer");
+    newer.stage = "publish".to_string();
+    ledger.save_run(&mut newer).expect("publish");
+    older.status = "active".to_string();
+    let err = ledger.claim_run(&mut older).expect_err("resume");
+    assert_eq!(err.to_string(), "a run is already publishing");
+    let stored = ledger.run_by_id(older.id).expect("older");
+    assert_eq!(stored.status, "stopped");
+    let publisher = ledger.run_by_id(newer.id).expect("newer");
+    assert_eq!(publisher.status, "active");
+    assert_eq!(publisher.stage, "publish");
+}
