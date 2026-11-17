@@ -1195,6 +1195,7 @@ impl Ledger {
             release_commits,
             false,
             None,
+            None,
             revalidate,
         )
     }
@@ -1223,6 +1224,7 @@ impl Ledger {
         review_id: i64,
         run_generation: i64,
         accept_approved_task: bool,
+        advance: OwnedRunAdvance,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Review, Error> {
         self.record_review_inner(
@@ -1242,6 +1244,7 @@ impl Ledger {
                 run_generation,
                 accept_approved_task,
             }),
+            Some(advance),
             revalidate,
         )
     }
@@ -1261,6 +1264,7 @@ impl Ledger {
         release_commits: Option<&[String]>,
         allow_owner: bool,
         invocation: Option<OwnedInvocation>,
+        advance: Option<OwnedRunAdvance>,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Review, Error> {
         let scope = review_scope(scope)?;
@@ -1360,6 +1364,15 @@ impl Ledger {
                     return Err(stale_review());
                 };
                 accept_bound_task(conn, slug, &head, id, owner_run, bound.run_generation)?;
+            }
+            if let Some(advance) = advance.as_ref() {
+                let Some(run_id) = owner_run else {
+                    return Err(stale_review());
+                };
+                let Some(bound) = invocation.as_ref() else {
+                    return Err(stale_review());
+                };
+                advance_owned_run(conn, run_id, bound.run_generation, advance)?;
             }
             load_review(conn, id)
         })
@@ -1999,6 +2012,177 @@ struct OwnedInvocation {
 
 fn stale_review() -> Error {
     Error::InvalidSetting(STALE_REVIEW_INVOCATION.to_string())
+}
+
+/// Run row written in the same transaction as an owned review.
+///
+/// The verdict, an approved task's acceptance, and this stage change commit
+/// together. A failure rolls all of them back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedRunAdvance {
+    pub stage: String,
+    pub status: String,
+    pub failure_streak: i64,
+    pub stop_reason: Option<String>,
+}
+
+/// How a Codex invocation may change its own run, and no other run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewInvocationAction {
+    /// Count one failure. Two in a row stop the run. One schedules another pass.
+    FailureStreak,
+    /// Stop the run. The caller does not push.
+    Halt { reason: String },
+    /// Pause for a usage limit. `reason` is `cli` or `cli|reset`.
+    Pause { reason: String },
+}
+
+/// Result of applying [`ReviewInvocationAction`] to the invocation that is still current.
+#[derive(Debug)]
+pub enum ReviewInvocationOutcome {
+    /// The review row or the run generation is no longer the one that was launched.
+    Stale,
+    /// The run is waiting at a checkpoint. It was not changed and must not be driven.
+    WaitingCheckpoint,
+    /// The run was saved. `drive` is set only for a non-terminal failure streak.
+    Saved {
+        drive: bool,
+        run: Box<crate::runs::Run>,
+    },
+}
+
+/// Check the invocation and apply `action` in one write.
+///
+/// A review that is no longer pending, or a run whose `write_stamp` has moved,
+/// is left unchanged. A waiting checkpoint is also left unchanged.
+pub fn apply_review_invocation(
+    ledger: &mut Ledger,
+    review_id: i64,
+    run_generation: i64,
+    action: ReviewInvocationAction,
+) -> Result<ReviewInvocationOutcome, Error> {
+    ledger.transaction(|conn| {
+        if !review_invocation_current(conn, review_id, run_generation)? {
+            return Ok(ReviewInvocationOutcome::Stale);
+        }
+        let review = load_review(conn, review_id)?;
+        let Some(run_id) = review.run_id else {
+            return Ok(ReviewInvocationOutcome::Stale);
+        };
+        let mut run = crate::runs::load(conn, run_id)?;
+        if run.write_stamp != run_generation || !invocation_run_is_live(&run) {
+            return Ok(ReviewInvocationOutcome::Stale);
+        }
+        let settings = crate::settings::load(conn)?;
+        if run.workflow.as_deref().unwrap_or("classic") != settings.workflow {
+            run.status = "stopped".to_string();
+            run.stop_reason = Some("workflow changed during run".to_string());
+            crate::runs::save(conn, &mut run)?;
+            return Ok(ReviewInvocationOutcome::Saved {
+                drive: false,
+                run: Box::new(run),
+            });
+        }
+        if run_is_waiting_checkpoint(&run) && !matches!(action, ReviewInvocationAction::Halt { .. })
+        {
+            return Ok(ReviewInvocationOutcome::WaitingCheckpoint);
+        }
+        let drive = match action {
+            ReviewInvocationAction::FailureStreak => {
+                run.failure_streak += 1;
+                if run.failure_streak >= 2 {
+                    run.status = "stopped".to_string();
+                    run.stop_reason = Some("two consecutive agent failures".to_string());
+                    false
+                } else {
+                    true
+                }
+            }
+            ReviewInvocationAction::Halt { reason } => {
+                if run.stage == "publishing" {
+                    run.stage = "publish".to_string();
+                }
+                run.status = "stopped".to_string();
+                run.stop_reason = Some(reason);
+                false
+            }
+            ReviewInvocationAction::Pause { reason } => {
+                run.status = "paused".to_string();
+                run.failure_streak = 0;
+                run.stop_reason = Some(reason);
+                false
+            }
+        };
+        crate::runs::save(conn, &mut run)?;
+        Ok(ReviewInvocationOutcome::Saved {
+            drive,
+            run: Box::new(run),
+        })
+    })
+}
+
+fn review_invocation_current(
+    conn: &Connection,
+    review_id: i64,
+    generation: i64,
+) -> Result<bool, Error> {
+    let review = match load_review(conn, review_id) {
+        Ok(review) => review,
+        Err(Error::Sqlite(rusqlite::Error::QueryReturnedNoRows)) => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    if review.verdict.is_some() {
+        return Ok(false);
+    }
+    let Some(run_id) = review.run_id else {
+        return Ok(false);
+    };
+    let Some(stamp) = run_write_stamp(conn, run_id)? else {
+        return Ok(false);
+    };
+    if stamp != generation {
+        return Ok(false);
+    }
+    Ok(latest_review_id(conn, &review.scope, review.task_id)? == Some(review.id))
+}
+
+fn invocation_run_is_live(run: &crate::runs::Run) -> bool {
+    matches!(run.status.as_str(), "active" | "waiting" | "paused")
+}
+
+fn run_is_waiting_checkpoint(run: &crate::runs::Run) -> bool {
+    run.status == "waiting"
+        && (run.stage == "gate_plan"
+            || run.stage == "gate_release"
+            || run.stage.starts_with("gate_review"))
+}
+
+fn advance_owned_run(
+    conn: &Connection,
+    run_id: i64,
+    generation: i64,
+    advance: &OwnedRunAdvance,
+) -> Result<(), Error> {
+    let mut run = crate::runs::load(conn, run_id)?;
+    if run.write_stamp != generation {
+        return Err(stale_review());
+    }
+    run.stage = advance.stage.clone();
+    run.status = advance.status.clone();
+    run.failure_streak = advance.failure_streak;
+    run.stop_reason = advance.stop_reason.clone();
+    crate::runs::save(conn, &mut run)?;
+    #[cfg(debug_assertions)]
+    if std::env::var("RELAYBOOK_ABORT_REVIEW_TRANSITION")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return Err(Error::InvalidSetting(
+            "review transition aborted".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn refuse_live_gated_run(conn: &Connection) -> Result<(), Error> {
@@ -2832,8 +3016,29 @@ fn accept_bound_task(
     if task.status != Status::Done {
         return Err(Error::NotDone);
     }
+    if task_report_accepted_at(conn, task.id, head)? {
+        return Ok(());
+    }
     accept_unreviewed(conn, slug, Some(run_id))?;
     Ok(())
+}
+
+fn task_report_accepted_at(conn: &Connection, task_id: i64, head: &str) -> Result<bool, Error> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT commit_sha, verdict FROM reports
+             WHERE task_id = ?1 AND kind = 'task'
+             ORDER BY id DESC
+             LIMIT 1",
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(matches!(
+        row,
+        Some((sha, verdict))
+            if sha.as_deref() == Some(head) && verdict.as_deref() == Some("accepted")
+    ))
 }
 
 fn run_write_stamp(conn: &Connection, id: i64) -> Result<Option<i64>, Error> {

@@ -349,6 +349,17 @@ fn codex(args: &[String]) {
             for _ in 0..1600 {
                 if release.is_file() {
                     let text = fs::read_to_string(&release).unwrap_or_default();
+                    if let Some(rest) = text.strip_prefix("relaybook-hold-exit ") {
+                        let mut lines = rest.splitn(2, '\n');
+                        let code = lines
+                            .next()
+                            .unwrap_or("1")
+                            .trim()
+                            .parse::<i32>()
+                            .unwrap_or(1);
+                        write_out(out.as_deref(), lines.next().unwrap_or(""));
+                        std::process::exit(code);
+                    }
                     write_out(out.as_deref(), &text);
                     return;
                 }

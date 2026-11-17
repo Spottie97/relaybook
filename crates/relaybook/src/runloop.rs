@@ -421,6 +421,9 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
         {
             return halt(cwd, &mut ledger, &mut run, "est_cost_cap_usd");
         }
+        if waiting_checkpoint(&run) {
+            return ok(&waiting_checkpoint_message(cwd, &run));
+        }
         if run.stage == "after_review" {
             match after_review(cwd, &mut ledger, &mut run, &settings) {
                 Control::Stay => {}
@@ -1007,6 +1010,9 @@ fn bump_failure(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
     if let Some(output) = refuse_workflow_change(&mut ledger, &mut run) {
         return output;
     }
+    if waiting_checkpoint(&run) {
+        return ok(&waiting_checkpoint_message(cwd, &run));
+    }
     run.failure_streak += 1;
     if run.failure_streak >= 2 {
         run.status = "stopped".to_string();
@@ -1269,6 +1275,21 @@ fn run_is_live(run: &Run) -> bool {
     matches!(run.status.as_str(), "active" | "waiting" | "paused")
 }
 
+fn waiting_checkpoint(run: &Run) -> bool {
+    run.status == "waiting"
+        && (run.stage == "gate_plan"
+            || run.stage == "gate_release"
+            || run.stage.starts_with("gate_review"))
+}
+
+fn waiting_checkpoint_message(cwd: &Path, run: &Run) -> String {
+    if run.stage == "gate_release" {
+        signoff_wait(cwd)
+    } else {
+        "waiting for approval: relaybook approve".to_string()
+    }
+}
+
 fn load_live(ledger: &Ledger, run_id: i64) -> Result<Run, String> {
     let run = ledger.run_by_id(run_id).map_err(|err| err.to_string())?;
     if !run_is_live(&run) {
@@ -1365,6 +1386,13 @@ fn review_with_codex(
         agents::CodexSandbox::ReadOnly
     };
     let gates = settings.gates.clone();
+    if let CodexScope::Task(slug) = &scope {
+        match recover_accepted_task(cwd, &mut ledger, &mut run, slug, &gates) {
+            Ok(Some(control)) => return control,
+            Ok(None) => {}
+            Err(err) => return Control::Return(halt(cwd, &mut ledger, &mut run, &err)),
+        }
+    }
     let prepared = match &scope {
         CodexScope::Task(slug) => crate::gate::start_task_review(&mut ledger, cwd, run_id, slug),
         CodexScope::Release => crate::gate::start_release_review(&mut ledger, cwd, run_id),
@@ -1423,37 +1451,57 @@ fn review_with_codex(
         &result_text(&result),
     );
     *transcript += 1;
-    if let Some(output) = take_agent(db, cwd, run_id, &result, "codex") {
-        close_live(
-            session,
-            cwd,
-            run_id,
-            quiet,
-            elapsed,
-            &result,
-            agent_outcome(&result),
-        );
-        return Control::Return(output);
-    }
-    if !matches!(result, AgentResult::Finished { .. }) {
-        close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
-        return Control::Return(bump_failure(db, cwd, quiet, run_id));
+    let invocation =
+        |action| apply_codex_invocation(db, cwd, quiet, run_id, review_id, generation, action);
+    match &result {
+        AgentResult::Unavailable { cli } => {
+            close_live(session, cwd, run_id, quiet, elapsed, &result, "unavailable");
+            return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Halt {
+                reason: format!("{cli} unavailable"),
+            }));
+        }
+        AgentResult::TimedOut => {
+            close_live(session, cwd, run_id, quiet, elapsed, &result, "timed out");
+            return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Halt {
+                reason: "timeout".to_string(),
+            }));
+        }
+        AgentResult::UsageLimit { reset_at, .. } => {
+            close_live(session, cwd, run_id, quiet, elapsed, &result, "paused");
+            let reason = match reset_at {
+                Some(time) => format!("codex|{time}"),
+                None => "codex".to_string(),
+            };
+            return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Pause {
+                reason,
+            }));
+        }
+        AgentResult::Failed { .. } => {
+            close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
+            return Control::Return(invocation(
+                relaybook_core::ReviewInvocationAction::FailureStreak,
+            ));
+        }
+        AgentResult::Finished { .. } => {}
     }
     let (verdict, body) = match agents::parse_codex_verdict(&result_text(&result), release) {
         Ok(parsed) => parsed,
         Err(_) => {
             close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
-            return Control::Return(bump_failure(db, cwd, quiet, run_id));
+            return Control::Return(invocation(
+                relaybook_core::ReviewInvocationAction::FailureStreak,
+            ));
         }
     };
     let mut ledger = match Ledger::open(db) {
         Ok(ledger) => ledger,
         Err(err) => return Control::Return(fail(&err.to_string())),
     };
-    let mut run = match load_live(&ledger, run_id) {
+    let run = match load_live(&ledger, run_id) {
         Ok(run) => run,
         Err(err) => return Control::Return(fail(&err)),
     };
+    let advance = codex_run_advance(&run, release, &verdict, &gates);
     let recorded = match &scope {
         CodexScope::Task(slug) => crate::gate::record_owned_task_review(
             &mut ledger,
@@ -1464,6 +1512,7 @@ fn review_with_codex(
             &body,
             review_id,
             generation,
+            advance.clone(),
         ),
         CodexScope::Release => crate::gate::record_owned_release_review(
             &mut ledger,
@@ -1473,6 +1522,7 @@ fn review_with_codex(
             &body,
             review_id,
             generation,
+            advance.clone(),
         ),
     };
     if let Err(err) = recorded {
@@ -1481,65 +1531,200 @@ fn review_with_codex(
         if err.to_string() == relaybook_core::STALE_REVIEW_INVOCATION {
             return Control::Return(fail(relaybook_core::STALE_REVIEW_INVOCATION));
         }
-        return Control::Return(bump_failure(db, cwd, quiet, run_id));
-    }
-    if release && verdict != "approved" {
-        close_live(session, cwd, run_id, quiet, elapsed, &result, "halted");
-        return Control::Return(halt(
-            cwd,
-            &mut ledger,
-            &mut run,
-            "release review requested changes",
+        return Control::Return(invocation(
+            relaybook_core::ReviewInvocationAction::FailureStreak,
         ));
     }
-    let report_verdict = match &scope {
-        CodexScope::Task(slug) => ledger
-            .latest_report_meta(slug)
-            .ok()
-            .flatten()
-            .and_then(|(_, stored)| stored)
-            .unwrap_or_else(|| {
-                if verdict == "approved" {
-                    "accepted".to_string()
-                } else {
-                    "reopened".to_string()
-                }
-            }),
-        CodexScope::Release => "approved".to_string(),
-    };
-    run.failure_streak = 0;
-    if release {
-        run.stage = "gate_release".to_string();
-        run.status = "waiting".to_string();
-        if let Err(err) = ledger.save_run(&mut run) {
-            return Control::Return(fail(&err.to_string()));
-        }
-        close_live(session, cwd, run_id, quiet, elapsed, &result, "waiting");
-        println!("{}", codex_review_line(&run, &label, &report_verdict));
-        return Control::Return(ok(&signoff_wait(cwd)));
+    if advance.status == "stopped" {
+        close_live(session, cwd, run_id, quiet, elapsed, &result, "halted");
+        let reason = advance
+            .stop_reason
+            .as_deref()
+            .unwrap_or("release review requested changes");
+        return Control::Return(fail(&format!("stopped: {reason}; relaybook run --resume")));
     }
+    let report_verdict = if release {
+        "approved".to_string()
+    } else if verdict == "approved" {
+        "accepted".to_string()
+    } else {
+        "reopened".to_string()
+    };
     let outcome = if report_verdict == "reopened" {
         "reopened"
-    } else if gates == "plan,review" {
+    } else if advance.status == "waiting" && !release {
         "paused at checkpoint"
+    } else if release {
+        "waiting"
     } else {
         "accepted"
     };
     close_live(session, cwd, run_id, quiet, elapsed, &result, outcome);
     println!("{}", codex_review_line(&run, &label, &report_verdict));
-    run.stage = format!("gate_review:{report_verdict}");
-    if gates == "plan,review" {
-        run.status = "waiting".to_string();
-        if let Err(err) = ledger.save_run(&mut run) {
-            return Control::Return(fail(&err.to_string()));
-        }
-        return Control::Return(ok("waiting for approval: relaybook approve"));
-    }
-    run.stage = "after_review".to_string();
-    if let Err(err) = ledger.save_run(&mut run) {
-        return Control::Return(fail(&err.to_string()));
+    if advance.status == "waiting" {
+        let message = if release {
+            signoff_wait(cwd)
+        } else {
+            "waiting for approval: relaybook approve".to_string()
+        };
+        return Control::Return(ok(&message));
     }
     Control::Stay
+}
+
+fn codex_run_advance(
+    run: &Run,
+    release: bool,
+    verdict: &str,
+    gates: &str,
+) -> relaybook_core::OwnedRunAdvance {
+    if release && verdict != "approved" {
+        return relaybook_core::OwnedRunAdvance {
+            stage: run.stage.clone(),
+            status: "stopped".to_string(),
+            failure_streak: 0,
+            stop_reason: Some("release review requested changes".to_string()),
+        };
+    }
+    if release {
+        return relaybook_core::OwnedRunAdvance {
+            stage: "gate_release".to_string(),
+            status: "waiting".to_string(),
+            failure_streak: 0,
+            stop_reason: run.stop_reason.clone(),
+        };
+    }
+    let report_verdict = if verdict == "approved" {
+        "accepted"
+    } else {
+        "reopened"
+    };
+    if gates == "plan,review" {
+        return relaybook_core::OwnedRunAdvance {
+            stage: format!("gate_review:{report_verdict}"),
+            status: "waiting".to_string(),
+            failure_streak: 0,
+            stop_reason: run.stop_reason.clone(),
+        };
+    }
+    relaybook_core::OwnedRunAdvance {
+        stage: "after_review".to_string(),
+        status: "active".to_string(),
+        failure_streak: 0,
+        stop_reason: run.stop_reason.clone(),
+    }
+}
+
+/// An approved task review already accepted this report and committed that
+/// fact, but the run was still at `review`. Continue from that result.
+fn recover_accepted_task(
+    cwd: &Path,
+    ledger: &mut Ledger,
+    run: &mut Run,
+    slug: &str,
+    gates: &str,
+) -> Result<Option<Control>, String> {
+    let Some((_, Some(verdict))) = ledger
+        .latest_report_meta(slug)
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(None);
+    };
+    if verdict != "accepted" {
+        return Ok(None);
+    }
+    let Some(review) = ledger
+        .latest_review("task", Some(slug))
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(None);
+    };
+    if review.verdict.as_deref() != Some("approved") || review.run_id != Some(run.id) {
+        return Ok(None);
+    }
+    let head = git(cwd, &["rev-parse", "HEAD"])?;
+    if review.commit_sha != head {
+        return Ok(None);
+    }
+    let Some(report) = ledger
+        .latest_task_report(slug)
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(None);
+    };
+    if report.commit_sha.as_deref() != Some(head.as_str()) {
+        return Ok(None);
+    }
+    let advance = codex_run_advance(run, false, "approved", gates);
+    run.stage = advance.stage;
+    run.status = advance.status;
+    run.failure_streak = advance.failure_streak;
+    run.stop_reason = advance.stop_reason;
+    ledger.save_run(run).map_err(|err| err.to_string())?;
+    println!("{}", codex_review_line(run, slug, "accepted"));
+    if run.status == "waiting" {
+        return Ok(Some(Control::Return(ok(
+            "waiting for approval: relaybook approve",
+        ))));
+    }
+    Ok(Some(Control::Stay))
+}
+
+fn apply_codex_invocation(
+    db: &Path,
+    cwd: &Path,
+    quiet: bool,
+    run_id: i64,
+    review_id: i64,
+    generation: i64,
+    action: relaybook_core::ReviewInvocationAction,
+) -> RunOutput {
+    let mut ledger = match Ledger::open(db) {
+        Ok(ledger) => ledger,
+        Err(err) => return fail(&err.to_string()),
+    };
+    match relaybook_core::apply_review_invocation(&mut ledger, review_id, generation, action) {
+        Ok(relaybook_core::ReviewInvocationOutcome::Stale) => {
+            fail(relaybook_core::STALE_REVIEW_INVOCATION)
+        }
+        Ok(relaybook_core::ReviewInvocationOutcome::WaitingCheckpoint) => {
+            let stage = ledger
+                .run_by_id(run_id)
+                .map(|run| run.stage)
+                .unwrap_or_default();
+            if stage == "gate_release" {
+                ok(&signoff_wait(cwd))
+            } else {
+                ok("waiting for approval: relaybook approve")
+            }
+        }
+        Ok(relaybook_core::ReviewInvocationOutcome::Saved { drive: true, .. }) => {
+            drop(ledger);
+            drive(db, cwd, quiet, run_id)
+        }
+        Ok(relaybook_core::ReviewInvocationOutcome::Saved { drive: false, run }) => {
+            if run.status == "paused" {
+                ok(&codex_pause_line(&run))
+            } else {
+                let reason = run.stop_reason.unwrap_or_else(|| "stopped".to_string());
+                fail(&format!("stopped: {reason}; relaybook run --resume"))
+            }
+        }
+        Err(err) => fail(&err.to_string()),
+    }
+}
+
+fn codex_pause_line(run: &Run) -> String {
+    match run.stop_reason.as_deref() {
+        Some(reason) => match reason.split_once('|') {
+            Some((cli, time)) if !time.is_empty() => {
+                format!("usage limit reached on {cli}; relaybook run --resume after {time}")
+            }
+            Some((cli, _)) => format!("usage limit reached on {cli}; relaybook run --resume"),
+            None => format!("usage limit reached on {reason}; relaybook run --resume"),
+        },
+        None => "usage limit reached on codex; relaybook run --resume".to_string(),
+    }
 }
 
 fn review_packet(cwd: &Path, prepared: &crate::gate::PreparedReview) -> Result<String, String> {

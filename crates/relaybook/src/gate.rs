@@ -609,6 +609,7 @@ pub(crate) fn record_owned_task_review(
     text: &str,
     review_id: i64,
     run_generation: i64,
+    advance: relaybook_core::OwnedRunAdvance,
 ) -> Result<Review, Error> {
     if ledger.settings()?.workflow != "gated" {
         return Err(Error::InvalidSetting(
@@ -638,10 +639,12 @@ pub(crate) fn record_owned_task_review(
         review_id,
         run_generation,
         true,
+        advance,
         move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
     )
 }
 
+#[allow(clippy::too_many_arguments)] // record fields plus the invocation that owns them
 pub(crate) fn record_owned_release_review(
     ledger: &mut Ledger,
     cwd: &Path,
@@ -650,6 +653,7 @@ pub(crate) fn record_owned_release_review(
     text: &str,
     review_id: i64,
     run_generation: i64,
+    advance: relaybook_core::OwnedRunAdvance,
 ) -> Result<Review, Error> {
     if ledger.settings()?.workflow != "gated" {
         return Err(Error::InvalidSetting(
@@ -688,6 +692,7 @@ pub(crate) fn record_owned_release_review(
         review_id,
         run_generation,
         false,
+        advance,
         move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
     )
 }

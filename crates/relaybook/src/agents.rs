@@ -322,7 +322,8 @@ pub(crate) fn codex_args(
 }
 
 /// `-o` path for one review. The directory is outside `root` so an isolated
-/// reviewer can create the file when the repository is read-only.
+/// reviewer can create the file when the repository is read-only. The directory
+/// itself is private; see [`prepare_codex_output`].
 pub(crate) fn codex_output_file(
     root: &Path,
     run_id: i64,
@@ -395,42 +396,270 @@ pub(crate) fn parse_codex_verdict(text: &str, release: bool) -> Result<(String, 
     Ok((verdict.to_string(), body))
 }
 
-fn prepare_codex_output(out: &Path, schema: &Path, schema_text: &str) -> Result<(), String> {
+/// Create the invocation directory and schema.
+///
+/// The directory is mode `0700` and is created with `mkdir`, which fails if
+/// the path already exists, including as a symlink. `share_user` is set only
+/// for the isolated sandbox. When it names another account, that account alone
+/// is granted access. A missing account or a failed grant does not widen the
+/// directory.
+fn prepare_codex_output(
+    out: &Path,
+    schema: &Path,
+    schema_text: &str,
+    share_user: Option<&str>,
+) -> Result<(), String> {
     let Some(parent) = out.parent() else {
         return Err("codex output has no directory".to_string());
     };
     if parent == std::env::temp_dir() {
         return Err("codex output directory is the temp root".to_string());
     }
-    create_shared_dir(parent)?;
-    std::fs::write(schema, schema_text).map_err(|err| err.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777))
-            .map_err(|err| err.to_string())?;
-        std::fs::set_permissions(schema, std::fs::Permissions::from_mode(0o644))
-            .map_err(|err| err.to_string())?;
+    match std::fs::symlink_metadata(parent) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err("codex output directory is a symlink".to_string());
+        }
+        Ok(_) => return Err("codex output directory already exists".to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.to_string()),
     }
-    let _ = std::fs::remove_file(out);
+    if std::fs::symlink_metadata(out).is_ok() || std::fs::symlink_metadata(schema).is_ok() {
+        return Err("codex output path already exists".to_string());
+    }
+    create_private_dir(parent)?;
+    write_private_schema(schema, schema_text)?;
+    if let Some(user) = share_user.map(str::trim).filter(|user| !user.is_empty())
+        && let Err(err) = grant_isolated_user(parent, schema, user)
+    {
+        let _ = std::fs::remove_file(schema);
+        let _ = std::fs::remove_dir(parent);
+        return Err(err);
+    }
     Ok(())
 }
 
-fn create_shared_dir(path: &Path) -> Result<(), String> {
+fn create_private_dir(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o777)
+            .mode(0o700)
             .create(path)
+            .map_err(|err| err.to_string())?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| err.to_string())?;
+        let meta = std::fs::symlink_metadata(path).map_err(|err| err.to_string())?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err("codex output directory is not a real directory".to_string());
+        }
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err("codex output directory is not private".to_string());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+fn write_private_schema(schema: &Path, schema_text: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(o_nofollow())
+            .open(schema)
+            .map_err(|err| err.to_string())?;
+        file.write_all(schema_text.as_bytes())
+            .map_err(|err| err.to_string())?;
+        std::fs::set_permissions(schema, std::fs::Permissions::from_mode(0o600))
             .map_err(|err| err.to_string())?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::create_dir_all(path).map_err(|err| err.to_string())?;
+        std::fs::write(schema, schema_text).map_err(|err| err.to_string())?;
     }
     Ok(())
+}
+
+fn read_codex_output(out: &Path, share_user: Option<&str>) -> Result<String, String> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let Some(parent) = out.parent() else {
+            return Err("codex output has no directory".to_string());
+        };
+        let parent_meta = std::fs::symlink_metadata(parent).map_err(|err| err.to_string())?;
+        if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+            return Err("codex output directory is not a real directory".to_string());
+        }
+        if parent_meta.permissions().mode() & 0o007 != 0 {
+            return Err("codex output directory is world-accessible".to_string());
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(o_nofollow())
+            .open(out)
+            .map_err(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    "codex output is missing".to_string()
+                } else {
+                    "codex output is not a regular file".to_string()
+                }
+            })?;
+        let meta = file.metadata().map_err(|err| err.to_string())?;
+        if !meta.is_file() {
+            return Err("codex output is not a regular file".to_string());
+        }
+        if !output_uid_allowed(meta.uid(), parent_meta.uid(), share_user) {
+            return Err("codex output is not owned by the review invocation".to_string());
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|err| err.to_string())?;
+        if text.trim().is_empty() {
+            return Err("codex output is empty".to_string());
+        }
+        Ok(text)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = share_user;
+        let text = std::fs::read_to_string(out).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                "codex output is missing".to_string()
+            } else {
+                err.to_string()
+            }
+        })?;
+        if text.trim().is_empty() {
+            return Err("codex output is empty".to_string());
+        }
+        Ok(text)
+    }
+}
+
+#[cfg(unix)]
+fn o_nofollow() -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        0x20000
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        0x100
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        0
+    }
+}
+
+#[cfg(unix)]
+fn output_uid_allowed(file_uid: u32, dir_uid: u32, share_user: Option<&str>) -> bool {
+    if file_uid == dir_uid {
+        return true;
+    }
+    let Some(user) = share_user.map(str::trim).filter(|user| !user.is_empty()) else {
+        return false;
+    };
+    account_uid(user).ok() == Some(file_uid)
+}
+
+fn grant_isolated_user(dir: &Path, schema: &Path, user: &str) -> Result<(), String> {
+    if !username_ok(user) {
+        return Err("codex user is invalid".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir_uid = std::fs::symlink_metadata(dir)
+            .map_err(|err| err.to_string())?
+            .uid();
+        let user_uid = account_uid(user)?;
+        if user_uid == dir_uid {
+            return Ok(());
+        }
+        run_setfacl(&["-m", &format!("u:{user}:rwx"), &dir.display().to_string()])?;
+        run_setfacl(&["-m", &format!("u:{user}:r"), &schema.display().to_string()])?;
+        let mode = std::fs::symlink_metadata(dir)
+            .map_err(|err| err.to_string())?
+            .permissions()
+            .mode();
+        if mode & 0o007 != 0 {
+            return Err("codex output directory is world-accessible".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, schema);
+        Err(format!(
+            "cannot share the codex output directory with {user}"
+        ))
+    }
+}
+
+fn username_ok(user: &str) -> bool {
+    let mut chars = user.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && user.len() <= 32
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+#[cfg(unix)]
+fn account_uid(user: &str) -> Result<u32, String> {
+    if !username_ok(user) {
+        return Err("codex user is invalid".to_string());
+    }
+    let output = Command::new("getent")
+        .args(["passwd", user])
+        .output()
+        .map_err(|err| format!("getent: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("codex user {user} was not found"));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let uid = text
+        .split(':')
+        .nth(2)
+        .ok_or_else(|| format!("codex user {user} was not found"))?;
+    uid.parse::<u32>()
+        .map_err(|_| format!("codex user {user} was not found"))
+}
+
+#[cfg(unix)]
+fn run_setfacl(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("setfacl")
+        .args(args)
+        .output()
+        .map_err(|err| format!("setfacl: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        Err("could not share the codex output directory".to_string())
+    } else {
+        Err(format!(
+            "could not share the codex output directory: {detail}"
+        ))
+    }
 }
 
 /// Run Codex and return the `-o` file only when the process exits 0 and that
@@ -459,7 +688,14 @@ pub(crate) fn call_codex(
     } else {
         TASK_CODEX_SCHEMA
     };
-    if let Err(err) = prepare_codex_output(out, &schema, schema_text) {
+    let share_user = if sandbox == CodexSandbox::Isolated {
+        std::env::var("RELAYBOOK_CODEX_USER")
+            .ok()
+            .filter(|user| !user.trim().is_empty())
+    } else {
+        None
+    };
+    if let Err(err) = prepare_codex_output(out, &schema, schema_text, share_user.as_deref()) {
         return AgentResult::Failed { output: err };
     }
     let args = codex_args(&root, &schema, out, prompt, sandbox);
@@ -534,20 +770,14 @@ pub(crate) fn call_codex(
             ),
         };
     }
-    match std::fs::read_to_string(out) {
-        Ok(text) if !text.trim().is_empty() => AgentResult::Finished {
+    match read_codex_output(out, share_user.as_deref()) {
+        Ok(text) => AgentResult::Finished {
             session_id: None,
             est_cost_usd: 0.0,
             output: text,
         },
-        Ok(_) => AgentResult::Failed {
-            output: format!("codex output is empty\n{stderr}"),
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => AgentResult::Failed {
-            output: format!("codex output is missing\n{stderr}"),
-        },
         Err(err) => AgentResult::Failed {
-            output: err.to_string(),
+            output: format!("{err}\n{stderr}"),
         },
     }
 }
@@ -819,7 +1049,7 @@ mod tests {
     use super::{
         AccountKind, Accounts, AgentResult, CodexSandbox, account_line, classify, claude_account,
         codex_args, codex_output_file, forbidden_codex_arg, parse_codex_verdict, path_is_inside,
-        review_input_too_large,
+        prepare_codex_output, read_codex_output, review_input_too_large,
     };
 
     #[test]
@@ -977,6 +1207,116 @@ mod tests {
         let out = codex_output_file(&root, 4, 9, 2);
         assert!(out.ends_with("codex-last.md"));
         assert!(!path_is_inside(&root, &out), "{out:?} is inside {root:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_output_directory_is_private_and_rejects_substitution() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().expect("temp");
+        for sandbox in [CodexSandbox::ReadOnly, CodexSandbox::Isolated] {
+            let out = root
+                .path()
+                .join(format!("{sandbox:?}"))
+                .join("codex-last.md");
+            let schema = out.with_file_name("codex-schema.json");
+            prepare_codex_output(&out, &schema, "{\"type\":\"object\"}\n", None).expect("prepare");
+            let dir = out.parent().expect("dir");
+            let mode = std::fs::symlink_metadata(dir)
+                .expect("dir meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "{sandbox:?} mode {mode:o}");
+            let schema_mode = std::fs::symlink_metadata(&schema)
+                .expect("schema meta")
+                .permissions()
+                .mode();
+            assert_eq!(
+                schema_mode & 0o777,
+                0o600,
+                "{sandbox:?} schema {schema_mode:o}"
+            );
+        }
+
+        let out = root.path().join("invocation").join("codex-last.md");
+        let schema = out.with_file_name("codex-schema.json");
+        prepare_codex_output(&out, &schema, "{}\n", None).expect("prepare");
+        let dir = out.parent().expect("dir");
+        let decoy = dir.join("decoy.json");
+        let token = "kestrel-symlink";
+        std::fs::write(
+            &decoy,
+            format!(
+                "{{\"verdict\":\"approved\",\"body\":{{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"token\":\"{token}\"}}}}\n"
+            ),
+        )
+        .expect("decoy");
+        symlink(&decoy, &out).expect("symlink");
+        let err = read_codex_output(&out, None).expect_err("symlink verdict");
+        assert!(!err.contains(token), "{err}");
+        assert!(
+            err.contains("not a regular file") || err.contains("missing"),
+            "{err}"
+        );
+
+        let swapped_out = root.path().join("swapped").join("codex-last.md");
+        let swapped_schema = swapped_out.with_file_name("codex-schema.json");
+        prepare_codex_output(&swapped_out, &swapped_schema, "{}\n", None).expect("prepare");
+        let mut permissions = std::fs::symlink_metadata(swapped_out.parent().expect("parent"))
+            .expect("meta")
+            .permissions();
+        permissions.set_mode(0o777);
+        std::fs::set_permissions(swapped_out.parent().expect("parent"), permissions)
+            .expect("chmod");
+        std::fs::write(&swapped_out, "{\"verdict\":\"approved\"}\n").expect("file");
+        let err = read_codex_output(&swapped_out, None).expect_err("world writable");
+        assert!(err.contains("world-accessible"), "{err}");
+        assert!(!err.contains("approved"), "{err}");
+
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).expect("target");
+        let link = root.path().join("link");
+        symlink(&target, &link).expect("dir symlink");
+        let linked_out = link.join("codex-last.md");
+        let linked_schema = link.join("codex-schema.json");
+        let err = prepare_codex_output(&linked_out, &linked_schema, "{\"secret\":true}\n", None)
+            .expect_err("followed symlink");
+        assert!(
+            err.contains("symlink") || err.contains("already exists"),
+            "{err}"
+        );
+        assert!(
+            std::fs::read_dir(&target)
+                .expect("target dir")
+                .next()
+                .is_none(),
+            "schema was written through the directory symlink"
+        );
+
+        let missing = prepare_codex_output(
+            &root.path().join("missing-user").join("codex-last.md"),
+            &root.path().join("missing-user").join("codex-schema.json"),
+            "{}\n",
+            Some("not-a-real-user"),
+        );
+        let err = missing.expect_err("unknown user");
+        assert!(
+            err.contains("not found") || err.contains("invalid") || err.contains("getent"),
+            "{err}"
+        );
+        let created = root.path().join("missing-user");
+        if created.exists() {
+            let mode = std::fs::symlink_metadata(&created)
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o007,
+                0,
+                "unknown user left a world-accessible directory {mode:o}"
+            );
+        }
     }
 
     #[test]
