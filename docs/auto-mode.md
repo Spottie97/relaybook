@@ -2,6 +2,8 @@
 
 Manual mode is the default. Auto mode spends plan usage: Claude plans and reviews, and Cursor implements, one task at a time, on a branch. Main changes only when you merge the pull request, but the run branch is pushed to `origin` before that. See [Pushes and the pull request](#pushes-and-the-pull-request).
 
+This page describes `workflow=classic`, the default. With `workflow=gated`, `relaybook run`, `relaybook run --resume`, and `relaybook approve` are refused. See [Gated workflow](#gated-workflow).
+
 Sign in to Claude Code and the Cursor CLI once. The CLI command is `cursor-agent`, or `agent` on Windows. Install it there from PowerShell with `irm 'https://cursor.com/install?win32=true' | iex`. Auto mode runs natively on Windows, and a WSL shell can use the Linux release instead. Then:
 
 ```sh
@@ -77,7 +79,13 @@ When the repository has an `origin` remote, the run pushes its branch with `git 
 
 When no run task is unfinished, the run pushes and runs `gh pr create --base main` without asking. Checkpoints pause after planning and after reviews only. There is no checkpoint before a push or the pull request. Without an `origin` remote nothing is pushed, but `gh pr create` still runs. Relaybook never merges and never creates a tag.
 
-The manual gated workflow publishes nothing before sign-off, so it does not use `relaybook run`. See [orca-workflow.md](orca-workflow.md). `relaybook run` still pushes when `workflow=gated`. Skipping those pushes, and routing the auto reviewer to Codex, is planned and not built.
+## Gated workflow
+
+With `workflow=gated`, `relaybook run`, `relaybook run --resume`, and `relaybook approve` exit 1 with "relaybook run is not available with workflow=gated in this build". That happens before any agent, git checkout, fetch, or push. `relaybook run stop`, `relaybook run complete`, `relaybook run watch`, and `relaybook run add` still run, and they do not push.
+
+`relaybook config set workflow classic` asks `Leave gated workflow?` at a terminal. Answering `y` sets `workflow=classic`. Without a terminal the command fails with `leaving workflow=gated requires confirmation at a TTY` and the setting stays `gated`. Declining fails with `leaving workflow=gated was not confirmed`. Setting `workflow=gated`, and setting `workflow=classic` when it is already `classic`, does not ask. `relaybook mode` does not ask either.
+
+The manual gated workflow is in [orca-workflow.md](orca-workflow.md). Classic auto mode still pushes as described above. Routing the auto reviewer to Codex is planned and not built.
 
 ## PRD template
 

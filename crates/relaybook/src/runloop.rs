@@ -46,6 +46,12 @@ pub(crate) fn execute(cwd: &Path, launch: Launch) -> RunOutput {
     if !launch.add.is_empty() {
         return add_to_run(&db, &launch.add);
     }
+    // Stop, complete, watch, and add returned above. They do not push.
+    // Everything else, including approve and resume, refuses before overrides,
+    // preflight, or git when this ledger is gated.
+    if let Err(err) = refuse_gated_launch(&db) {
+        return fail(&err);
+    }
     if let Err(err) = apply_overrides(&db, &launch) {
         return fail(&err);
     }
@@ -94,6 +100,14 @@ fn stop_requested(db: &Path) -> RunOutput {
         return fail("stopped: stopped by request; relaybook run --resume");
     }
     fail("no active run")
+}
+
+fn refuse_gated_launch(db: &Path) -> Result<(), String> {
+    let ledger = Ledger::open(db).map_err(|err| err.to_string())?;
+    if ledger.settings().map_err(|err| err.to_string())?.workflow == "gated" {
+        return Err("relaybook run is not available with workflow=gated in this build".to_string());
+    }
+    Ok(())
 }
 
 fn apply_overrides(db: &Path, launch: &Launch) -> Result<(), String> {

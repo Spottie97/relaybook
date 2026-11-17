@@ -108,7 +108,7 @@ relaybook run watch
 relaybook run stop
 ```
 
-`relaybook run` adopts open and claimed tasks that have no run. `--new-only` skips that. `relaybook run add` links unfinished tasks to the active run. A done task is rejected. `--quiet` prints phase headers and the closing summary. `relaybook run watch` prints `.relaybook/runs/<id>/live.log` and follows it until the run pauses or ends. `relaybook status` appends the latest live lines while a run is active.
+`relaybook run` adopts open and claimed tasks that have no run. `--new-only` skips that. `relaybook run add` links unfinished tasks to the active run. A done task is rejected. `--quiet` prints phase headers and the closing summary. `relaybook run watch` prints `.relaybook/runs/<id>/live.log` and follows it until the run pauses or ends. `relaybook status` appends the latest live lines while a run is active. With `workflow=gated`, `relaybook run`, `relaybook run --resume`, and `relaybook approve` are refused. See [auto-mode.md](auto-mode.md#gated-workflow).
 
 ## Install and setup
 

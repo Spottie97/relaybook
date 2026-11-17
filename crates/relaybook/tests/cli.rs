@@ -1128,15 +1128,14 @@ fn gated_requires_reviewer_codex() {
 
     run(dir.path(), ["config", "set", "workflow", "classic"])
         .assert()
-        .success()
-        .stdout("workflow classic\n");
-    run(dir.path(), ["config", "set", "reviewer", "claude"])
-        .assert()
-        .success()
-        .stdout("reviewer claude\n");
-    let restored = json_data(dir.path(), ["config", "--json"]);
-    assert_eq!(restored["reviewer"], json!("claude"));
-    assert_eq!(restored["workflow"], json!("classic"));
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "leaving workflow=gated requires confirmation at a TTY",
+        ));
+    let stayed = json_data(dir.path(), ["config", "--json"]);
+    assert_eq!(stayed["reviewer"], json!("codex"));
+    assert_eq!(stayed["workflow"], json!("gated"));
 }
 
 #[test]

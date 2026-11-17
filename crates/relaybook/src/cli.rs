@@ -1869,8 +1869,24 @@ fn show_config(cwd: &Path) -> Result<Outcome, Fail> {
     json_outcome(settings.clone(), relaybook_core::format_config(&settings))
 }
 
+fn confirm_leave_gated() -> Result<(), Fail> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(invalid_setting(
+            "leaving workflow=gated requires confirmation at a TTY",
+        ));
+    }
+    match uninstall::confirm("Leave gated workflow?") {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(invalid_setting("leaving workflow=gated was not confirmed")),
+        Err(message) => Err(invalid_setting(message)),
+    }
+}
+
 fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
+    if key == "workflow" && value == "classic" && ledger.settings()?.workflow == "gated" {
+        confirm_leave_gated()?;
+    }
     let settings = ledger.set_setting(key, value)?;
     let shown = match key {
         "est_cost_cap_usd" => settings

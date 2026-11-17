@@ -1,6 +1,6 @@
 # Orca workflow
 
-Manual work with `workflow=gated` is implemented. The default stays `workflow=classic`: the same task commands, and no review, release, or graph gate. Auto mode still plans and reviews with Claude, and `relaybook run` still pushes before sign-off. Sections marked **Planned** are not enforced.
+Manual work with `workflow=gated` is implemented. The default stays `workflow=classic`: the same task commands, and no review, release, or graph gate. Auto mode with `workflow=classic` still plans and reviews with Claude, and `relaybook run` still pushes before sign-off. With `workflow=gated`, `relaybook run` and `relaybook approve` refuse. Sections marked **Planned** are not enforced.
 
 ## Minimum version
 
@@ -47,14 +47,14 @@ relaybook config set workflow gated
 
 **Auto mode today:**
 
-- `relaybook run` pushes the run branch to `origin` after every accepted review and whenever it halts, then pushes again and runs `gh pr create` without a checkpoint. See [auto-mode.md](auto-mode.md#pushes-and-the-pull-request). That is why this workflow does not use `relaybook run`.
-- Setting `workflow=gated` does not change that loop.
+- With `workflow=classic`, `relaybook run` pushes the run branch to `origin` after every accepted review and whenever it halts, then pushes again and runs `gh pr create` without a checkpoint. See [auto-mode.md](auto-mode.md#pushes-and-the-pull-request).
+- With `workflow=gated`, `relaybook run`, `relaybook run --resume`, and `relaybook approve` refuse before any push. `relaybook config set workflow classic` requires a terminal. This workflow still does not use `relaybook run`.
 
 **Planned:**
 
 - Codex routing inside `relaybook run`, including a missing-Codex halt.
 - A runloop guard that stops a reviewer who edits the branch or the ledger.
-- A release gate that skips pushes and the pull request until sign-off, including when the run halts.
+- A release gate that publishes only after sign-off, including when the run halts. Until that lands, gated `relaybook run` stays unavailable.
 - Graph refresh and handoff SHAs inside the auto runner.
 
 ## Reviewer edits
