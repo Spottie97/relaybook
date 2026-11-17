@@ -21,11 +21,11 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 - The prompt hook prints `N new reports: relaybook inbox`.
 - Docs describe the manual gated workflow as implemented and pin the minimum version: gated work requires Relaybook 0.4.0 or later (ledger schema 7). 0.3.3 and earlier open a schema 7 ledger and ignore the gates.
 - Auto mode still pushes the run branch before sign-off. The auto-mode gates are not built.
-- `scripts/agent-smoke.sh` checks a real `graphify` binary: an existing merge driver is kept, `CLAUDE.md` drift is warned, and `relaybook uninstall --dry-run --graphify` lists Graphify's side effects. The script stays manual and is not part of CI.
+- `scripts/agent-smoke.sh` checks a real `graphify` binary: an existing merge driver is kept, `CLAUDE.md` drift is warned, and `relaybook uninstall --dry-run --graphify` lists Graphify's side effects. Its graphify phase clears inherited `GIT_DIR`, `GIT_WORK_TREE`, and `GIT_INDEX_FILE` and uses a temporary HOME. The agent phase still uses the caller's HOME, and the optional build writes under the checkout. The script stays manual and is not part of CI.
 
 ### Fixed
 
-- `relaybook setup` keeps an existing `merge.graphify.driver`, including the driver `graphify hook install` registers. When that key is unset, setup still registers `graphify merge-driver %O %A %B`.
+- `relaybook setup` keeps an existing `merge.graphify.driver`, including a driver in global or system git config and the driver `graphify hook install` registers. When that key is unset in the effective git configuration, setup still registers a repository-local `graphify merge-driver %O %A %B`.
 - `relaybook setup` warns `CLAUDE.md: warn (graphify claude install changed CLAUDE.md)` when that command changes `CLAUDE.md`. The warning does not fail setup.
 - `relaybook uninstall --dry-run --graphify` lists what Graphify's uninstall commands change: the Graphify section of `CLAUDE.md`, Graphify hooks in `.claude/settings.json`, `.cursor/rules/graphify.mdc`, Graphify git hooks, the `graphify-out/graph.json` merge attribute, and `merge.graphify.*`.
 

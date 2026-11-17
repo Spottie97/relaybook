@@ -19,7 +19,7 @@ relaybook setup --ci
 - `relaybook setup --no-commands` skips `.claude/commands/relaybook.md` and `.cursor/commands/relaybook.md`.
 - `relaybook setup --ci` writes `.github/workflows/graphify-update.yml` and adds `graphify-out/graph.json merge=graphify` to `.gitattributes`. An existing workflow file is left untouched. The workflow opens a pull request instead of pushing to `main`. `graphify-out/` stays tracked.
 
-Setup leaves an existing `merge.graphify.driver` unchanged, including the command `graphify hook install` registered. When that key is unset, setup sets `merge.graphify.driver` to `graphify merge-driver %O %A %B` and `merge.graphify.name` to `graphify graph.json union merge`.
+Setup leaves an existing `merge.graphify.driver` unchanged, including a driver in global or system git config and the command `graphify hook install` registered. When that key is unset in the effective git configuration, setup sets a repository-local `merge.graphify.driver` to `graphify merge-driver %O %A %B` and `merge.graphify.name` to `graphify graph.json union merge`.
 
 `relaybook setup` writes a `# relaybook:start` / `# relaybook:end` block in `.gitignore` and, with `--ci`, in `.gitattributes`. The entries sit on their own lines. A pattern you already ignore is left where it is. The ignore block covers Graphify backups, `graphify-out/` (unless you passed `--ci`), `.relaybook/*.db-wal`, `.relaybook/*.db-shm`, and `.relaybook/runs/`. `.relaybook/ledger.db` stays committable.
 

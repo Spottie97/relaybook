@@ -224,6 +224,62 @@ fn setup_keeps_an_existing_merge_driver() {
 }
 
 #[test]
+fn setup_keeps_a_global_merge_driver() {
+    // Child processes only. GIT_CONFIG_COUNT and its pushInsteadOf pairs stay inherited.
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    let global = root.path().join("global.gitconfig");
+    fs::create_dir(&repo).expect("repo");
+    fs::write(&global, "").expect("global gitconfig");
+    let home_before = home_gitconfig();
+    let system_before = fs::read("/etc/gitconfig").ok();
+
+    let custom_driver = "\"/usr/bin/python3\" -m graphify merge-driver %O %A %B";
+    let custom_name = "graphify union";
+    let init = git_global(&repo, &global, &["init", "-b", "main"]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    write_global_config(&global, "merge.graphify.driver", custom_driver);
+    write_global_config(&global, "merge.graphify.name", custom_name);
+
+    setup_with_global(&repo, &global, &["setup", "--ci", "--no-graphify"]);
+
+    let local = fs::read_to_string(repo.join(".git/config")).expect("local gitconfig");
+    assert!(
+        !local.contains("[merge \"graphify\"]"),
+        "local config overrode the global driver:\n{local}"
+    );
+    assert_local_absent(&repo, &global, "merge.graphify.driver");
+    assert_local_absent(&repo, &global, "merge.graphify.name");
+    assert_eq!(
+        effective_config(&repo, &global, "merge.graphify.driver"),
+        custom_driver
+    );
+    assert_eq!(
+        effective_config(&repo, &global, "merge.graphify.name"),
+        custom_name
+    );
+    assert_eq!(file_config(&global, "merge.graphify.driver"), custom_driver);
+    assert_eq!(file_config(&global, "merge.graphify.name"), custom_name);
+    let attributes = fs::read_to_string(repo.join(".gitattributes")).expect("attributes");
+    assert!(
+        attributes.contains("graphify-out/graph.json merge=graphify\n"),
+        "{attributes}"
+    );
+    assert!(
+        home_gitconfig() == home_before,
+        "real ~/.gitconfig was modified"
+    );
+    assert!(
+        fs::read("/etc/gitconfig").ok() == system_before,
+        "system gitconfig was modified"
+    );
+}
+
+#[test]
 fn setup_repairs_old_attribute_lines_without_ci() {
     for original in [
         "keep text=auto\ngraphify-out/graph.json merge=graphify # relaybook\n",
@@ -326,4 +382,103 @@ fn config_get(dir: &Path, key: &str) -> String {
         .expect("utf8")
         .trim()
         .to_string()
+}
+
+fn home_gitconfig() -> Vec<u8> {
+    let home = std::env::var("HOME").expect("HOME");
+    fs::read(Path::new(&home).join(".gitconfig")).unwrap_or_default()
+}
+
+fn git_global(dir: &Path, global: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("git")
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(args)
+        .output()
+        .expect("git")
+}
+
+fn write_global_config(global: &Path, key: &str, value: &str) {
+    let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["config", "--file"])
+        .arg(global)
+        .arg(key)
+        .arg(value)
+        .output()
+        .expect("git config --file");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn file_config(global: &Path, key: &str) -> String {
+    let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["config", "--file"])
+        .arg(global)
+        .args(["--get", key])
+        .output()
+        .expect("git config --file --get");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}
+
+fn effective_config(dir: &Path, global: &Path, key: &str) -> String {
+    let output = git_global(dir, global, &["config", "--get", key]);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}
+
+fn assert_local_absent(dir: &Path, global: &Path, key: &str) {
+    let output = git_global(dir, global, &["config", "--local", "--get", key]);
+    assert!(
+        !output.status.success(),
+        "local {key} was set: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+fn setup_with_global(dir: &Path, global: &Path, args: &[&str]) {
+    let mut cmd = Command::cargo_bin("relaybook").expect("relaybook binary");
+    cmd.current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args(args);
+    cmd.assert().success();
 }

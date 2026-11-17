@@ -3,7 +3,53 @@
 # Needs a signed-in claude, the Cursor CLI, and a real graphify on PATH.
 # One run: real-graphify checks in a throwaway repo, then the three plain
 # prompts from agent-onboarding-eval. The unit tests use a stand-in graphify.
+#
+# The graphify phase clears GIT_DIR, GIT_WORK_TREE, and GIT_INDEX_FILE and
+# uses a temporary HOME, so it does not operate on another repository or
+# rewrite the caller's Claude or Cursor config. The agent phase keeps the
+# caller's HOME. The optional relaybook build writes under this checkout.
+# RELAYBOOK_SMOKE_LIB=1 loads the helpers and returns before that work.
 set -eu
+
+# git -C does not override these. Drop them before either throwaway repo.
+clear_git_repo_env() {
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+}
+
+# Run a command in a repository. A non-empty home isolates HOME and XDG.
+run_in_repo() {
+  _repo=$1
+  _home=$2
+  shift 2
+  (
+    clear_git_repo_env
+    cd "$_repo" || exit 1
+    if [ -n "$_home" ]; then
+      HOME="$_home"
+      XDG_CONFIG_HOME="$_home/config"
+      XDG_DATA_HOME="$_home/data"
+      export HOME XDG_CONFIG_HOME XDG_DATA_HOME
+    fi
+    "$@"
+  )
+}
+
+init_throwaway() {
+  _init_repo=$1
+  _init_home=$2
+  run_in_repo "$_init_repo" "$_init_home" git init -q -b main
+  run_in_repo "$_init_repo" "$_init_home" git config user.name "Relaybook"
+  run_in_repo "$_init_repo" "$_init_home" git config user.email "relaybook@example.com"
+  run_in_repo "$_init_repo" "$_init_home" git config commit.gpgsign false
+}
+
+run_graphify() {
+  run_in_repo "$graph" "$graph_home" "$@"
+}
+
+if [ "${RELAYBOOK_SMOKE_LIB:-}" = 1 ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 relaybook=${RELAYBOOK_BIN:-$root/target/debug/relaybook}
@@ -41,32 +87,23 @@ relaybook_dir=$(dirname "$relaybook")
 PATH="$relaybook_dir:$PATH"
 export PATH
 
-# Real graphify. HOME is isolated so this does not rewrite the user's Claude or Cursor config.
-git -C "$graph" init -q -b main
-git -C "$graph" config user.name "Relaybook"
-git -C "$graph" config user.email "relaybook@example.com"
-git -C "$graph" config commit.gpgsign false
+# Clear repository and index overrides before either throwaway repo.
+# The graphify phase uses a temporary HOME. The agent phase keeps the
+# caller's HOME. The optional build above writes under this checkout.
+clear_git_repo_env
+
+init_throwaway "$graph" "$graph_home"
 mkdir -p "$graph/src"
 printf 'fn main() {}\n' > "$graph/src/main.rs"
-git -C "$graph" add src/main.rs
-git -C "$graph" commit -q -m "tiny app"
-
-run_graphify() {
-  (
-    cd "$graph" || exit 1
-    HOME="$graph_home" \
-      XDG_CONFIG_HOME="$graph_home/config" \
-      XDG_DATA_HOME="$graph_home/data" \
-      "$@"
-  )
-}
+run_in_repo "$graph" "$graph_home" git add src/main.rs
+run_in_repo "$graph" "$graph_home" git commit -q -m "tiny app"
 
 if ! run_graphify graphify hook install >"$graph/hook-install.out" 2>&1; then
   echo "graphify hook install failed" >&2
   cat "$graph/hook-install.out" >&2
   exit 1
 fi
-before=$(git -C "$graph" config --local --get merge.graphify.driver || true)
+before=$(run_in_repo "$graph" "$graph_home" git config --local --get merge.graphify.driver || true)
 if [ -z "$before" ]; then
   echo "graphify hook install did not set merge.graphify.driver" >&2
   cat "$graph/hook-install.out" >&2
@@ -77,7 +114,7 @@ if ! run_graphify "$relaybook" setup --ci >"$graph/setup.out" 2>&1; then
   cat "$graph/setup.out" >&2
   exit 1
 fi
-after=$(git -C "$graph" config --local --get merge.graphify.driver || true)
+after=$(run_in_repo "$graph" "$graph_home" git config --local --get merge.graphify.driver || true)
 if [ "$before" != "$after" ]; then
   echo "setup replaced merge.graphify.driver" >&2
   printf 'before: %s\n' "$before" >&2
@@ -120,18 +157,15 @@ if [ "$had_rules" -eq 1 ] && [ ! -f "$rules" ]; then
   echo "dry-run removed .cursor/rules/graphify.mdc" >&2
   exit 1
 fi
-still=$(git -C "$graph" config --local --get merge.graphify.driver || true)
+still=$(run_in_repo "$graph" "$graph_home" git config --local --get merge.graphify.driver || true)
 if [ "$still" != "$before" ]; then
   echo "dry-run changed merge.graphify.driver" >&2
   exit 1
 fi
 echo "graphify: driver kept, CLAUDE.md warned, dry-run listed side effects"
 
+init_throwaway "$work" ""
 cd "$work" || exit 1
-git init -q -b main
-git config user.name "Relaybook"
-git config user.email "relaybook@example.com"
-git config commit.gpgsign false
 mkdir -p src
 cat > src/main.rs <<'EOF'
 fn main() {
