@@ -1686,6 +1686,15 @@ fn authorize_while_prompted(dir: &Path, sha: &str, during: impl FnOnce()) -> Pty
 }
 
 fn answer_at_tty(dir: &Path, args: &[&str], accept: bool) -> PtyOutput {
+    answer_at_tty_with(dir, args, accept, &[])
+}
+
+fn answer_at_tty_with(
+    dir: &Path,
+    args: &[&str],
+    accept: bool,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> PtyOutput {
     use std::io::{Read, Write};
     use std::sync::mpsc;
     use std::thread;
@@ -1711,6 +1720,9 @@ fn answer_at_tty(dir: &Path, args: &[&str], accept: bool) -> PtyOutput {
     cmd.cwd(dir);
     cmd.env_remove("GIT_DIR");
     cmd.env_remove("GIT_WORK_TREE");
+    for (key, value) in env {
+        cmd.env(*key, value);
+    }
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().expect("reader");
@@ -1764,4 +1776,452 @@ fn answer_at_tty(dir: &Path, args: &[&str], accept: bool) -> PtyOutput {
         code: status.exit_code(),
         output: String::from_utf8_lossy(&buf).into_owned(),
     }
+}
+
+#[cfg(unix)]
+fn write_push_result_wrapper(path: &Path, target: &Path) {
+    let target = target.display();
+    let script = format!(
+        "#!/bin/sh\nif [ -z \"$RELAYBOOK_TRACE_LOG\" ]; then echo \"RELAYBOOK_TRACE_LOG is unset\" >&2; exit 99; fi\nprintf '%s\\n' \"git $*\" >> \"$RELAYBOOK_TRACE_LOG\"\nif [ -n \"$RELAYBOOK_PUSH_GATE\" ]; then\n  for arg in \"$@\"; do\n    if [ \"$arg\" = \"push\" ]; then\n      i=0\n      while [ ! -f \"$RELAYBOOK_PUSH_GATE\" ]; do\n        i=$((i + 1))\n        if [ \"$i\" -gt 400 ]; then echo \"push gate timed out\" >&2; exit 98; fi\n        sleep 0.05\n      done\n      decision=$(head -n 1 \"$RELAYBOOK_PUSH_GATE\")\n      if [ \"$decision\" = \"fail\" ]; then echo \"push refused\" >&2; exit 1; fi\n      break\n    fi\n  done\nfi\nexec '{target}' \"$@\"\n"
+    );
+    fs::write(path, script).expect("wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).expect("meta").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod");
+}
+
+#[cfg(unix)]
+fn write_ls_remote_fail_wrapper(path: &Path, target: &Path) {
+    let target = target.display();
+    let script = format!(
+        "#!/bin/sh\nif [ -z \"$RELAYBOOK_TRACE_LOG\" ]; then echo \"RELAYBOOK_TRACE_LOG is unset\" >&2; exit 99; fi\nprintf '%s\\n' \"git $*\" >> \"$RELAYBOOK_TRACE_LOG\"\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"ls-remote\" ]; then echo \"ls-remote failed\" >&2; exit 1; fi\ndone\nexec '{target}' \"$@\"\n"
+    );
+    fs::write(path, script).expect("wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).expect("meta").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod");
+}
+
+#[cfg(unix)]
+fn write_stamp(dir: &Path, id: i64) -> i64 {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    conn.query_row("SELECT write_stamp FROM runs WHERE id = ?1", [id], |row| {
+        row.get(0)
+    })
+    .expect("stamp")
+}
+
+#[cfg(unix)]
+fn command_text(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+#[cfg(unix)]
+fn task_run_id(dir: &Path, slug: &str) -> Option<i64> {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    conn.query_row("SELECT run_id FROM tasks WHERE slug = ?1", [slug], |row| {
+        row.get(0)
+    })
+    .expect("task")
+}
+
+/// Holds `git push` after the publish claim is committed. `decision` is `go` or `fail`.
+#[cfg(unix)]
+fn during_held_publish(
+    decision: &str,
+    during: impl FnOnce(&Path, i64),
+) -> (String, (String, String)) {
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let repo = gated_repo();
+    let _older = seed_stopped(repo.path(), "relaybook/prd", Some("gated"));
+    let (head, run_id) = reviewed_release(&repo);
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    let probes = install_probes();
+    write_push_result_wrapper(&probes.bin.join("git"), &program_on_path("git"));
+    let gate = probes.log.join("allow-push");
+    struct ReleasePush(PathBuf, String);
+    impl Drop for ReleasePush {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, &self.1);
+        }
+    }
+    let _release = ReleasePush(gate.clone(), format!("{decision}\n"));
+
+    let mut approve = relaybook(repo.path());
+    apply_probes(&mut approve, &probes);
+    approve.env("RELAYBOOK_PUSH_GATE", &gate);
+    approve.arg("approve");
+    approve.stdout(Stdio::piped());
+    approve.stderr(Stdio::piped());
+    let mut approve = approve.spawn().expect("spawn approve");
+    let trace_path = probes.log.join("invocations");
+    let started = Instant::now();
+    loop {
+        let text = fs::read_to_string(&trace_path).unwrap_or_default();
+        let held = text.lines().any(|line| line.starts_with("git push "));
+        if held
+            || started.elapsed() > Duration::from_secs(20)
+            || matches!(approve.try_wait(), Ok(Some(_)))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    let held = fs::read_to_string(&trace_path).unwrap_or_default();
+    assert!(
+        held.lines().any(|line| line.starts_with("git push ")),
+        "approve did not reach push:\n{held}"
+    );
+    during(repo.path(), run_id);
+    fs::write(&gate, format!("{decision}\n")).expect("release push");
+    let output = approve.wait_with_output().expect("wait approve");
+    let text = command_text(&output);
+    let row = run_status(repo.path(), run_id);
+    (text, row)
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_and_add_during_publish_are_refused_and_the_publisher_finishes() {
+    let (text, (status, stage)) = during_held_publish("go", |dir, run_id| {
+        let stamp = write_stamp(dir, run_id);
+        let complete = relaybook(dir)
+            .args(["run", "complete"])
+            .output()
+            .expect("complete");
+        let complete_text = command_text(&complete);
+        assert!(!complete.status.success(), "{complete_text}");
+        assert!(
+            complete_text.contains("a publish claim is in progress; complete does not change it"),
+            "{complete_text}"
+        );
+        assert_eq!(write_stamp(dir, run_id), stamp);
+        relaybook(dir)
+            .args(["task", "create", "greet", "--title", "Say hello"])
+            .assert()
+            .success();
+        let add = relaybook(dir)
+            .args(["run", "add", "greet"])
+            .output()
+            .expect("add");
+        let add_text = command_text(&add);
+        assert!(!add.status.success(), "{add_text}");
+        assert!(
+            add_text.contains("a publish claim is in progress"),
+            "{add_text}"
+        );
+        assert_eq!(task_run_id(dir, "greet"), None);
+        assert_eq!(write_stamp(dir, run_id), stamp);
+        let (status, stage) = run_status(dir, run_id);
+        assert_eq!(status, "active");
+        assert_eq!(stage, "publishing");
+    });
+    assert!(text.contains("opened https://example.test/pr/1"), "{text}");
+    assert_eq!(status, "complete", "{text}");
+    assert_eq!(stage, "done", "{text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_and_stop_during_a_failed_publish_let_the_failure_save_land() {
+    let (text, (status, stage)) = during_held_publish("fail", |dir, run_id| {
+        let stamp = write_stamp(dir, run_id);
+        let complete = relaybook(dir)
+            .args(["run", "complete"])
+            .output()
+            .expect("complete");
+        let complete_text = command_text(&complete);
+        assert!(!complete.status.success(), "{complete_text}");
+        assert!(
+            complete_text.contains("a publish claim is in progress; complete does not change it"),
+            "{complete_text}"
+        );
+        let stop = relaybook(dir).args(["run", "stop"]).output().expect("stop");
+        let stop_text = command_text(&stop);
+        assert!(!stop.status.success(), "{stop_text}");
+        assert!(
+            stop_text.contains("a publish claim is in progress; stop does not release it"),
+            "{stop_text}"
+        );
+        assert_eq!(write_stamp(dir, run_id), stamp);
+        let (status, stage) = run_status(dir, run_id);
+        assert_eq!(status, "active", "{stop_text}");
+        assert_eq!(stage, "publishing");
+    });
+    assert!(text.contains("push refused"), "{text}");
+    assert!(!text.contains("run changed concurrently"), "{text}");
+    assert_eq!(status, "stopped", "{text}");
+    assert_eq!(stage, "publish", "{text}");
+}
+
+#[cfg(unix)]
+fn publishing_claim(dir: &Path, run_id: i64) {
+    let mut ledger =
+        relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
+    let mut run = ledger.run_by_id(run_id).expect("run");
+    run.stage = "publishing".to_string();
+    run.status = "active".to_string();
+    ledger.save_run(&mut run).expect("publishing");
+}
+
+#[cfg(unix)]
+fn exited_pid() -> i64 {
+    let mut child = std::process::Command::new("true").spawn().expect("true");
+    let pid = i64::from(child.id());
+    child.wait().expect("exit");
+    pid
+}
+
+#[cfg(unix)]
+#[test]
+fn recover_publish_refuses_a_live_publisher_a_bad_phrase_and_no_tty() {
+    let repo = gated_repo();
+    let (head, run_id) = reviewed_release(&repo);
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    publishing_claim(repo.path(), run_id);
+    let id = run_id.to_string();
+    let missing = relaybook(repo.path())
+        .args(["run", "recover-publish", &id])
+        .output()
+        .expect("no tty");
+    let missing_text = command_text(&missing);
+    assert!(!missing.status.success(), "{missing_text}");
+    assert!(
+        missing_text.contains("recover-publish requires confirmation at a TTY"),
+        "{missing_text}"
+    );
+    assert_eq!(run_status(repo.path(), run_id).1, "publishing");
+
+    let wrong = answer_at_tty(repo.path(), &["run", "recover-publish", &id], false);
+    assert!(!wrong.success, "{}", wrong.output);
+    assert!(
+        wrong.output.contains("publish recovery was not confirmed"),
+        "{}",
+        wrong.output
+    );
+    assert_eq!(run_status(repo.path(), run_id).1, "publishing");
+
+    let alive = answer_at_tty(repo.path(), &["run", "recover-publish", &id], true);
+    assert!(!alive.success, "{}", alive.output);
+    assert!(
+        alive.output.contains("publisher is still running"),
+        "{}",
+        alive.output
+    );
+    assert_eq!(run_status(repo.path(), run_id).1, "publishing");
+}
+
+#[cfg(unix)]
+#[test]
+fn recover_publish_frees_a_dead_publisher_and_a_later_publish_rechecks() {
+    let repo = gated_repo();
+    let (head, run_id) = reviewed_release(&repo);
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    publishing_claim(repo.path(), run_id);
+    let dead = exited_pid();
+    let db = repo.path().join(".relaybook").join("ledger.db");
+    rusqlite::Connection::open(&db)
+        .expect("open")
+        .execute(
+            "UPDATE publish_claims SET pid = ?1 WHERE run_id = ?2",
+            [dead, run_id],
+        )
+        .expect("pid");
+    let id = run_id.to_string();
+    let recovered = answer_at_tty(repo.path(), &["run", "recover-publish", &id], true);
+    assert!(recovered.success, "{}", recovered.output);
+    assert!(
+        recovered.output.contains("push result unknown"),
+        "{}",
+        recovered.output
+    );
+    let (status, stage) = run_status(repo.path(), run_id);
+    assert_eq!(status, "stopped");
+    assert_eq!(stage, "publish");
+    let conn = rusqlite::Connection::open(&db).expect("open");
+    let check: (String, String, i64) = conn
+        .query_row(
+            "SELECT context, status, override FROM remote_checks WHERE context = 'recover-publish'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("check");
+    assert_eq!(check.1, "unknown");
+    assert_eq!(check.2, 0);
+    let payload: String = conn
+        .query_row(
+            "SELECT payload FROM events WHERE kind = 'run_linked' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("event");
+    assert!(payload.contains("recover-publish"), "{payload}");
+    assert!(payload.contains(&dead.to_string()), "{payload}");
+    assert!(payload.contains("\"push_result\":\"unknown\""), "{payload}");
+    drop(conn);
+
+    let mut ledger = relaybook_core::Ledger::open(&db).expect("ledger");
+    ledger
+        .set_setting_with("remote_check", "local", true)
+        .expect("local");
+    drop(ledger);
+
+    let probes = install_probes();
+    write_ls_remote_fail_wrapper(&probes.bin.join("git"), &program_on_path("git"));
+    let mut resume = relaybook(repo.path());
+    apply_probes(&mut resume, &probes);
+    resume.args(["run", "--resume"]);
+    let output = resume.output().expect("resume");
+    let text = command_text(&output);
+    assert!(!output.status.success(), "{text}");
+    let trace = fs::read_to_string(probes.log.join("invocations")).unwrap_or_default();
+    let ls = trace.lines().position(|line| line.contains(" ls-remote "));
+    let push = trace.lines().position(|line| {
+        line.split_whitespace().nth(1) == Some("push")
+            || line.split_whitespace().any(|arg| arg == "push")
+    });
+    assert!(ls.is_some(), "remote check did not run:\n{trace}\n{text}");
+    assert!(
+        push.is_none() || ls.is_some_and(|ls| push.is_some_and(|push| ls < push)),
+        "publish ran before the remote check:\n{trace}"
+    );
+    assert!(push.is_none(), "publish ran:\n{trace}");
+    let again = rusqlite::Connection::open(&db).expect("open");
+    let publish_check: String = again
+        .query_row(
+            "SELECT status FROM remote_checks WHERE context = 'publish' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("publish check");
+    assert_eq!(publish_check, "unknown");
+}
+
+#[cfg(unix)]
+#[test]
+fn later_publish_after_recovery_accepts_the_offline_override() {
+    let repo = gated_repo();
+    let (head, run_id) = reviewed_release(&repo);
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    publishing_claim(repo.path(), run_id);
+    let dead = exited_pid();
+    let db = repo.path().join(".relaybook").join("ledger.db");
+    rusqlite::Connection::open(&db)
+        .expect("open")
+        .execute(
+            "UPDATE publish_claims SET pid = ?1 WHERE run_id = ?2",
+            [dead, run_id],
+        )
+        .expect("pid");
+    let mut ledger = relaybook_core::Ledger::open(&db).expect("ledger");
+    ledger.recover_publishing(run_id).expect("recover");
+    ledger
+        .set_setting_with("remote_check", "local", true)
+        .expect("local");
+    drop(ledger);
+
+    let probes = install_probes();
+    write_ls_remote_fail_wrapper(&probes.bin.join("git"), &program_on_path("git"));
+    let mut path = std::ffi::OsString::from(&probes.bin);
+    path.push(":");
+    path.push(std::env::var_os("PATH").expect("PATH"));
+    let trace = probes.log.join("invocations");
+    let kind = std::ffi::OsString::from("happy");
+    let env = [
+        ("PATH", path.as_os_str()),
+        ("RELAYBOOK_FAKE_KIND", kind.as_os_str()),
+        ("RELAYBOOK_TRACE_LOG", trace.as_os_str()),
+        ("LOG", probes.log.as_os_str()),
+    ];
+    let resumed = answer_at_tty_with(repo.path(), &["run", "--resume"], true, &env);
+    assert!(
+        resumed.output.contains("offline"),
+        "override was not offered:\n{}",
+        resumed.output
+    );
+    assert!(
+        resumed.success,
+        "override did not let publish continue:\n{}",
+        resumed.output
+    );
+    assert!(
+        resumed.output.contains("opened https://example.test/pr/1"),
+        "{}",
+        resumed.output
+    );
+    let text = fs::read_to_string(&trace).unwrap_or_default();
+    let ls = text.lines().position(|line| line.contains(" ls-remote "));
+    let push = text
+        .lines()
+        .position(|line| line.split_whitespace().any(|arg| arg == "push"));
+    assert!(ls.is_some(), "remote check did not run:\n{text}");
+    assert!(
+        ls.is_some_and(|ls| push.is_some_and(|push| ls < push)),
+        "push did not follow the remote check:\n{text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn recover_publish_refuses_a_valid_foreign_lease_and_accepts_an_expired_one() {
+    let repo = gated_repo();
+    let (_head, run_id) = reviewed_release(&repo);
+    publishing_claim(repo.path(), run_id);
+    let db = repo.path().join(".relaybook").join("ledger.db");
+    rusqlite::Connection::open(&db)
+        .expect("open")
+        .execute(
+            "UPDATE publish_claims SET host = 'other-host' WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("host");
+    let id = run_id.to_string();
+    let fresh = answer_at_tty(repo.path(), &["run", "recover-publish", &id], true);
+    assert!(!fresh.success, "{}", fresh.output);
+    assert!(
+        fresh.output.contains("publish lease is still valid"),
+        "{}",
+        fresh.output
+    );
+    assert_eq!(run_status(repo.path(), run_id).1, "publishing");
+
+    rusqlite::Connection::open(&db)
+        .expect("open")
+        .execute(
+            "UPDATE publish_claims SET heartbeat_at = '2000-01-01T00:00:00.000Z' WHERE run_id = ?1",
+            [run_id],
+        )
+        .expect("expire");
+    let expired = answer_at_tty(repo.path(), &["run", "recover-publish", &id], true);
+    assert!(expired.success, "{}", expired.output);
+    assert!(
+        expired.output.contains("push result unknown"),
+        "{}",
+        expired.output
+    );
+    let (status, stage) = run_status(repo.path(), run_id);
+    assert_eq!(status, "stopped");
+    assert_eq!(stage, "publish");
+    let claims: i64 = rusqlite::Connection::open(&db)
+        .expect("open")
+        .query_row(
+            "SELECT COUNT(*) FROM publish_claims WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .expect("claims");
+    assert_eq!(claims, 0);
 }

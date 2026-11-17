@@ -176,6 +176,14 @@ CREATE TABLE IF NOT EXISTS remote_checks (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS publish_claims (
+    run_id INTEGER PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    host TEXT NOT NULL,
+    process_start TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT NOT NULL
+);
+
 CREATE UNIQUE INDEX IF NOT EXISTS runs_one_live_gated
 ON runs (workflow)
 WHERE workflow = 'gated'
@@ -195,6 +203,19 @@ WHERE workflow = 'gated'
     status IN ('active', 'waiting', 'paused')
     OR stage = 'publishing'
   );
+";
+
+/// Publisher pid, host, and heartbeat for a gated run at stage `publishing`.
+/// A read-write open installs this on an existing schema 8 ledger.
+/// `user_version` stays 8.
+pub(crate) const PUBLISH_CLAIMS: &str = "
+CREATE TABLE IF NOT EXISTS publish_claims (
+    run_id INTEGER PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    host TEXT NOT NULL,
+    process_start TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT NOT NULL
+);
 ";
 
 /// Triggers installed for schema 8. They only `RAISE`; they do not write.
@@ -299,6 +320,14 @@ CREATE TABLE IF NOT EXISTS remote_checks (
     detail TEXT,
     override INTEGER NOT NULL DEFAULT 0 CHECK (override IN (0, 1)),
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS publish_claims (
+    run_id INTEGER PRIMARY KEY,
+    pid INTEGER NOT NULL,
+    host TEXT NOT NULL,
+    process_start TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT NOT NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS runs_one_live_gated

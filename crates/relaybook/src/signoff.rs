@@ -29,9 +29,6 @@ pub(crate) struct Challenge {
 }
 
 pub(crate) fn confirm(challenge: &Challenge) -> Result<(), Error> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Err(Error::InvalidSetting(challenge.missing_tty.to_string()));
-    }
     if challenge.token.len() != 12 || !challenge.token.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(Error::InvalidSetting(
@@ -39,8 +36,48 @@ pub(crate) fn confirm(challenge: &Challenge) -> Result<(), Error> {
         ));
     }
     let phrase = format!("{} {}", challenge.verb, challenge.token);
+    read_typed_line(
+        challenge.ask,
+        &phrase,
+        challenge.missing_tty,
+        challenge.declined,
+    )
+}
+
+/// Typed confirmation whose expected line is not a 12-hex token.
+///
+/// Used when the operator must type a run id. Same TTY rule, timeout, and
+/// refusal of `y` as [`confirm`].
+pub(crate) struct ExactChallenge {
+    pub ask: &'static str,
+    pub expected: String,
+    pub missing_tty: &'static str,
+    pub declined: &'static str,
+}
+
+pub(crate) fn confirm_exact(challenge: &ExactChallenge) -> Result<(), Error> {
+    if challenge.expected.is_empty() {
+        return Err(Error::InvalidSetting(challenge.declined.to_string()));
+    }
+    read_typed_line(
+        challenge.ask,
+        &challenge.expected,
+        challenge.missing_tty,
+        challenge.declined,
+    )
+}
+
+fn read_typed_line(
+    ask: &str,
+    phrase: &str,
+    missing_tty: &str,
+    declined: &str,
+) -> Result<(), Error> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(Error::InvalidSetting(missing_tty.to_string()));
+    }
     let mut stdout = std::io::stdout();
-    writeln!(stdout, "{}", challenge.ask).map_err(|err| Error::InvalidSetting(err.to_string()))?;
+    writeln!(stdout, "{ask}").map_err(|err| Error::InvalidSetting(err.to_string()))?;
     writeln!(stdout, "Type {phrase}").map_err(|err| Error::InvalidSetting(err.to_string()))?;
     writeln!(stdout, "{DESCRIPTION}").map_err(|err| Error::InvalidSetting(err.to_string()))?;
     stdout
@@ -57,7 +94,7 @@ pub(crate) fn confirm(challenge: &Challenge) -> Result<(), Error> {
         ));
     }
     if answer.trim() != phrase {
-        return Err(Error::InvalidSetting(challenge.declined.to_string()));
+        return Err(Error::InvalidSetting(declined.to_string()));
     }
     Ok(())
 }

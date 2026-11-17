@@ -1344,3 +1344,342 @@ fn two_connections_cannot_insert_or_activate_a_second_live_gated_run() {
         .expect("version");
     assert_eq!(version, 8);
 }
+
+#[test]
+fn publishing_refuses_complete_assign_and_reclaim_and_the_publisher_save_lands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.set_setting("reviewer", "codex").expect("reviewer");
+    ledger.set_setting("workflow", "gated").expect("gated");
+    let mut publisher = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("run");
+    publisher.stage = "publishing".to_string();
+    ledger.save_run(&mut publisher).expect("claim");
+    let stamp = publisher.write_stamp;
+
+    let err = ledger.request_run_complete().expect_err("complete");
+    assert_eq!(
+        err.to_string(),
+        "a publish claim is in progress; complete does not change it"
+    );
+    ledger.create_task("extra", "Extra").expect("task");
+    let err = ledger.assign_run("extra", publisher.id).expect_err("add");
+    assert_eq!(err.to_string(), "a publish claim is in progress");
+    let err = ledger.claim_run(&mut publisher).expect_err("reclaim");
+    assert_eq!(err.to_string(), "a publish claim is in progress");
+    let stored = ledger.run_by_id(publisher.id).expect("stored");
+    assert_eq!(stored.write_stamp, stamp);
+    assert!(!stored.complete_requested);
+    assert_eq!(stored.stage, "publishing");
+    assert_eq!(stored.status, "active");
+
+    publisher.status = "complete".to_string();
+    publisher.stage = "done".to_string();
+    publisher.stop_reason = Some("https://example.test/pr/1".to_string());
+    ledger.save_run(&mut publisher).expect("publisher success");
+    let done = ledger.run_by_id(publisher.id).expect("done");
+    assert_eq!(done.status, "complete");
+    assert_eq!(done.stage, "done");
+    assert!(done.write_stamp > stamp);
+
+    let mut failed = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("second");
+    failed.stage = "publishing".to_string();
+    ledger.save_run(&mut failed).expect("claim");
+    let failed_stamp = failed.write_stamp;
+    let err = ledger
+        .request_run_complete()
+        .expect_err("complete during failure");
+    assert_eq!(
+        err.to_string(),
+        "a publish claim is in progress; complete does not change it"
+    );
+    assert_eq!(
+        ledger.run_by_id(failed.id).expect("held").write_stamp,
+        failed_stamp
+    );
+    failed.status = "stopped".to_string();
+    failed.stage = "publish".to_string();
+    failed.stop_reason = Some("git push failed: push refused".to_string());
+    ledger.save_run(&mut failed).expect("publisher failure");
+    let stopped = ledger.run_by_id(failed.id).expect("stopped");
+    assert_eq!(stopped.status, "stopped");
+    assert_eq!(stopped.stage, "publish");
+    assert_eq!(
+        stopped.stop_reason.as_deref(),
+        Some("git push failed: push refused")
+    );
+    assert!(stopped.write_stamp > failed_stamp);
+}
+
+#[test]
+fn accept_all_rechecks_gated_workflow_inside_the_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    seed_approved_report(&mut ledger, "owned");
+    let held = Arc::new(Barrier::new(2));
+    let writer = spawn_accept_holder(
+        path.clone(),
+        held.clone(),
+        "UPDATE settings SET value = 'gated' WHERE key = 'workflow'",
+    );
+    held.wait();
+    let err = ledger.accept_all_reports().expect_err("gated");
+    assert_eq!(
+        err.to_string(),
+        "report accept --all is unavailable when workflow=gated"
+    );
+    writer.join().expect("holder");
+    assert_eq!(report_verdict(&path, "owned"), None);
+}
+
+#[test]
+fn accept_all_rechecks_live_run_ownership_inside_the_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    seed_approved_report(&mut ledger, "owned");
+    let run = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("run");
+    let mut stopped = ledger.run_by_id(run.id).expect("load");
+    stopped.status = "stopped".to_string();
+    ledger.save_run(&mut stopped).expect("stop");
+    rusqlite::Connection::open(&path)
+        .expect("open")
+        .execute(
+            "UPDATE tasks SET run_id = ?1 WHERE slug = 'owned'",
+            [run.id],
+        )
+        .expect("link");
+    let held = Arc::new(Barrier::new(2));
+    let writer = spawn_accept_holder(
+        path.clone(),
+        held.clone(),
+        "UPDATE runs SET status = 'active', write_stamp = write_stamp + 1 WHERE workflow = 'gated'",
+    );
+    held.wait();
+    let err = ledger.accept_all_reports().expect_err("owned");
+    assert_eq!(err.to_string(), OWNED);
+    writer.join().expect("holder");
+    assert_eq!(report_verdict(&path, "owned"), None);
+    assert_eq!(ledger.settings().expect("settings").workflow, "classic");
+}
+
+#[test]
+fn recover_publishing_refuses_a_live_publisher_and_a_fresh_foreign_lease() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    let run = hold_publish(&mut ledger);
+    let err = ledger.recover_publishing(run.id).expect_err("alive");
+    assert_eq!(err.to_string(), "publisher is still running");
+    assert_eq!(stamp_of(&path, run.id), run.write_stamp);
+    assert_eq!(ledger.run_by_id(run.id).expect("row").stage, "publishing");
+
+    rusqlite::Connection::open(&path)
+        .expect("open")
+        .execute(
+            "UPDATE publish_claims SET host = 'other-host' WHERE run_id = ?1",
+            [run.id],
+        )
+        .expect("host");
+    let err = ledger.recover_publishing(run.id).expect_err("foreign");
+    assert_eq!(err.to_string(), "publish lease is still valid");
+    assert_eq!(stamp_of(&path, run.id), run.write_stamp);
+    assert_eq!(ledger.run_by_id(run.id).expect("row").stage, "publishing");
+
+    rusqlite::Connection::open(&path)
+        .expect("open")
+        .execute("DELETE FROM publish_claims WHERE run_id = ?1", [run.id])
+        .expect("clear");
+    let err = ledger.recover_publishing(run.id).expect_err("missing");
+    assert_eq!(err.to_string(), "publish claim has no lease");
+    assert_eq!(ledger.run_by_id(run.id).expect("row").stage, "publishing");
+}
+
+#[test]
+fn recover_publishing_frees_an_expired_lease_and_marks_the_push_unknown() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    let run = hold_publish(&mut ledger);
+    rusqlite::Connection::open(&path)
+        .expect("open")
+        .execute(
+            "UPDATE publish_claims SET heartbeat_at = '2000-01-01T00:00:00.000Z', host = 'other-host' WHERE run_id = ?1",
+            [run.id],
+        )
+        .expect("expire");
+    let recovery = ledger.recover_publishing(run.id).expect("recover");
+    assert_eq!(recovery.push_result, "unknown");
+    assert_eq!(recovery.outcome, "recovered");
+    assert_eq!(recovery.run_id, run.id);
+    let stored = ledger.run_by_id(run.id).expect("row");
+    assert_eq!(stored.status, "stopped");
+    assert_eq!(stored.stage, "publish");
+    assert_eq!(
+        stored.stop_reason.as_deref(),
+        Some("publish recovered; push result unknown")
+    );
+    let claims: i64 = rusqlite::Connection::open(&path)
+        .expect("open")
+        .query_row(
+            "SELECT COUNT(*) FROM publish_claims WHERE run_id = ?1",
+            [run.id],
+            |row| row.get(0),
+        )
+        .expect("claims");
+    assert_eq!(claims, 0);
+    let check: (String, String, i64) = rusqlite::Connection::open(&path)
+        .expect("open")
+        .query_row(
+            "SELECT context, status, override FROM remote_checks ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("check");
+    assert_eq!(
+        check,
+        ("recover-publish".to_string(), "unknown".to_string(), 0)
+    );
+    let payload: String = rusqlite::Connection::open(&path)
+        .expect("open")
+        .query_row(
+            "SELECT payload FROM events WHERE kind = 'run_linked' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("event");
+    assert!(payload.contains("recover-publish"), "{payload}");
+    assert!(payload.contains("\"push_result\":\"unknown\""), "{payload}");
+    assert!(payload.contains("other-host"), "{payload}");
+    let ctx = ledger.context(None, 50).expect("context");
+    replay(&ctx.events).expect("replay");
+    assert!(ledger.push_recheck_outstanding(&run.branch).expect("flag"));
+    ledger
+        .record_remote_check(&relaybook_core::RemoteCheckDraft {
+            context: "publish".to_string(),
+            branch: run.branch.clone(),
+            head_sha: "abc".to_string(),
+            remote: Some("origin".to_string()),
+            status: "present".to_string(),
+            detail: "published".to_string(),
+            overridden: false,
+        })
+        .expect("present");
+    assert!(
+        ledger.push_recheck_outstanding(&run.branch).expect("still"),
+        "a present check does not clear the forced recheck"
+    );
+    ledger
+        .start_run("next.md", "digest", "feature", Some("gated"))
+        .expect("slot freed");
+}
+
+#[cfg(unix)]
+#[test]
+fn recover_publishing_frees_a_dead_pid_before_the_lease_expires() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    let run = hold_publish(&mut ledger);
+    let dead = exited_pid();
+    rusqlite::Connection::open(&path)
+        .expect("open")
+        .execute(
+            "UPDATE publish_claims SET pid = ?1 WHERE run_id = ?2",
+            [dead, run.id],
+        )
+        .expect("pid");
+    let recovery = ledger.recover_publishing(run.id).expect("dead");
+    assert_eq!(recovery.pid, dead);
+    assert_eq!(recovery.push_result, "unknown");
+    assert_eq!(ledger.run_by_id(run.id).expect("row").status, "stopped");
+    assert!(ledger.push_recheck_outstanding("feature").expect("flag"));
+}
+
+fn hold_publish(ledger: &mut Ledger) -> relaybook_core::Run {
+    ledger.set_setting("reviewer", "codex").expect("reviewer");
+    ledger.set_setting("workflow", "gated").expect("gated");
+    let mut run = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("run");
+    run.stage = "publishing".to_string();
+    ledger.save_run(&mut run).expect("claim");
+    run
+}
+
+fn stamp_of(path: &std::path::Path, id: i64) -> i64 {
+    rusqlite::Connection::open(path)
+        .expect("open")
+        .query_row("SELECT write_stamp FROM runs WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .expect("stamp")
+}
+
+fn seed_approved_report(ledger: &mut Ledger, slug: &str) {
+    ledger.set_setting("reviewer", "codex").expect("reviewer");
+    ledger.set_setting("workflow", "classic").expect("classic");
+    ledger.create_task(slug, "Owned").expect("task");
+    ledger.claim_task(slug, "cursor").expect("claim");
+    ledger
+        .finish_task(slug, None, Some("abc123"))
+        .expect("done");
+    ledger
+        .start_review(
+            "task",
+            Some(slug),
+            None,
+            "feature",
+            "codex",
+            None,
+            "abc123",
+            None,
+            "fp",
+        )
+        .expect("start");
+    ledger
+        .record_review(
+            "task",
+            Some(slug),
+            "codex",
+            "abc123",
+            "abc123",
+            "fp",
+            "approved",
+            TASK_REVIEW,
+            false,
+        )
+        .expect("record");
+}
+
+fn spawn_accept_holder(
+    path: PathBuf,
+    barrier: Arc<Barrier>,
+    sql: &'static str,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&path).expect("open");
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .expect("timeout");
+        conn.execute_batch("BEGIN IMMEDIATE").expect("begin");
+        conn.execute(sql, []).expect("switch");
+        barrier.wait();
+        thread::sleep(std::time::Duration::from_millis(400));
+        conn.execute_batch("COMMIT").expect("commit");
+    })
+}
+
+#[cfg(unix)]
+fn exited_pid() -> i64 {
+    let mut child = std::process::Command::new("true").spawn().expect("true");
+    let pid = i64::from(child.id());
+    child.wait().expect("exit");
+    pid
+}

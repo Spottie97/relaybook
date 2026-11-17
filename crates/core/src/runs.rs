@@ -145,6 +145,23 @@ pub fn insert(
 }
 
 pub fn save(conn: &Connection, run: &mut Run) -> Result<(), Error> {
+    save_inner(conn, run, true)
+}
+
+/// Leaves stage `publishing` for an audited recovery. Other processes cannot
+/// use [`save`] for that row.
+pub(crate) fn save_for_recovery(conn: &Connection, run: &mut Run) -> Result<(), Error> {
+    save_inner(conn, run, false)
+}
+
+fn save_inner(conn: &Connection, run: &mut Run, enforce_publisher: bool) -> Result<(), Error> {
+    let stored = load(conn, run.id)?;
+    let held = stored.workflow.as_deref() == Some("gated") && stored.stage == "publishing";
+    if enforce_publisher && held && !crate::publish_claim::same_publisher(conn, run.id)? {
+        return Err(Error::InvalidSetting(
+            crate::publish_claim::IN_PROGRESS.to_string(),
+        ));
+    }
     if counts_as_live_gated(run) && another_live_gated(conn, Some(run.id))? {
         return Err(Error::InvalidSetting(ALREADY_LIVE.to_string()));
     }
@@ -176,6 +193,15 @@ pub fn save(conn: &Connection, run: &mut Run) -> Result<(), Error> {
         ));
     }
     run.write_stamp += 1;
+    let entered = run.workflow.as_deref() == Some("gated")
+        && run.stage == "publishing"
+        && stored.stage != "publishing";
+    if entered {
+        crate::publish_claim::record(conn, run.id)?;
+    }
+    if held && run.stage != "publishing" {
+        crate::publish_claim::clear(conn, run.id)?;
+    }
     Ok(())
 }
 
