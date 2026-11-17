@@ -27,7 +27,7 @@ relaybook status --json
 
 ## Tables
 
-Schema version is `PRAGMA user_version` 8. A new ledger is created at that version. Opening an older file migrates it forward. Opening a file whose `user_version` is newer than 8 fails, on a read-write open and on a read-only open, with `this ledger needs a newer relaybook`. A read-write migration takes the write lock and checks `user_version` again before it changes the file, including when the file has no `events` table. When that locked version is newer, the open fails and the stored `user_version` stays as it was.
+Schema version is `PRAGMA user_version` 8. A new ledger is created at that version. Opening an older file migrates it forward. Opening a file whose `user_version` is newer than 8 fails, on a read-write open and on a read-only open, with `this ledger needs a newer relaybook`. A read-write migration takes the write lock and checks `user_version` again before it changes the file, including when the file has no `events` table. `relaybook init` uses that migration. It does not apply the schema, set `user_version`, or change journal mode first, so a file another process has already created at a newer version is not rewritten to schema 8. When that locked version is newer, the open fails and the stored `user_version` stays as it was.
 
 | Table | Role |
 | --- | --- |

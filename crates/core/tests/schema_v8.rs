@@ -162,6 +162,10 @@ fn fresh_ledger_is_v8_with_guards() {
     assert!(auth.iter().any(|name| name == "method"));
     assert!(auth.iter().any(|name| name == "evidence"));
     let conn = Connection::open(&path).expect("open");
+    let journal: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .expect("journal");
+    assert_eq!(journal, "wal");
     let tables: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'remote_checks'",

@@ -16,7 +16,7 @@ fn empty_sections() -> Sections {
     }
 }
 use crate::error::Error;
-use crate::migrate::{apply_current_schema, ensure_guards, migrate, newer_ledger, user_version};
+use crate::migrate::{ensure_guards, migrate, newer_ledger, user_version};
 use crate::model::{
     Context, Decision, Event, EventKind, Status, Step, Task, TaskDetail, checked_slug,
     required_text,
@@ -25,6 +25,19 @@ use crate::schema::SCHEMA_VERSION;
 
 thread_local! {
     static REPORT_RESTORED_GUARD: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Publishes a ledger after `initialize` starts and before it opens `path`.
+    static BEFORE_INITIALIZE_OPEN: Cell<Option<fn(&std::path::Path)>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn before_initialize_open(path: &std::path::Path) {
+    if let Some(publish) = BEFORE_INITIALIZE_OPEN.with(Cell::get) {
+        publish(path);
+    }
 }
 
 /// Open SQLite ledger. Projection tables hold current state; `events` is insert-only.
@@ -130,15 +143,16 @@ impl Ledger {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let fresh = !path.exists();
+        // A path missing here can be a newer ledger before this process opens
+        // it. migrate re-reads user_version under the write lock before any
+        // schema or version write. journal_mode is a write too, so it waits
+        // until that check has accepted the file.
+        #[cfg(test)]
+        before_initialize_open(path);
         let mut conn = Connection::open(path)?;
         configure(&conn)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        if fresh {
-            apply_current_schema(&conn)?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
         migrate(&mut conn)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         let guards_restored = note_guards(&conn)?;
         Ok(Self {
             conn,
@@ -2686,6 +2700,79 @@ mod tests {
             })
             .expect("payload");
         assert_eq!(stored_again, payload);
+    }
+
+    struct ClearInitializeHook;
+
+    impl Drop for ClearInitializeHook {
+        fn drop(&mut self) {
+            super::BEFORE_INITIALIZE_OPEN.with(|hook| hook.set(None));
+        }
+    }
+
+    fn publish_schema_nine(path: &std::path::Path) {
+        assert!(
+            !path.exists(),
+            "initialize wrote the ledger before the newer schema was published"
+        );
+        let conn = rusqlite::Connection::open(path).expect("publish");
+        conn.execute_batch(
+            "CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                ts TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL
+             );
+             INSERT INTO events (id, ts, kind, payload)
+             VALUES (1, '2026-01-01T00:00:00.000Z', 'task_created', '{\"slug\":\"auth\"}');",
+        )
+        .expect("schema 9");
+        conn.pragma_update(None, "user_version", 9)
+            .expect("version");
+    }
+
+    #[test]
+    fn initialize_refuses_newer_version_published_before_its_schema_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ledger.db");
+        let _clear = ClearInitializeHook;
+        super::BEFORE_INITIALIZE_OPEN.with(|hook| hook.set(Some(publish_schema_nine)));
+        let err = match Ledger::initialize(&path) {
+            Ok(_) => panic!("initialize relabeled a newer ledger"),
+            Err(err) => err,
+        };
+        assert_eq!(err.to_string(), "this ledger needs a newer relaybook");
+        let conn = rusqlite::Connection::open(&path).expect("open");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, 9);
+        let payload: String = conn
+            .query_row("SELECT payload FROM events WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("event");
+        assert_eq!(payload, r#"{"slug":"auth"}"#);
+        let tasks: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tasks'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("tasks");
+        assert_eq!(tasks, 0);
+        let triggers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'relaybook_guard_run_update'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("triggers");
+        assert_eq!(triggers, 0);
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal");
+        assert_eq!(journal, "delete");
     }
 
     #[test]
