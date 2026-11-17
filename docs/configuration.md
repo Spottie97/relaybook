@@ -19,6 +19,8 @@ relaybook setup --ci
 - `relaybook setup --no-commands` skips `.claude/commands/relaybook.md` and `.cursor/commands/relaybook.md`.
 - `relaybook setup --ci` writes `.github/workflows/graphify-update.yml` and adds `graphify-out/graph.json merge=graphify` to `.gitattributes`. An existing workflow file is left untouched. The workflow opens a pull request instead of pushing to `main`. `graphify-out/` stays tracked.
 
+Setup leaves an existing `merge.graphify.driver` unchanged, including the command `graphify hook install` registered. When that key is unset, setup sets `merge.graphify.driver` to `graphify merge-driver %O %A %B` and `merge.graphify.name` to `graphify graph.json union merge`.
+
 `relaybook setup` writes a `# relaybook:start` / `# relaybook:end` block in `.gitignore` and, with `--ci`, in `.gitattributes`. The entries sit on their own lines. A pattern you already ignore is left where it is. The ignore block covers Graphify backups, `graphify-out/` (unless you passed `--ci`), `.relaybook/*.db-wal`, `.relaybook/*.db-shm`, and `.relaybook/runs/`. `.relaybook/ledger.db` stays committable.
 
 ## How the graph stays current
@@ -91,7 +93,7 @@ curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh
 
 `--yes` also runs `rtk init -g` without the y/N prompt. Without a terminal and without `--yes`, the installer prints `rtk init -g` instead of editing `~/.claude/settings.json`. `relaybook setup` never installs RTK and never edits that global file. The pull hooks run `graphify update .` in the background and print nothing. Graphify's editor hook does not rewrite `relaybook` commands.
 
-Setup was last checked by hand against Graphify 0.9.111. The automated tests use a stand-in `graphify`, not the real one. The hooks that setup guards call `graphify hook-guard`, which `graphify --help` does not list, so a Graphify release can change it without notice. `graphify claude install` rewrites the Graphify section of `CLAUDE.md`, and its wording changes between Graphify versions, so running `relaybook setup` again after upgrading Graphify can leave `CLAUDE.md` modified.
+Setup was last checked by hand against Graphify 0.9.111. The automated tests use a stand-in `graphify`, not the real one. The hooks that setup guards call `graphify hook-guard`, which `graphify --help` does not list, so a Graphify release can change it without notice. `graphify claude install` rewrites the Graphify section of `CLAUDE.md`, and its wording changes between Graphify versions. When that changes `CLAUDE.md`, `relaybook setup` warns `CLAUDE.md: warn (graphify claude install changed CLAUDE.md)` and leaves the file as Graphify wrote it. The warning does not fail setup.
 
 `scripts/measure-context.sh --check` fails when fixture context exceeds 4000 bytes, a write acknowledgement exceeds 120 bytes, or an instruction block exceeds 1000 bytes. Role prompts stay under 1200 bytes. Slash commands stay under 1500 bytes. `relaybook guide` stays under 4000 bytes per role.
 
@@ -111,7 +113,7 @@ relaybook uninstall --yes --graphify
 | `--dry-run` | Show what would change. Write nothing |
 | `--yes` | Apply without asking |
 | `--purge` | Also delete `.relaybook/` and `graphify-out/`. Asks `y/N` unless `--yes` is set |
-| `--graphify` | Also run `graphify claude uninstall`, `graphify cursor uninstall`, and `graphify hook uninstall`. Graphify's uninstall deletes `.cursor/rules/graphify.mdc`, removes `graphify-out/graph.json merge=graphify` from `.gitattributes`, and unsets `merge.graphify.*`. Relaybook ignores their exit codes. `--dry-run` lists the three commands but not these effects |
+| `--graphify` | Also run `graphify claude uninstall`, `graphify cursor uninstall`, and `graphify hook uninstall`. `graphify claude uninstall` removes the Graphify section of `CLAUDE.md` and Graphify hooks from `.claude/settings.json`. `graphify cursor uninstall` deletes `.cursor/rules/graphify.mdc`. `graphify hook uninstall` removes Graphify's git hooks, removes `graphify-out/graph.json merge=graphify` from `.gitattributes`, and unsets `merge.graphify.*`. Relaybook ignores their exit codes. `--dry-run` lists each command with those effects and writes nothing |
 
 What it removes, and only inside Relaybook's markers or the setup manifest:
 
@@ -124,7 +126,7 @@ What it removes, and only inside Relaybook's markers or the setup manifest:
 - The `command -v graphify` guards wrapped around Graphify hooks under every event, including `PreToolUse` and `SessionStart`. Graphify sometimes writes an absolute path such as `~/.local/bin/graphify`. Setup rewrites that to `graphify hook-guard ...`, and skips the command when `graphify` is not on PATH, so a committed settings file does not leak a home directory or fail for teammates. Graphify's own hooks stay. Uninstall puts the command back to `graphify hook-guard ...`.
 - The post-merge and post-rewrite blocks between the relaybook hook markers.
 - The `# relaybook:start` / `# relaybook:end` block in `.gitignore` and `.gitattributes`, including an older `pattern # relaybook` line and a lone `# relaybook` line directly above a pattern Relaybook owns. Other lines stay.
-- `.github/workflows/graphify-update.yml` when it still matches the template, the graphify merge attribute, and `merge.graphify.name` / `merge.graphify.driver`.
+- `.github/workflows/graphify-update.yml` when it still matches the template, the graphify merge attribute, and `merge.graphify.name` / `merge.graphify.driver`. A `merge.graphify.driver` that setup left unchanged stays. `relaybook uninstall --graphify` still lists Graphify's own unset of `merge.graphify.*`.
 
 What it keeps unless you pass `--purge`:
 

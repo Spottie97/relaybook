@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use assert_cmd::prelude::*;
+use predicates::prelude::PredicateBooleanExt;
 
 fn relaybook(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("relaybook").expect("relaybook binary");
@@ -205,6 +206,59 @@ fn dry_run_and_purge_and_an_active_run() {
 fn connection_clear(db: &Path) {
     let connection = rusqlite::Connection::open(db).expect("open");
     connection.execute("DELETE FROM runs", []).expect("delete");
+}
+
+#[test]
+fn dry_run_lists_graphify_uninstall_effects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_init(dir.path());
+    relaybook(dir.path())
+        .args(["setup", "--no-graphify"])
+        .assert()
+        .success();
+    let claude = fs::read(dir.path().join("CLAUDE.md")).expect("claude");
+    let bin = dir.path().join("bin");
+    copy_fake(&bin, "graphify");
+    let log = dir.path().join("graphify.log");
+    relaybook(dir.path())
+        .args(["uninstall", "--dry-run", "--graphify"])
+        .env("PATH", prepend_path(&bin))
+        .env("GRAPHIFY_LOG", &log)
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "would remove graphify claude uninstall (removes the Graphify section of CLAUDE.md and Graphify hooks from .claude/settings.json)",
+        ))
+        .stdout(predicates::str::contains(
+            "would remove graphify cursor uninstall (deletes .cursor/rules/graphify.mdc)",
+        ))
+        .stdout(predicates::str::contains(
+            "would remove graphify hook uninstall (removes Graphify git hooks, removes graphify-out/graph.json merge=graphify from .gitattributes, and unsets merge.graphify.*)",
+        ));
+    assert_eq!(
+        fs::read(dir.path().join("CLAUDE.md")).expect("claude"),
+        claude
+    );
+    assert!(!log.exists(), "dry-run must not run graphify");
+
+    relaybook(dir.path())
+        .args(["uninstall", "--dry-run", "--graphify"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(
+            "skipped graphify claude uninstall (graphify is not on PATH)",
+        ))
+        .stdout(predicates::str::contains(
+            "skipped graphify cursor uninstall (graphify is not on PATH)",
+        ))
+        .stdout(predicates::str::contains(
+            "skipped graphify hook uninstall (graphify is not on PATH)",
+        ))
+        .stdout(predicates::str::contains("graphify.mdc").not());
+    assert_eq!(
+        fs::read(dir.path().join("CLAUDE.md")).expect("claude"),
+        claude
+    );
 }
 
 #[test]

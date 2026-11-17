@@ -347,10 +347,28 @@ fn record_graphify(root: &Path, options: &Options, steps: &mut Vec<Step>) {
             push(steps, name, "skipped", INSTALL_HINT);
             continue;
         }
+        let watch_claude = *name == "graphify claude install";
+        let before = if watch_claude {
+            read_claude(root)
+        } else {
+            None
+        };
         let result = graphify::run(root, args);
         let status = if result.ok { "done" } else { "failed" };
         push(steps, name, status, result.detail);
+        if watch_claude && read_claude(root) != before {
+            push(
+                steps,
+                "CLAUDE.md",
+                "warn",
+                "graphify claude install changed CLAUDE.md",
+            );
+        }
     }
+}
+
+fn read_claude(root: &Path) -> Option<Vec<u8>> {
+    std::fs::read(root.join("CLAUDE.md")).ok()
 }
 
 fn record_rtk(steps: &mut Vec<Step>) {

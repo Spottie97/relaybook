@@ -1,6 +1,8 @@
 #!/bin/sh
-# Manual smoke test. Not part of CI: it needs a signed-in claude and Cursor CLI.
-# One run: a fresh repo, then the three plain prompts from agent-onboarding-eval.
+# Manual smoke test. Not part of CI.
+# Needs a signed-in claude, the Cursor CLI, and a real graphify on PATH.
+# One run: real-graphify checks in a throwaway repo, then the three plain
+# prompts from agent-onboarding-eval. The unit tests use a stand-in graphify.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -22,14 +24,110 @@ if [ -z "$cursor" ]; then
   echo "cursor-agent and agent are not on PATH" >&2
   exit 1
 fi
+if ! command -v graphify >/dev/null 2>&1; then
+  echo "graphify is not on PATH" >&2
+  exit 1
+fi
 
 work=$(mktemp -d)
+graph=$(mktemp -d)
+graph_home=$(mktemp -d)
 cleanup() {
-  rm -rf "$work"
+  rm -rf "$work" "$graph" "$graph_home"
 }
 trap cleanup EXIT
 
-cd "$work"
+relaybook_dir=$(dirname "$relaybook")
+PATH="$relaybook_dir:$PATH"
+export PATH
+
+# Real graphify. HOME is isolated so this does not rewrite the user's Claude or Cursor config.
+git -C "$graph" init -q -b main
+git -C "$graph" config user.name "Relaybook"
+git -C "$graph" config user.email "relaybook@example.com"
+git -C "$graph" config commit.gpgsign false
+mkdir -p "$graph/src"
+printf 'fn main() {}\n' > "$graph/src/main.rs"
+git -C "$graph" add src/main.rs
+git -C "$graph" commit -q -m "tiny app"
+
+run_graphify() {
+  (
+    cd "$graph" || exit 1
+    HOME="$graph_home" \
+      XDG_CONFIG_HOME="$graph_home/config" \
+      XDG_DATA_HOME="$graph_home/data" \
+      "$@"
+  )
+}
+
+if ! run_graphify graphify hook install >"$graph/hook-install.out" 2>&1; then
+  echo "graphify hook install failed" >&2
+  cat "$graph/hook-install.out" >&2
+  exit 1
+fi
+before=$(git -C "$graph" config --local --get merge.graphify.driver || true)
+if [ -z "$before" ]; then
+  echo "graphify hook install did not set merge.graphify.driver" >&2
+  cat "$graph/hook-install.out" >&2
+  exit 1
+fi
+if ! run_graphify "$relaybook" setup --ci >"$graph/setup.out" 2>&1; then
+  echo "relaybook setup --ci failed" >&2
+  cat "$graph/setup.out" >&2
+  exit 1
+fi
+after=$(git -C "$graph" config --local --get merge.graphify.driver || true)
+if [ "$before" != "$after" ]; then
+  echo "setup replaced merge.graphify.driver" >&2
+  printf 'before: %s\n' "$before" >&2
+  printf 'after: %s\n' "$after" >&2
+  exit 1
+fi
+if ! grep -q 'CLAUDE.md: warn (graphify claude install changed CLAUDE.md)' "$graph/setup.out"; then
+  echo "setup did not warn that graphify changed CLAUDE.md" >&2
+  cat "$graph/setup.out" >&2
+  exit 1
+fi
+rules="$graph/.cursor/rules/graphify.mdc"
+had_rules=0
+if [ -f "$rules" ]; then
+  had_rules=1
+fi
+if ! run_graphify "$relaybook" uninstall --dry-run --graphify >"$graph/dry.out" 2>&1; then
+  echo "relaybook uninstall --dry-run --graphify failed" >&2
+  cat "$graph/dry.out" >&2
+  exit 1
+fi
+dry_has() {
+  if ! grep -F -q "$1" "$graph/dry.out"; then
+    echo "dry-run missing: $1" >&2
+    cat "$graph/dry.out" >&2
+    exit 1
+  fi
+}
+dry_has "would remove graphify claude uninstall"
+dry_has "would remove graphify cursor uninstall"
+dry_has "would remove graphify hook uninstall"
+dry_has "deletes .cursor/rules/graphify.mdc"
+dry_has "graphify-out/graph.json merge=graphify"
+dry_has "merge.graphify.*"
+if [ ! -f "$graph/CLAUDE.md" ]; then
+  echo "dry-run removed CLAUDE.md" >&2
+  exit 1
+fi
+if [ "$had_rules" -eq 1 ] && [ ! -f "$rules" ]; then
+  echo "dry-run removed .cursor/rules/graphify.mdc" >&2
+  exit 1
+fi
+still=$(git -C "$graph" config --local --get merge.graphify.driver || true)
+if [ "$still" != "$before" ]; then
+  echo "dry-run changed merge.graphify.driver" >&2
+  exit 1
+fi
+echo "graphify: driver kept, CLAUDE.md warned, dry-run listed side effects"
+
+cd "$work" || exit 1
 git init -q -b main
 git config user.name "Relaybook"
 git config user.email "relaybook@example.com"
@@ -48,7 +146,6 @@ code_paths() {
   git ls-files --others --exclude-standard -- src Cargo.toml Cargo.lock
 }
 
-export PATH="$(dirname "$relaybook"):$PATH"
 "$relaybook" setup --no-graphify >/dev/null
 
 allow="Bash(relaybook context:*),Bash(relaybook inbox:*),Bash(relaybook guide:*),Bash(relaybook status:*),Bash(relaybook task create:*),Bash(relaybook task list:*),Bash(relaybook task reopen:*),Bash(relaybook task depend:*),Bash(relaybook step add:*),Bash(relaybook step edit:*),Bash(relaybook decision log:*),Bash(relaybook report accept:*),Bash(relaybook report note:*)"

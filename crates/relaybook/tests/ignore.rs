@@ -156,6 +156,74 @@ fn uninstall_removes_each_attribute_form() {
 }
 
 #[test]
+fn setup_keeps_an_existing_merge_driver() {
+    let custom_driver = "\"/usr/bin/python3\" -m graphify merge-driver %O %A %B";
+    let custom_name = "graphify union";
+
+    let repaired = tempfile::tempdir().expect("tempdir");
+    git_init(repaired.path());
+    git_ok(
+        repaired.path(),
+        &["config", "merge.graphify.driver", custom_driver],
+    );
+    git_ok(
+        repaired.path(),
+        &["config", "merge.graphify.name", custom_name],
+    );
+    fs::write(
+        repaired.path().join(".gitattributes"),
+        "graphify-out/graph.json merge=graphify # relaybook\n",
+    )
+    .expect("write");
+    setup(repaired.path(), &["setup", "--no-graphify"]);
+    assert_eq!(
+        config_get(repaired.path(), "merge.graphify.driver"),
+        custom_driver
+    );
+    assert_eq!(
+        config_get(repaired.path(), "merge.graphify.name"),
+        custom_name
+    );
+    let attributes =
+        fs::read_to_string(repaired.path().join(".gitattributes")).expect("attributes");
+    assert!(
+        attributes.contains("graphify-out/graph.json merge=graphify\n"),
+        "{attributes}"
+    );
+
+    let ci = tempfile::tempdir().expect("tempdir");
+    git_init(ci.path());
+    git_ok(
+        ci.path(),
+        &["config", "merge.graphify.driver", custom_driver],
+    );
+    git_ok(ci.path(), &["config", "merge.graphify.name", custom_name]);
+    setup(ci.path(), &["setup", "--ci", "--no-graphify"]);
+    assert_eq!(
+        config_get(ci.path(), "merge.graphify.driver"),
+        custom_driver
+    );
+    assert_eq!(config_get(ci.path(), "merge.graphify.name"), custom_name);
+    let attributes = fs::read_to_string(ci.path().join(".gitattributes")).expect("attributes");
+    assert!(
+        attributes.contains("graphify-out/graph.json merge=graphify\n"),
+        "{attributes}"
+    );
+
+    let fresh = tempfile::tempdir().expect("tempdir");
+    git_init(fresh.path());
+    setup(fresh.path(), &["setup", "--ci", "--no-graphify"]);
+    assert_eq!(
+        config_get(fresh.path(), "merge.graphify.driver"),
+        "graphify merge-driver %O %A %B"
+    );
+    assert_eq!(
+        config_get(fresh.path(), "merge.graphify.name"),
+        "graphify graph.json union merge"
+    );
+}
+
+#[test]
 fn setup_repairs_old_attribute_lines_without_ci() {
     for original in [
         "keep text=auto\ngraphify-out/graph.json merge=graphify # relaybook\n",
@@ -234,4 +302,28 @@ fn git(dir: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("git")
+}
+
+fn git_ok(dir: &Path, args: &[&str]) {
+    let output = git(dir, args);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn config_get(dir: &Path, key: &str) -> String {
+    let output = git(dir, &["config", "--local", "--get", key]);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
 }

@@ -78,6 +78,11 @@ fn has_driver(text: &str) -> bool {
 }
 
 pub(crate) fn register_driver(root: &Path) {
+    // `graphify hook install` may already have registered its own driver.
+    // Keep that local value. Set Relaybook's driver only when the key is unset.
+    if has_local_merge_driver(root) {
+        return;
+    }
     let _ = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -96,4 +101,17 @@ pub(crate) fn register_driver(root: &Path) {
             "graphify merge-driver %O %A %B",
         ])
         .status();
+}
+
+fn has_local_merge_driver(root: &Path) -> bool {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--local", "--get", "merge.graphify.driver"])
+        .output()
+    else {
+        return false;
+    };
+    output.status.success()
+        && std::str::from_utf8(&output.stdout).is_ok_and(|text| !text.trim().is_empty())
 }
