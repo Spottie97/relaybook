@@ -1,8 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use relaybook_core::{Ledger, Run};
@@ -169,7 +166,7 @@ fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Resul
     let digest = file_sha256(&full)?;
     let branch = format!("relaybook/{}", stem(prd));
     if settings.workflow == "gated" {
-        screen_before_publish(&mut ledger, cwd, &branch, "begin_run", true)?;
+        refuse_existing_run_branch(&mut ledger, cwd, &branch, &settings.remote_check)?;
     }
     sync_main(cwd)?;
     git(cwd, &["checkout", "-B", &branch, "main"])?;
@@ -365,10 +362,9 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<i64, String> {
             let output = halt(cwd, &mut ledger, &mut run, &err);
             return Err(output.text.trim_end().to_string());
         }
-        if let Err(err) =
-            screen_before_publish(&mut ledger, cwd, &run.branch, "gate_release", false)
-        {
-            let output = halt(cwd, &mut ledger, &mut run, &err);
+        let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        if let Err(err) = crate::gate::require_unpublished(&mut ledger, &root, "gate_release") {
+            let output = halt(cwd, &mut ledger, &mut run, &err.to_string());
             return Err(output.text.trim_end().to_string());
         }
     } else {
@@ -1254,123 +1250,6 @@ fn authorized_at(ledger: &Ledger, run: &Run, sha: &str) -> Result<bool, String> 
     }
 }
 
-fn screen_before_publish(
-    ledger: &mut Ledger,
-    cwd: &Path,
-    branch: &str,
-    context: &str,
-    named: bool,
-) -> Result<(), String> {
-    let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    if ledger
-        .push_recheck_outstanding(branch)
-        .map_err(|err| err.to_string())?
-    {
-        return confirm_outstanding(ledger, &root, branch, context, named);
-    }
-    if named {
-        let mode = ledger
-            .settings()
-            .map_err(|err| err.to_string())?
-            .remote_check;
-        return refuse_existing_run_branch(ledger, cwd, branch, &mode);
-    }
-    crate::gate::require_unpublished(ledger, &root, context).map_err(|err| err.to_string())
-}
-
-/// Online R7 check after `recover-publish`. Present always refuses. Unknown
-/// uses the existing offline typed override. Absent proceeds.
-fn confirm_outstanding(
-    ledger: &mut Ledger,
-    root: &Path,
-    branch: &str,
-    context: &str,
-    named: bool,
-) -> Result<(), String> {
-    let view = if named {
-        crate::remote::screen_named_branch(root, branch, "online").map_err(|err| err.to_string())?
-    } else {
-        crate::remote::screen(root, "online").map_err(|err| err.to_string())?
-    };
-    let check_id = ledger
-        .record_remote_check(&relaybook_core::RemoteCheckDraft {
-            context: context.to_string(),
-            branch: view.branch.clone(),
-            head_sha: view.head_sha.clone(),
-            remote: view.remote.clone(),
-            status: view.status.to_string(),
-            detail: view.detail.clone(),
-            overridden: false,
-        })
-        .map_err(|err| err.to_string())?;
-    match view.status {
-        "present" => Err(view.message.unwrap_or_else(|| "published".to_string())),
-        "unknown" => {
-            let token =
-                crate::signoff::token_from_sha(&view.head_sha).map_err(|err| err.to_string())?;
-            crate::signoff::confirm(&crate::signoff::Challenge {
-                ask: "Proceed without remote verification?",
-                verb: "offline",
-                token,
-                missing_tty: "proceeding without remote verification requires confirmation at a TTY",
-                declined: "proceeding without remote verification was not confirmed",
-            })
-            .map_err(|err| err.to_string())?;
-            ledger
-                .set_remote_check_override(check_id)
-                .map_err(|err| err.to_string())?;
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-struct LeaseHeartbeat {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-}
-
-impl LeaseHeartbeat {
-    fn start(path: PathBuf, run_id: i64) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
-        let handle = std::thread::spawn(move || {
-            while !flag.load(Ordering::Relaxed) {
-                let _ = relaybook_core::touch_publish_lease(&path, run_id);
-                for _ in 0..20 {
-                    if flag.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        });
-        Self {
-            stop,
-            handle: Some(handle),
-        }
-    }
-
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-impl Drop for LeaseHeartbeat {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn stop_heartbeat(beat: &mut Option<LeaseHeartbeat>) {
-    if let Some(beat) = beat {
-        beat.stop();
-    }
-}
-
 fn refuse_existing_run_branch(
     ledger: &mut Ledger,
     cwd: &Path,
@@ -1432,8 +1311,9 @@ fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
     if let Err(err) = crate::gate::ensure_gated_clean(cwd) {
         return halt(cwd, ledger, run, &err.to_string());
     }
-    if let Err(err) = screen_before_publish(ledger, cwd, &run.branch, "publish", false) {
-        return halt(cwd, ledger, run, &err);
+    let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    if let Err(err) = crate::gate::require_unpublished(ledger, &root, "publish") {
+        return halt(cwd, ledger, run, &err.to_string());
     }
     let origin = git(cwd, &["remote"])
         .unwrap_or_default()
@@ -1451,21 +1331,14 @@ fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
     if let Err(err) = ledger.claim_run(run) {
         return fail(&err.to_string());
     }
-    let mut beat = match ledger.database_path() {
-        Ok(path) => Some(LeaseHeartbeat::start(path, run.id)),
-        Err(_) => None,
-    };
     let spec = format!("{head}:refs/heads/{}", run.branch);
-    let pushed = git(cwd, &["push", "--no-follow-tags", "-u", "origin", &spec]);
-    if let Err(err) = pushed {
-        stop_heartbeat(&mut beat);
+    if let Err(err) = git(cwd, &["push", "--no-follow-tags", "-u", "origin", &spec]) {
         return halt(cwd, ledger, run, &err);
     }
     let body = report_body(ledger, run.id);
     let title = format!("Relaybook run {}", run.branch);
     match gh_pr(cwd, &run.branch, &title, &body) {
         Ok(url) => {
-            stop_heartbeat(&mut beat);
             run.status = "complete".to_string();
             run.stage = "done".to_string();
             run.stop_reason = Some(url.clone());
@@ -1474,10 +1347,7 @@ fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
             }
             ok(&format!("opened {url}"))
         }
-        Err(err) => {
-            stop_heartbeat(&mut beat);
-            halt(cwd, ledger, run, &err)
-        }
+        Err(err) => halt(cwd, ledger, run, &err),
     }
 }
 

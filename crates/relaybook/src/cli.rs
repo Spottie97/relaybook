@@ -395,11 +395,6 @@ enum RunAction {
     Add { slug: Vec<String> },
     /// Print the live log and follow it until the run pauses or ends.
     Watch,
-    /// Free a publish claim whose publisher is gone. The push result stays unknown.
-    RecoverPublish {
-        /// Id of the run stuck at stage publishing.
-        run_id: i64,
-    },
 }
 
 #[derive(Subcommand)]
@@ -694,9 +689,6 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
                 (None, None) => None,
             };
             let (stop, complete, watch, add) = match action {
-                Some(RunAction::RecoverPublish { run_id }) => {
-                    return recover_publish(&cwd, run_id);
-                }
                 Some(RunAction::Stop) => (true, false, false, Vec::new()),
                 Some(RunAction::Complete) => (false, true, false, Vec::new()),
                 Some(RunAction::Watch) => (false, false, true, Vec::new()),
@@ -1171,43 +1163,6 @@ fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
         move || gate::recheck_release_authorize(&root, &sha_owned),
     )?;
     json_outcome(authorization, render::line(&format!("authorized {sha}")))
-}
-
-fn recover_publish(cwd: &Path, run_id: i64) -> Result<Outcome, Fail> {
-    if run_id <= 0 {
-        return Err(Fail::Usage("run id must be positive".to_string()));
-    }
-    let mut ledger = open_ledger(cwd)?;
-    let run = ledger
-        .run_by_id(run_id)
-        .map_err(|_| invalid_setting("run is not publishing"))?;
-    if run.workflow.as_deref() != Some("gated") || run.stage != "publishing" {
-        return Err(invalid_setting("run is not publishing"));
-    }
-    signoff::confirm_exact(&signoff::ExactChallenge {
-        ask: "Recover publish for this run? The push result stays unknown.",
-        expected: run_id.to_string(),
-        missing_tty: "recover-publish requires confirmation at a TTY",
-        declined: "publish recovery was not confirmed",
-    })?;
-    let recovery = ledger.recover_publishing(run_id)?;
-    let run = ledger.run_by_id(run_id)?;
-    json_outcome(
-        serde_json::json!({
-            "run_id": recovery.run_id,
-            "status": run.status,
-            "stage": run.stage,
-            "push_result": recovery.push_result,
-            "pid": recovery.pid,
-            "host": recovery.host,
-            "process_start": recovery.process_start,
-            "heartbeat_at": recovery.heartbeat_at,
-            "outcome": recovery.outcome,
-        }),
-        render::line(&format!(
-            "recovered publish for run {run_id}; push result unknown"
-        )),
-    )
 }
 
 fn confirm_without_remote(sha: &str) -> Result<(), Fail> {

@@ -166,19 +166,6 @@ pub struct RemoteCheck {
     pub created_at: String,
 }
 
-/// Audit result of `relaybook run recover-publish`. The push result is
-/// `unknown`: recovery does not claim the push failed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublishRecovery {
-    pub run_id: i64,
-    pub pid: i64,
-    pub host: String,
-    pub process_start: String,
-    pub heartbeat_at: String,
-    pub outcome: String,
-    pub push_result: String,
-}
-
 impl Ledger {
     pub fn initialize(path: &std::path::Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
@@ -229,21 +216,6 @@ impl Ledger {
     /// This open recreated at least one missing guard trigger.
     pub fn guards_restored(&self) -> bool {
         self.guards_restored
-    }
-
-    /// Path of the open database file, for a heartbeat connection.
-    pub fn database_path(&self) -> Result<std::path::PathBuf, Error> {
-        let file: String = self.conn.query_row(
-            "SELECT file FROM pragma_database_list WHERE name = 'main'",
-            [],
-            |row| row.get(0),
-        )?;
-        if file.is_empty() {
-            return Err(Error::InvalidSetting(
-                "ledger path is unavailable".to_string(),
-            ));
-        }
-        Ok(std::path::PathBuf::from(file))
     }
 
     /// A gated open in this process recreated missing guard triggers.
@@ -745,28 +717,6 @@ impl Ledger {
         Ok(row)
     }
 
-    /// A `recover-publish` unknown check for `branch` is still the reason the
-    /// next publish must query remotes online.
-    pub fn push_recheck_outstanding(&self, branch: &str) -> Result<bool, Error> {
-        let recovery: Option<i64> = self.conn.query_row(
-            "SELECT MAX(id) FROM remote_checks
-             WHERE branch = ?1 AND context = 'recover-publish'
-               AND status = 'unknown' AND override = 0",
-            params![branch],
-            |row| row.get(0),
-        )?;
-        let Some(recovery) = recovery else {
-            return Ok(false);
-        };
-        let cleared: Option<i64> = self.conn.query_row(
-            "SELECT MAX(id) FROM remote_checks
-             WHERE branch = ?1 AND id > ?2 AND (status = 'absent' OR override = 1)",
-            params![branch, recovery],
-            |row| row.get(0),
-        )?;
-        Ok(cleared.is_none())
-    }
-
     /// Marks one check as the authorization that proceeded without a remote query.
     ///
     /// The id is the row recorded for that confirmation. Updating the newest
@@ -802,9 +752,9 @@ impl Ledger {
     pub fn assign_run(&mut self, slug: &str, run_id: i64) -> Result<bool, Error> {
         let slug = checked_slug(slug)?;
         self.transaction(|conn| {
-            if crate::publish_claim::stage_is_publishing(conn)? {
+            if crate::runs::stage_is_publishing(conn)? {
                 return Err(Error::InvalidSetting(
-                    crate::publish_claim::IN_PROGRESS.to_string(),
+                    crate::runs::PUBLISH_IN_PROGRESS.to_string(),
                 ));
             }
             link_run(conn, &slug, run_id)
@@ -922,7 +872,7 @@ impl Ledger {
                 }
                 if owner.stage == "publishing" {
                     return Err(Error::InvalidSetting(
-                        crate::publish_claim::IN_PROGRESS.to_string(),
+                        crate::runs::PUBLISH_IN_PROGRESS.to_string(),
                     ));
                 }
             }
@@ -950,9 +900,9 @@ impl Ledger {
 
     pub fn request_run_complete(&mut self) -> Result<(), Error> {
         self.transaction(|conn| {
-            if crate::publish_claim::stage_is_publishing(conn)? {
+            if crate::runs::stage_is_publishing(conn)? {
                 return Err(Error::InvalidSetting(
-                    crate::publish_claim::COMPLETE_HELD.to_string(),
+                    crate::runs::PUBLISH_COMPLETE_HELD.to_string(),
                 ));
             }
             let Some(mut run) = crate::runs::active(conn)? else {
@@ -961,15 +911,6 @@ impl Ledger {
             run.complete_requested = true;
             crate::runs::save(conn, &mut run)
         })
-    }
-
-    /// Free a gated run stuck at stage `publishing`.
-    ///
-    /// Succeeds only when the publisher is gone on this host, or the lease
-    /// has expired. The run stops, the live slot opens, and the push result
-    /// is `unknown`. The row is unchanged when recovery is refused.
-    pub fn recover_publishing(&mut self, run_id: i64) -> Result<PublishRecovery, Error> {
-        self.transaction(|conn| recover_publishing_in(conn, run_id))
     }
 
     pub fn accept_report(&mut self, slug: &str) -> Result<usize, Error> {
@@ -1891,88 +1832,6 @@ fn pending_owned_by_live_gated(conn: &Connection) -> Result<bool, Error> {
         )
         .optional()?;
     Ok(found.is_some())
-}
-
-fn recover_publishing_in(conn: &Connection, run_id: i64) -> Result<PublishRecovery, Error> {
-    let mut run = crate::runs::load(conn, run_id).map_err(|err| match err {
-        Error::Sqlite(rusqlite::Error::QueryReturnedNoRows) => {
-            Error::InvalidSetting("run is not publishing".to_string())
-        }
-        other => other,
-    })?;
-    if run.workflow.as_deref() != Some("gated") || run.stage != "publishing" {
-        return Err(Error::InvalidSetting("run is not publishing".to_string()));
-    }
-    let evidence = crate::publish_claim::assess(conn, run_id)?;
-    if !evidence.recoverable {
-        return Err(Error::InvalidSetting(evidence.reason));
-    }
-    let head = authorization_sha(conn, &run.branch)?.unwrap_or_else(|| "unknown".to_string());
-    run.status = "stopped".to_string();
-    run.stage = "publish".to_string();
-    run.stop_reason = Some("publish recovered; push result unknown".to_string());
-    crate::runs::save_for_recovery(conn, &mut run)?;
-    let detail = format!(
-        "by operator\npid {}\nhost {}\nprocess_start {}\nheartbeat_at {}\nlease_secs {}\nsame_host {}\npid_state {}\nlease_expired {}\noutcome recovered\npush_result unknown",
-        evidence.pid,
-        evidence.host,
-        evidence.process_start,
-        evidence.heartbeat_at,
-        crate::publish_claim::PUBLISH_LEASE_SECS,
-        evidence.same_host,
-        evidence.pid_state,
-        evidence.lease_expired,
-    );
-    let ts = now(conn)?;
-    conn.execute(
-        "INSERT INTO remote_checks
-            (context, branch, head_sha, remote, status, detail, override, created_at)
-         VALUES ('recover-publish', ?1, ?2, NULL, 'unknown', ?3, 0, ?4)",
-        params![run.branch, head, detail, ts],
-    )?;
-    insert_event(
-        conn,
-        EventKind::RunLinked,
-        serde_json::json!({
-            "action": "recover-publish",
-            "by": "operator",
-            "run_id": run_id,
-            "pid": evidence.pid,
-            "host": evidence.host,
-            "process_start": evidence.process_start,
-            "heartbeat_at": evidence.heartbeat_at,
-            "lease_secs": crate::publish_claim::PUBLISH_LEASE_SECS,
-            "same_host": evidence.same_host,
-            "pid_state": evidence.pid_state,
-            "lease_expired": evidence.lease_expired,
-            "outcome": "recovered",
-            "push_result": "unknown",
-            "why": "publish claim recovered; push result unknown",
-        }),
-    )?;
-    Ok(PublishRecovery {
-        run_id,
-        pid: evidence.pid,
-        host: evidence.host,
-        process_start: evidence.process_start,
-        heartbeat_at: evidence.heartbeat_at,
-        outcome: "recovered".to_string(),
-        push_result: "unknown".to_string(),
-    })
-}
-
-fn authorization_sha(conn: &Connection, branch: &str) -> Result<Option<String>, Error> {
-    let sha = conn
-        .query_row(
-            "SELECT commit_sha FROM release_authorizations
-             WHERE branch = ?1
-             ORDER BY id DESC
-             LIMIT 1",
-            params![branch],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(sha)
 }
 
 fn refuse_live_gated_task(conn: &Connection, slug: &str) -> Result<(), Error> {

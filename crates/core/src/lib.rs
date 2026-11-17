@@ -7,7 +7,6 @@ pub mod legacy;
 pub mod lifecycle;
 mod migrate;
 mod model;
-mod publish_claim;
 mod replay;
 mod reports;
 mod runs;
@@ -16,14 +15,13 @@ mod settings;
 
 pub use error::Error;
 pub use ledger::{
-    Absorb, AnchoredClaim, ClaimAnchor, GraphBuild, Ledger, PublishRecovery, ReleaseAuthorization,
-    RemoteCheck, RemoteCheckDraft, Review, ScopedTask, TaskReport,
+    Absorb, AnchoredClaim, ClaimAnchor, GraphBuild, Ledger, ReleaseAuthorization, RemoteCheck,
+    RemoteCheckDraft, Review, ScopedTask, TaskReport,
 };
 pub use legacy::{LegacyMove, migrate_legacy_ledger};
 pub use model::{
     Context, Decision, Event, EventKind, RECENT_EVENT_LIMIT, Status, Step, Task, TaskDetail,
 };
-pub use publish_claim::{PUBLISH_LEASE_SECS, touch_publish_lease};
 pub use replay::{ReplayedDecision, ReplayedTask, replay};
 pub use reports::{InboxItem, Sections};
 pub use runs::{

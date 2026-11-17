@@ -44,29 +44,6 @@ pub(crate) fn confirm(challenge: &Challenge) -> Result<(), Error> {
     )
 }
 
-/// Typed confirmation whose expected line is not a 12-hex token.
-///
-/// Used when the operator must type a run id. Same TTY rule, timeout, and
-/// refusal of `y` as [`confirm`].
-pub(crate) struct ExactChallenge {
-    pub ask: &'static str,
-    pub expected: String,
-    pub missing_tty: &'static str,
-    pub declined: &'static str,
-}
-
-pub(crate) fn confirm_exact(challenge: &ExactChallenge) -> Result<(), Error> {
-    if challenge.expected.is_empty() {
-        return Err(Error::InvalidSetting(challenge.declined.to_string()));
-    }
-    read_typed_line(
-        challenge.ask,
-        &challenge.expected,
-        challenge.missing_tty,
-        challenge.declined,
-    )
-}
-
 fn read_typed_line(
     ask: &str,
     phrase: &str,

@@ -25,6 +25,11 @@ pub struct Run {
     /// Advances on every successful save. A save whose stamp does not match
     /// the row is stale and does not write.
     pub write_stamp: i64,
+    /// Set when this value saved a gated run into stage `publishing`.
+    /// It holds that row's `write_stamp`. Not stored: [`load`] leaves it
+    /// empty, so a reloaded run cannot overwrite a publishing row. The
+    /// compare-and-swap still rejects a stale copy of the value that holds it.
+    publish_hold: Option<i64>,
 }
 
 pub fn latest(conn: &Connection) -> Result<Option<Run>, Error> {
@@ -144,23 +149,20 @@ pub fn insert(
     load(conn, conn.last_insert_rowid())
 }
 
+pub(crate) const PUBLISH_IN_PROGRESS: &str = "a publish claim is in progress";
+pub(crate) const PUBLISH_COMPLETE_HELD: &str =
+    "a publish claim is in progress; complete does not change it";
+
+/// True when a gated run is at stage `publishing` after its push has started.
+pub(crate) fn stage_is_publishing(conn: &Connection) -> Result<bool, Error> {
+    Ok(publishing(conn)?.is_some_and(|run| run.stage == "publishing"))
+}
+
 pub fn save(conn: &Connection, run: &mut Run) -> Result<(), Error> {
-    save_inner(conn, run, true)
-}
-
-/// Leaves stage `publishing` for an audited recovery. Other processes cannot
-/// use [`save`] for that row.
-pub(crate) fn save_for_recovery(conn: &Connection, run: &mut Run) -> Result<(), Error> {
-    save_inner(conn, run, false)
-}
-
-fn save_inner(conn: &Connection, run: &mut Run, enforce_publisher: bool) -> Result<(), Error> {
     let stored = load(conn, run.id)?;
     let held = stored.workflow.as_deref() == Some("gated") && stored.stage == "publishing";
-    if enforce_publisher && held && !crate::publish_claim::same_publisher(conn, run.id)? {
-        return Err(Error::InvalidSetting(
-            crate::publish_claim::IN_PROGRESS.to_string(),
-        ));
+    if held && run.publish_hold != Some(stored.write_stamp) {
+        return Err(Error::InvalidSetting(PUBLISH_IN_PROGRESS.to_string()));
     }
     if counts_as_live_gated(run) && another_live_gated(conn, Some(run.id))? {
         return Err(Error::InvalidSetting(ALREADY_LIVE.to_string()));
@@ -193,14 +195,10 @@ fn save_inner(conn: &Connection, run: &mut Run, enforce_publisher: bool) -> Resu
         ));
     }
     run.write_stamp += 1;
-    let entered = run.workflow.as_deref() == Some("gated")
-        && run.stage == "publishing"
-        && stored.stage != "publishing";
-    if entered {
-        crate::publish_claim::record(conn, run.id)?;
-    }
-    if held && run.stage != "publishing" {
-        crate::publish_claim::clear(conn, run.id)?;
+    if stored.workflow.as_deref() == Some("gated") && run.stage == "publishing" {
+        run.publish_hold = Some(run.write_stamp);
+    } else {
+        run.publish_hold = None;
     }
     Ok(())
 }
@@ -285,6 +283,7 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         complete_requested: complete != 0,
         workflow: row.get(14)?,
         write_stamp: row.get(15)?,
+        publish_hold: None,
     })
 }
 
