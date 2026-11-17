@@ -123,6 +123,148 @@ struct Check<'a> {
     urls: &'a [(String, String)],
 }
 
+/// Whether `refs/heads/<branch>` is already on a remote, or a local
+/// `refs/remotes/*/<branch>` still names it.
+///
+/// This is the run-branch half of the publish check. It does not treat commits
+/// that are already on `main` as a publish of the new branch.
+pub(crate) fn screen_named_branch(
+    root: &Path,
+    branch: &str,
+    remote_check: &str,
+) -> Result<RemoteView, Error> {
+    let head = gitinfo::verified_head(root).unwrap_or_else(|| "none".to_string());
+    let local = local_refs(root)?;
+    let listed = remote_names(root);
+    let remotes = listed.as_ref().cloned().unwrap_or_default();
+    let urls: Vec<(String, String)> = remotes
+        .iter()
+        .filter_map(|name| fetch_url(root, name).map(|url| (name.clone(), url)))
+        .collect();
+    let push_differs = remotes.iter().any(|name| push_url_differs(root, name));
+    let local_only = remote_check == "local";
+    let check = NamedCheck {
+        branch,
+        head: &head,
+        push_differs,
+        urls: &urls,
+    };
+    if local_only {
+        if let Some((remote, message)) = named_branch_local(&local, branch, None) {
+            return Ok(check.view(Some(remote), "present", Some(message), &[]));
+        }
+        return Ok(check.view(None, "local", None, &[]));
+    }
+    if let Err(message) = &listed {
+        if let Some((remote, hit)) = named_branch_local(&local, branch, None) {
+            return Ok(check.view(Some(remote), "present", Some(hit), &[]));
+        }
+        return Ok(check.view(
+            None,
+            "unknown",
+            Some(format!("remote check failed: {message}")),
+            &[],
+        ));
+    }
+    let online: Vec<OnlineQuery> = remotes
+        .iter()
+        .map(|name| query_remote(root, name))
+        .collect();
+    if let Some((remote, message)) = named_branch_local(&local, branch, Some(&online)) {
+        return Ok(check.view(Some(remote), "present", Some(message), &online));
+    }
+    if let Some((remote, message)) = named_branch_online(&online, branch) {
+        return Ok(check.view(Some(remote), "present", Some(message), &online));
+    }
+    if let Some((remote, message)) = online_unknown(&online) {
+        return Ok(check.view(Some(remote), "unknown", Some(message), &online));
+    }
+    Ok(check.view(None, "absent", None, &online))
+}
+
+/// Sorted `sha refname` lines for every `refs/remotes` entry.
+pub(crate) fn tracking_ref_lines(root: &Path) -> Result<Vec<String>, String> {
+    let text = git_stdout(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "--end-of-options",
+            "refs/remotes",
+        ],
+    )?;
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    Ok(lines)
+}
+
+struct NamedCheck<'a> {
+    branch: &'a str,
+    head: &'a str,
+    push_differs: bool,
+    urls: &'a [(String, String)],
+}
+
+impl NamedCheck<'_> {
+    fn view(
+        &self,
+        remote: Option<String>,
+        status: &'static str,
+        message: Option<String>,
+        online: &[OnlineQuery],
+    ) -> RemoteView {
+        let message = message.map(|text| redact_userinfo(&text));
+        RemoteView {
+            branch: self.branch.to_string(),
+            head_sha: self.head.to_string(),
+            remote,
+            status,
+            detail: detail(self.push_differs, self.urls, message.as_deref(), online),
+            message,
+        }
+    }
+}
+
+fn named_branch_local(
+    local: &[LocalRef],
+    branch: &str,
+    online: Option<&[OnlineQuery]>,
+) -> Option<(String, String)> {
+    let hits: Vec<&LocalRef> = local.iter().filter(|hit| hit.branch == branch).collect();
+    if let Some(hit) = hits
+        .iter()
+        .find(|hit| online.is_some_and(|rows| remote_branch_missing(rows, &hit.remote, branch)))
+    {
+        return Some((
+            hit.remote.clone(),
+            "published earlier; deleting the remote branch does not unpublish it".to_string(),
+        ));
+    }
+    hits.first()
+        .map(|hit| (hit.remote.clone(), format!("{} exists", hit.refname)))
+}
+
+fn named_branch_online(online: &[OnlineQuery], branch: &str) -> Option<(String, String)> {
+    let branch_ref = format!("refs/heads/{branch}");
+    for row in online {
+        let OnlineResult::Refs(refs) = &row.result else {
+            continue;
+        };
+        if refs.iter().any(|item| item.name == branch_ref) {
+            return Some((
+                row.name.clone(),
+                format!("{branch_ref} exists on {}", row.name),
+            ));
+        }
+    }
+    None
+}
+
 /// Local half of the check. Safe to call while the ledger write lock is held.
 pub(crate) fn refuse_local(root: &Path) -> Result<(), Error> {
     let branch = require_branch(root)?;

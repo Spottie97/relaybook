@@ -1129,6 +1129,7 @@ fn range_text(range: &gitinfo::ReleaseRange) -> String {
 fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
     let sha = sha.trim();
     let mut ledger = open_ledger(cwd)?;
+    gate::allow_release_authorize(&ledger)?;
     let first = gate::prepare_authorize(&ledger, cwd, sha)?;
     if let gate::PublishScreen::Present(message) =
         gate::screen_publish(&mut ledger, &first.root, "authorize")?
@@ -1149,12 +1150,13 @@ fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
     let sha_owned = sha.to_string();
     let commits = checkout.range.commits.clone();
     let (method, evidence) = signoff_record(&ledger, &checkout.root, sha)?;
+    let run_id = gate::gate_release_run_id(&ledger, &checkout.branch)?.or_else(gate::env_run_id);
     let authorization = ledger.authorize_release_with(
         &checkout.branch,
         sha,
         &checkout.range.head,
         "maintainer",
-        gate::env_run_id(),
+        run_id,
         Some(&commits),
         Some(method),
         evidence.as_deref(),
@@ -1363,6 +1365,7 @@ fn accept_report(
     let Some(slug) = slug else {
         return Err(Fail::Usage("pass a slug, --note, or --all".to_string()));
     };
+    gate::refuse_live_task(&ledger, slug)?;
     if gated {
         require_gated_clean_tree(cwd, &ledger)?;
         let head = gitinfo::verified_head(cwd)
@@ -1594,6 +1597,9 @@ fn signoff_change_confirmed(
 
 fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
+    if key == "workflow" {
+        gate::refuse_live_workflow(&ledger)?;
+    }
     let leave_confirmed = workflow_leave_confirmed(&ledger, cwd, key, value)?;
     let remote_confirmed = remote_local_confirmed(&ledger, cwd, key, value)?;
     let signoff_confirmed = signoff_change_confirmed(&ledger, cwd, key, value)?;

@@ -19,19 +19,14 @@ pub struct Run {
     pub failure_streak: i64,
     pub current_slug: Option<String>,
     pub complete_requested: bool,
+    /// Frozen when the run starts. `None` is a row from before that column was
+    /// stored; the runner treats it as classic.
+    pub workflow: Option<String>,
 }
 
 pub fn latest(conn: &Connection) -> Result<Option<Run>, Error> {
     let row = conn
-        .query_row(
-            "SELECT id, prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd,
-                    status, stop_reason, started_at, failure_streak, current_slug, complete_requested
-             FROM runs
-             ORDER BY id DESC
-             LIMIT 1",
-            [],
-            read_run,
-        )
+        .query_row(&select_run("ORDER BY id DESC LIMIT 1"), [], read_run)
         .optional()?;
     Ok(row)
 }
@@ -39,12 +34,7 @@ pub fn latest(conn: &Connection) -> Result<Option<Run>, Error> {
 pub fn active(conn: &Connection) -> Result<Option<Run>, Error> {
     let row = conn
         .query_row(
-            "SELECT id, prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd,
-                    status, stop_reason, started_at, failure_streak, current_slug, complete_requested
-             FROM runs
-             WHERE status IN ('active', 'waiting', 'paused')
-             ORDER BY id DESC
-             LIMIT 1",
+            &select_run("WHERE status IN ('active', 'waiting', 'paused') ORDER BY id DESC LIMIT 1"),
             [],
             read_run,
         )
@@ -55,12 +45,9 @@ pub fn active(conn: &Connection) -> Result<Option<Run>, Error> {
 pub fn resumable(conn: &Connection) -> Result<Option<Run>, Error> {
     let row = conn
         .query_row(
-            "SELECT id, prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd,
-                    status, stop_reason, started_at, failure_streak, current_slug, complete_requested
-             FROM runs
-             WHERE status IN ('waiting', 'paused', 'stopped')
-             ORDER BY id DESC
-             LIMIT 1",
+            &select_run(
+                "WHERE status IN ('waiting', 'paused', 'stopped') ORDER BY id DESC LIMIT 1",
+            ),
             [],
             read_run,
         )
@@ -157,14 +144,17 @@ pub fn latest_report(
 }
 
 pub fn load(conn: &Connection, id: i64) -> Result<Run, Error> {
-    conn.query_row(
+    conn.query_row(&select_run("WHERE id = ?1"), params![id], read_run)
+        .map_err(Error::from)
+}
+
+fn select_run(tail: &str) -> String {
+    format!(
         "SELECT id, prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd,
-                status, stop_reason, started_at, failure_streak, current_slug, complete_requested
-         FROM runs WHERE id = ?1",
-        params![id],
-        read_run,
+                status, stop_reason, started_at, failure_streak, current_slug, complete_requested,
+                workflow
+         FROM runs {tail}"
     )
-    .map_err(Error::from)
 }
 
 fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
@@ -184,6 +174,7 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         failure_streak: row.get(11)?,
         current_slug: row.get(12)?,
         complete_requested: complete != 0,
+        workflow: row.get(14)?,
     })
 }
 

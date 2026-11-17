@@ -50,6 +50,7 @@ fn gated_repo() -> Repo {
         &["config", "user.email", "relaybook@example.com"],
     );
     git(dir.path(), &["config", "user.name", "Relaybook"]);
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
     fs::write(dir.path().join("README.md"), "seed\n").expect("write");
     git(dir.path(), &["add", "README.md"]);
     git(dir.path(), &["commit", "-m", "seed"]);
@@ -251,6 +252,134 @@ fn head_sha(dir: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+#[derive(Debug)]
+struct RunRow {
+    workflow: Option<String>,
+    stage: String,
+    status: String,
+    stop_reason: Option<String>,
+}
+
+fn run_row(dir: &Path) -> RunRow {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    conn.query_row(
+        "SELECT workflow, stage, status, stop_reason FROM runs ORDER BY id DESC LIMIT 1",
+        [],
+        |row| {
+            Ok(RunRow {
+                workflow: row.get(0)?,
+                stage: row.get(1)?,
+                status: row.get(2)?,
+                stop_reason: row.get(3)?,
+            })
+        },
+    )
+    .expect("run row")
+}
+
+fn seed_run(dir: &Path, branch: &str, stage: &str, status: &str) -> i64 {
+    let mut ledger =
+        relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
+    let mut run = ledger
+        .start_run("prd.md", "abc", branch, Some("gated"))
+        .expect("start run");
+    run.stage = stage.to_string();
+    run.status = status.to_string();
+    ledger.save_run(&run).expect("save run");
+    run.id
+}
+
+fn assign_run(dir: &Path, slug: &str, run_id: i64) {
+    let mut ledger =
+        relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
+    assert!(
+        ledger.assign_run(slug, run_id).expect("assign"),
+        "{slug} was already linked"
+    );
+}
+
+fn set_run_stage(dir: &Path, stage: &str) {
+    let mut ledger =
+        relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
+    let mut run = ledger.active_run().expect("active").expect("run");
+    run.stage = stage.to_string();
+    ledger.save_run(&run).expect("save");
+}
+
+fn authorization_run_id(dir: &Path) -> Option<i64> {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    conn.query_row(
+        "SELECT run_id FROM release_authorizations ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .expect("authorization")
+}
+
+fn reviewed_release(repo: &Repo) -> (String, i64) {
+    let dir = repo.path();
+    git(dir, &["checkout", "-b", "relaybook/prd"]);
+    fs::write(dir.join("ship.txt"), "ship\n").expect("ship");
+    git(dir, &["add", "ship.txt"]);
+    git(dir, &["commit", "-m", "ship"]);
+    let head = head_sha(dir);
+    relaybook(dir)
+        .args(["review", "start", "--release"])
+        .assert()
+        .success();
+    relaybook(dir)
+        .args([
+            "review",
+            "record",
+            "--release",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            RELEASE_REVIEW,
+        ])
+        .assert()
+        .success();
+    let run_id = seed_run(dir, "relaybook/prd", "gate_release", "waiting");
+    (head, run_id)
+}
+
+fn bare_rev(bare: &Path, rev: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().expect("utf8"),
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            rev,
+        ])
+        .output()
+        .expect("rev-parse");
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn bare_relaybook_refs(bare: &Path) -> String {
+    let output = Command::new("git")
+        .args([
+            "--git-dir",
+            bare.to_str().expect("utf8"),
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/relaybook",
+        ])
+        .output()
+        .expect("for-each-ref");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 fn head_branch(dir: &Path) -> String {
     let output = Command::new("git")
         .current_dir(dir)
@@ -276,55 +405,73 @@ fn setting(dir: &Path, key: &str) -> Value {
     envelope["data"][key].clone()
 }
 
-fn assert_refused(dir: &Path, bare: &Path, args: &[&str]) {
-    let before = head_sha(dir);
-    assert_eq!(head_branch(dir), "main");
+fn assert_review_halt_never_pushes(dir: &Path, bare: &Path) {
     let probes = install_probes();
-    let output = run_probed(dir, &probes, args);
+    let output = run_probed(dir, &probes, &["run", "--prd", "prd.md", "--gates", "none"]);
     let text = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{args:?}\n{text}{err}");
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
     assert!(
-        text.contains(GATED_RUN_REFUSAL),
-        "{args:?}\nstdout={text}\nstderr={err}"
+        text.contains("codex routing not built"),
+        "stdout={text}\nstderr={err}"
     );
-    assert_agents_not_called(&probes.log);
-    assert_eq!(head_branch(dir), "main");
-    assert_eq!(head_sha(dir), before);
-    assert!(ref_missing(dir, "refs/heads/relaybook/prd"));
+    assert!(
+        !text.contains(GATED_RUN_REFUSAL),
+        "the skeleton must run, not refuse up front:\n{text}"
+    );
+    assert!(!probes.log.join("gh.args").exists(), "gh was invoked");
     assert!(ref_missing(bare, "refs/heads/relaybook/prd"));
-    assert_eq!(setting(dir, "max_cycles"), json!(9));
-    assert_eq!(setting(dir, "gates"), json!("plan,review"));
-    assert_eq!(setting(dir, "workflow"), json!("gated"));
+    assert!(
+        bare_relaybook_refs(bare).is_empty(),
+        "a run branch was pushed"
+    );
+    let row = run_row(dir);
+    assert_eq!(row.workflow.as_deref(), Some("gated"));
+    assert_eq!(row.stage, "review");
+    assert_eq!(row.status, "stopped");
+    assert!(
+        row.stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("codex routing not built")),
+        "{row:?}"
+    );
 }
 
 #[test]
 fn gated_run_refuses_before_preflight_git_or_agents() {
+    // R9 replaces the pre-preflight refusal. The no-push property stays.
     let repo = gated_repo();
-    assert_refused(
-        repo.path(),
-        &repo.bare,
-        &[
-            "run",
-            "--prd",
-            "prd.md",
-            "--max-cycles",
-            "3",
-            "--gates",
-            "none",
-        ],
-    );
+    assert_review_halt_never_pushes(repo.path(), &repo.bare);
+}
+
+#[test]
+fn gated_halt_never_pushes() {
+    let repo = gated_repo();
+    assert_review_halt_never_pushes(repo.path(), &repo.bare);
 }
 
 #[test]
 fn gated_approve_and_resume_refuse() {
     let repo = gated_repo();
-    assert_refused(repo.path(), &repo.bare, &["approve"]);
-    assert_refused(
-        repo.path(),
-        &repo.bare,
-        &["run", "--resume", "--max-cycles", "3", "--gates", "none"],
-    );
+    for args in [&["approve"][..], &["run", "--resume"][..]] {
+        let before = head_sha(repo.path());
+        let probes = install_probes();
+        let output = run_probed(repo.path(), &probes, args);
+        let text = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}\n{text}{err}");
+        assert!(
+            text.contains("no run to resume"),
+            "{args:?}\nstdout={text}\nstderr={err}"
+        );
+        assert!(!text.contains(GATED_RUN_REFUSAL), "{text}");
+        assert!(!probes.log.join("gh.args").exists(), "{args:?} invoked gh");
+        assert_eq!(head_branch(repo.path()), "main");
+        assert_eq!(head_sha(repo.path()), before);
+        assert!(ref_missing(repo.path(), "refs/heads/relaybook/prd"));
+        assert!(ref_missing(&repo.bare, "refs/heads/relaybook/prd"));
+        assert_eq!(setting(repo.path(), "workflow"), json!("gated"));
+    }
 }
 
 #[test]
@@ -479,6 +626,190 @@ fn entering_gated_needs_no_terminal() {
         .stdout("mode manual\n");
     assert_eq!(setting(dir.path(), "workflow"), json!("gated"));
     assert_eq!(setting(dir.path(), "mode"), json!("manual"));
+}
+
+const OWNED: &str = "a gated run owns this; use relaybook approve / run --resume";
+const RELEASE_REVIEW: &str = r#"{"findings":"none","security":"ok","tests_checked":"cargo test","not_checked":"none","prd_covered":true,"gaps":"none"}"#;
+
+#[test]
+fn gated_run_freezes_workflow() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let output = run_probed(repo.path(), &probes, &["run", "--prd", "prd.md"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    assert!(
+        text.contains("waiting for approval: relaybook approve"),
+        "{text}"
+    );
+    assert!(!probes.log.join("gh.args").exists());
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+    assert_eq!(run_row(repo.path()).workflow.as_deref(), Some("gated"));
+
+    relaybook(repo.path())
+        .args(["config", "set", "workflow", "classic"])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicates::str::contains(OWNED));
+    assert_eq!(setting(repo.path(), "workflow"), json!("gated"));
+
+    let stopped = run_probed(repo.path(), &probes, &["run", "stop"]);
+    let stopped_text = String::from_utf8_lossy(&stopped.stdout);
+    assert_eq!(stopped.status.code(), Some(1), "{stopped_text}");
+    assert!(
+        stopped_text.contains("stopped by request"),
+        "{stopped_text}"
+    );
+    assert_eq!(run_row(repo.path()).status, "stopped");
+
+    let left = answer_at_tty(repo.path(), &["config", "set", "workflow", "classic"], true);
+    assert!(left.success, "{}", left.output);
+    assert_eq!(setting(repo.path(), "workflow"), json!("classic"));
+    assert_eq!(run_row(repo.path()).workflow.as_deref(), Some("gated"));
+
+    let resume = install_probes();
+    let output = run_probed(repo.path(), &resume, &["run", "--resume"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(
+        text.contains("workflow changed during run"),
+        "stdout={text}\nstderr={err}"
+    );
+    assert!(!resume.log.join("gh.args").exists());
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+}
+
+#[test]
+fn approve_at_gate_release_requires_authorization_at_head() {
+    let repo = gated_repo();
+    let (head, run_id) = reviewed_release(&repo);
+    let probes = install_probes();
+    let output = run_probed(repo.path(), &probes, &["approve"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(
+        text.contains(&format!(
+            "waiting for sign-off: relaybook release authorize --sha {head}"
+        )),
+        "stdout={text}\nstderr={err}"
+    );
+    assert!(!probes.log.join("gh.args").exists());
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+    assert_eq!(run_row(repo.path()).status, "waiting");
+
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    assert_eq!(authorization_run_id(repo.path()), Some(run_id));
+
+    let probes = install_probes();
+    let output = run_probed(repo.path(), &probes, &["approve"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    assert!(text.contains("opened https://example.test/pr/1"), "{text}");
+    let gh = fs::read_to_string(probes.log.join("gh.args")).expect("gh.args");
+    assert_eq!(
+        gh.lines().filter(|line| line.contains("pr create")).count(),
+        1,
+        "{gh}"
+    );
+    assert_eq!(
+        bare_rev(&repo.bare, "refs/heads/relaybook/prd").as_deref(),
+        Some(head.as_str())
+    );
+}
+
+#[test]
+fn publish_refuses_when_head_moved_after_authorization() {
+    let repo = gated_repo();
+    let (head, _) = reviewed_release(&repo);
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    set_run_stage(repo.path(), "publish");
+    fs::write(repo.path().join("later.txt"), "later\n").expect("later");
+    git(repo.path(), &["add", "later.txt"]);
+    git(repo.path(), &["commit", "-m", "move HEAD"]);
+    let moved = head_sha(repo.path());
+    assert_ne!(moved, head);
+
+    let probes = install_probes();
+    let output = run_probed(repo.path(), &probes, &["approve"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(
+        text.contains("HEAD moved after authorization"),
+        "stdout={text}\nstderr={err}"
+    );
+    assert!(!probes.log.join("gh.args").exists());
+    assert!(bare_rev(&repo.bare, "refs/heads/relaybook/prd").is_none());
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+}
+
+#[test]
+fn manual_review_and_accept_refuse_on_live_gated_run_tasks() {
+    let repo = gated_repo();
+    relaybook(repo.path())
+        .args(["task", "create", "work", "--title", "Work"])
+        .assert()
+        .success();
+    relaybook(repo.path())
+        .args(["task", "create", "other", "--title", "Other"])
+        .assert()
+        .success();
+    let run_id = seed_run(repo.path(), "main", "execute", "active");
+    assign_run(repo.path(), "work", run_id);
+
+    for args in [
+        &["review", "start", "work"][..],
+        &[
+            "review",
+            "record",
+            "work",
+            "--by",
+            "codex",
+            "--sha",
+            "abc",
+            "--verdict",
+            "approved",
+            "--text",
+            "{}",
+        ][..],
+        &["report", "accept", "work"][..],
+        &["review", "start", "--release"][..],
+        &[
+            "review",
+            "record",
+            "--release",
+            "--by",
+            "codex",
+            "--sha",
+            "abc",
+            "--verdict",
+            "approved",
+            "--text",
+            RELEASE_REVIEW,
+        ][..],
+        &["config", "set", "workflow", "classic"][..],
+    ] {
+        relaybook(repo.path())
+            .args(args)
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicates::str::contains(OWNED));
+    }
+    assert_eq!(setting(repo.path(), "workflow"), json!("gated"));
+    assert_eq!(run_row(repo.path()).status, "active");
+    relaybook(repo.path())
+        .args(["release", "status"])
+        .assert()
+        .success();
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
 }
 
 struct PtyOutput {

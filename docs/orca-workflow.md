@@ -1,6 +1,6 @@
 # Orca workflow
 
-Manual work with `workflow=gated` is implemented. The default stays `workflow=classic`: the same task commands, and no review, release, or graph gate. Auto mode with `workflow=classic` still plans and reviews with Claude, and `relaybook run` still pushes before sign-off. With `workflow=gated`, `relaybook run` and `relaybook approve` refuse. Sections marked **Planned** are not enforced.
+Manual work with `workflow=gated` is implemented. The default stays `workflow=classic`: the same task commands, and no review, release, or graph gate. Auto mode with `workflow=classic` still plans and reviews with Claude, and `relaybook run` still pushes before sign-off. With `workflow=gated`, auto mode runs until review and does not push before sign-off. Sections marked **Planned** are not enforced.
 
 ## Minimum version
 
@@ -56,13 +56,12 @@ A program that can read the prompt can type the line. A signing key that same us
 **Auto mode today:**
 
 - With `workflow=classic`, `relaybook run` pushes the run branch to `origin` after every accepted review and whenever it halts, then pushes again and runs `gh pr create` without a checkpoint. See [auto-mode.md](auto-mode.md#pushes-and-the-pull-request).
-- With `workflow=gated`, `relaybook run`, `relaybook run --resume`, and `relaybook approve` refuse before any push. `relaybook config set workflow classic` requires a terminal, including a value that only differs by surrounding whitespace. This workflow still does not use `relaybook run`.
+- With `workflow=gated`, `relaybook run` freezes `gated` on the run row. It does not push on halt or before authorization. `relaybook approve` at `gate_release` pushes the authorized commit and opens one pull request. See [auto-mode.md](auto-mode.md#gated-workflow). `relaybook config set workflow classic` requires a terminal, including a value that only differs by surrounding whitespace, and it is refused while that run is active, waiting, or paused.
 
 **Planned:**
 
-- Codex routing inside `relaybook run`, including a missing-Codex halt.
+- Codex routing inside `relaybook run`, including a missing-Codex halt. Until that lands, the gated review step stops with "codex routing not built".
 - A runloop guard that stops a reviewer who edits the branch or the ledger.
-- A release gate that publishes only after sign-off, including when the run halts. Until that lands, gated `relaybook run` stays unavailable.
 - Graph refresh and handoff SHAs inside the auto runner.
 
 ## Reviewer edits

@@ -171,6 +171,7 @@ pub(crate) fn review_start_task(
     cwd: &Path,
     slug: &str,
 ) -> Result<TaskReviewStart, Error> {
+    refuse_live_task(ledger, slug)?;
     let reviewer = {
         let settings = ledger.settings()?;
         if settings.workflow != "gated" {
@@ -261,6 +262,7 @@ pub(crate) fn review_record_task(
     verdict: &str,
     text: &str,
 ) -> Result<Review, Error> {
+    refuse_live_task(ledger, slug)?;
     let configured = {
         let settings = ledger.settings()?;
         if settings.workflow != "gated" {
@@ -304,6 +306,7 @@ pub(crate) fn review_start_release(
     ledger: &mut Ledger,
     cwd: &Path,
 ) -> Result<ReleaseReviewStart, Error> {
+    refuse_live_release(ledger)?;
     let reviewer = {
         let settings = ledger.settings()?;
         if settings.workflow != "gated" {
@@ -363,6 +366,7 @@ pub(crate) fn review_record_release(
     verdict: &str,
     text: &str,
 ) -> Result<Review, Error> {
+    refuse_live_release(ledger)?;
     let configured = {
         let settings = ledger.settings()?;
         if settings.workflow != "gated" {
@@ -544,6 +548,68 @@ pub(crate) fn env_run_id() -> Option<i64> {
     std::env::var("RELAYBOOK_RUN_ID")
         .ok()
         .and_then(|value| value.parse().ok())
+}
+
+const LIVE_RUN_OWNS: &str = "a gated run owns this; use relaybook approve / run --resume";
+
+fn live_gated_run(ledger: &Ledger) -> Result<Option<relaybook_core::Run>, Error> {
+    match ledger.active_run()? {
+        Some(run) if run.workflow.as_deref() == Some("gated") => Ok(Some(run)),
+        _ => Ok(None),
+    }
+}
+
+pub(crate) fn refuse_live_task(ledger: &Ledger, slug: &str) -> Result<(), Error> {
+    let slug = slug.trim();
+    let Some(run) = live_gated_run(ledger)? else {
+        return Ok(());
+    };
+    let owned = ledger
+        .run_tasks(run.id)?
+        .iter()
+        .any(|task| task.slug == slug);
+    if owned {
+        Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn refuse_live_release(ledger: &Ledger) -> Result<(), Error> {
+    if live_gated_run(ledger)?.is_some() {
+        Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn refuse_live_workflow(ledger: &Ledger) -> Result<(), Error> {
+    refuse_live_release(ledger)
+}
+
+/// `release authorize` is allowed when no gated run is live, or when that run
+/// is waiting at `gate_release`.
+pub(crate) fn allow_release_authorize(ledger: &Ledger) -> Result<(), Error> {
+    let Some(run) = live_gated_run(ledger)? else {
+        return Ok(());
+    };
+    if run.status == "waiting" && run.stage == "gate_release" {
+        Ok(())
+    } else {
+        Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
+    }
+}
+
+/// Run id to store when this branch is waiting at `gate_release`.
+pub(crate) fn gate_release_run_id(ledger: &Ledger, branch: &str) -> Result<Option<i64>, Error> {
+    let Some(run) = live_gated_run(ledger)? else {
+        return Ok(None);
+    };
+    if run.status == "waiting" && run.stage == "gate_release" && run.branch == branch {
+        Ok(Some(run.id))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn task_is_done(ledger: &Ledger, slug: &str) -> Result<bool, Error> {

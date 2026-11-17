@@ -47,11 +47,6 @@ pub(crate) fn execute(cwd: &Path, launch: Launch) -> RunOutput {
         return add_to_run(&db, &launch.add);
     }
     // Stop, complete, watch, and add returned above. They do not push.
-    // Everything else, including approve and resume, refuses before overrides,
-    // preflight, or git when this ledger is gated.
-    if let Err(err) = refuse_gated_launch(&db) {
-        return fail(&err);
-    }
     if let Err(err) = apply_overrides(&db, &launch) {
         return fail(&err);
     }
@@ -100,14 +95,6 @@ fn stop_requested(db: &Path) -> RunOutput {
         return fail("stopped: stopped by request; relaybook run --resume");
     }
     fail("no active run")
-}
-
-fn refuse_gated_launch(db: &Path) -> Result<(), String> {
-    let ledger = Ledger::open(db).map_err(|err| err.to_string())?;
-    if ledger.settings().map_err(|err| err.to_string())?.workflow == "gated" {
-        return Err("relaybook run is not available with workflow=gated in this build".to_string());
-    }
-    Ok(())
 }
 
 fn apply_overrides(db: &Path, launch: &Launch) -> Result<(), String> {
@@ -171,6 +158,9 @@ fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Resul
     };
     let digest = file_sha256(&full)?;
     let branch = format!("relaybook/{}", stem(prd));
+    if settings.workflow == "gated" {
+        refuse_existing_run_branch(&mut ledger, cwd, &branch, &settings.remote_check)?;
+    }
     sync_main(cwd)?;
     git(cwd, &["checkout", "-B", &branch, "main"])?;
     let run = ledger
@@ -330,7 +320,23 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<(), String> {
     if approve && run.status != "waiting" {
         return Err("run is not waiting".to_string());
     }
-    if approve && run.stage.starts_with("gate_review") {
+    let settings = ledger.settings().map_err(|err| err.to_string())?;
+    if workflow_changed(&run, &settings) {
+        let output = halt(cwd, &mut ledger, &mut run, "workflow changed during run");
+        return Err(output.text.trim_end().to_string());
+    }
+    if run.stage == "gate_release" {
+        git(cwd, &["checkout", &run.branch])?;
+        if !release_authorized(&ledger, cwd, &run)? {
+            return Err(signoff_wait(cwd));
+        }
+        let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
+        if let Err(err) = crate::gate::require_unpublished(&mut ledger, &root, "gate_release") {
+            let output = halt(cwd, &mut ledger, &mut run, &err.to_string());
+            return Err(output.text.trim_end().to_string());
+        }
+        run.stage = "publish".to_string();
+    } else if approve && run.stage.starts_with("gate_review") {
         run.stage = "after_review".to_string();
     } else if approve && run.stage == "gate_plan" {
         run.stage = "execute".to_string();
@@ -363,6 +369,9 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
         }) else {
             return fail("no active run");
         };
+        if workflow_changed(&run, &settings) {
+            return halt(cwd, &mut ledger, &mut run, "workflow changed during run");
+        }
         if settings.mode != "auto" {
             return halt(cwd, &mut ledger, &mut run, "mode is manual");
         }
@@ -404,12 +413,13 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             };
             let budget = settings.est_cost_cap_usd.clone();
             let run_id = run.id;
+            let gated = is_gated(&run);
             run.agent_calls += 1;
             if let Err(err) = ledger.save_run(&run) {
                 return fail(&err.to_string());
             }
             drop(ledger);
-            let before = match snap(cwd, &run.branch) {
+            let before = match snap(cwd, &run.branch, gated) {
                 Ok(before) => before,
                 Err(err) => return fail(&err),
             };
@@ -427,7 +437,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
                 &result_text(&result),
             );
             transcript += 1;
-            if let Err(err) = guard_claude(cwd, &before) {
+            if let Err(err) = guard_claude(cwd, &before, gated) {
                 close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
                 return halt_db(db, cwd, &err);
             }
@@ -488,6 +498,9 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             continue;
         }
         if run.stage == "review" {
+            if is_gated(&run) {
+                return halt(cwd, &mut ledger, &mut run, "codex routing not built");
+            }
             let Some(slug) = run.current_slug.clone() else {
                 run.stage = "execute".to_string();
                 if let Err(err) = ledger.save_run(&run) {
@@ -504,7 +517,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
                 return fail(&err.to_string());
             }
             drop(ledger);
-            let before = match snap(cwd, &branch) {
+            let before = match snap(cwd, &branch, false) {
                 Ok(before) => before,
                 Err(err) => return fail(&err),
             };
@@ -528,7 +541,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
                 &result_text(&result),
             );
             transcript += 1;
-            if let Err(err) = guard_claude(cwd, &before) {
+            if let Err(err) = guard_claude(cwd, &before, false) {
                 close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
                 return halt_db(db, cwd, &err);
             }
@@ -594,12 +607,24 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             }
             continue;
         }
+        if run.stage == "release_review" {
+            return halt(cwd, &mut ledger, &mut run, "codex routing not built");
+        }
+        if run.stage == "publish" && is_gated(&run) {
+            return publish(cwd, &mut ledger, &mut run);
+        }
+        if run.stage == "gate_release" && is_gated(&run) {
+            return halt(cwd, &mut ledger, &mut run, &signoff_wait(cwd));
+        }
         // execute, or a gate that was already approved into execute
         let tasks = match ledger.run_tasks(run.id) {
             Ok(tasks) => tasks,
             Err(err) => return fail(&err.to_string()),
         };
         if run.complete_requested && !relaybook_core::unfinished_run(&tasks) {
+            if is_gated(&run) {
+                return enter_release_review(cwd, &mut ledger, &mut run);
+            }
             return finish(cwd, &mut ledger, &mut run);
         }
         let slug = if let Some(slug) = run.current_slug.clone() {
@@ -626,6 +651,9 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
                 return halt(cwd, &mut ledger, &mut run, "planner created no tasks");
             }
             if !relaybook_core::unfinished_run(&tasks) {
+                if is_gated(&run) {
+                    return enter_release_review(cwd, &mut ledger, &mut run);
+                }
                 return finish(cwd, &mut ledger, &mut run);
             }
             return halt(cwd, &mut ledger, &mut run, "no ready task");
@@ -656,11 +684,12 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
         let prompt = format!("{}\nTask slug: {slug}\n", agents::executor_template());
         let run_id = run.id;
         let branch = run.branch.clone();
+        let gated = is_gated(&run);
         if let Err(err) = ledger.save_run(&run) {
             return fail(&err.to_string());
         }
         drop(ledger);
-        let before = match snap(cwd, &branch) {
+        let before = match snap(cwd, &branch, gated) {
             Ok(before) => before,
             Err(err) => return fail(&err),
         };
@@ -678,7 +707,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             &result_text(&result),
         );
         transcript += 1;
-        if let Err(err) = guard_cursor(cwd, &before, &branch) {
+        if let Err(err) = guard_cursor(cwd, &before, &branch, gated) {
             close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "halted");
             return halt_db(db, cwd, &err);
         }
@@ -804,11 +833,16 @@ fn after_review(
         }
         return Control::Stay;
     }
-    if let Err(err) = push_branch(cwd, &run.branch) {
+    if !is_gated(run)
+        && let Err(err) = push_branch(cwd, &run.branch)
+    {
         return Control::Return(halt(cwd, ledger, run, &err));
     }
     let tasks = ledger.run_tasks(run.id).unwrap_or_default();
     if run.complete_requested && !relaybook_core::unfinished_run(&tasks) {
+        if is_gated(run) {
+            return Control::Return(enter_release_review(cwd, ledger, run));
+        }
         return Control::Return(finish(cwd, ledger, run));
     }
     run.current_slug = None;
@@ -840,7 +874,9 @@ fn finish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
 }
 
 fn halt(cwd: &Path, ledger: &mut Ledger, run: &mut Run, reason: &str) -> RunOutput {
-    let _ = push_branch(cwd, &run.branch);
+    if !is_gated(run) {
+        let _ = push_branch(cwd, &run.branch);
+    }
     run.status = "stopped".to_string();
     run.stop_reason = Some(reason.to_string());
     if let Err(err) = ledger.save_run(run) {
@@ -1018,9 +1054,10 @@ struct Snap {
     origin_branch: Option<String>,
     tags: Vec<String>,
     tree: String,
+    remote_refs: Vec<String>,
 }
 
-fn snap(cwd: &Path, branch: &str) -> Result<Snap, String> {
+fn snap(cwd: &Path, branch: &str, gated: bool) -> Result<Snap, String> {
     Ok(Snap {
         head: git(cwd, &["rev-parse", "HEAD"])?,
         branch: git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?,
@@ -1029,12 +1066,21 @@ fn snap(cwd: &Path, branch: &str) -> Result<Snap, String> {
         origin_branch: git(cwd, &["rev-parse", &format!("origin/{branch}")]).ok(),
         tags: tag_list(cwd),
         tree: crate::git::worktree_fingerprint(cwd)?,
+        remote_refs: if gated {
+            crate::remote::tracking_ref_lines(cwd)?
+        } else {
+            Vec::new()
+        },
     })
 }
 
-fn guard_claude(cwd: &Path, before: &Snap) -> Result<(), String> {
-    let after = snap(cwd, &before.branch)?;
-    shared_guard(before, &after)?;
+fn guard_claude(cwd: &Path, before: &Snap, gated: bool) -> Result<(), String> {
+    let after = snap(cwd, &before.branch, gated)?;
+    if gated {
+        shared_guard_gated(before, &after)?;
+    } else {
+        shared_guard(before, &after)?;
+    }
     if after.head != before.head || after.tree != before.tree {
         return Err(format!(
             "claude edited the worktree: {} -> {}",
@@ -1044,9 +1090,13 @@ fn guard_claude(cwd: &Path, before: &Snap) -> Result<(), String> {
     Ok(())
 }
 
-fn guard_cursor(cwd: &Path, before: &Snap, branch: &str) -> Result<(), String> {
-    let after = snap(cwd, branch)?;
-    shared_guard(before, &after)?;
+fn guard_cursor(cwd: &Path, before: &Snap, branch: &str, gated: bool) -> Result<(), String> {
+    let after = snap(cwd, branch, gated)?;
+    if gated {
+        shared_guard_gated(before, &after)?;
+    } else {
+        shared_guard(before, &after)?;
+    }
     if after.branch != branch {
         return Err("switched branch".to_string());
     }
@@ -1069,8 +1119,127 @@ fn shared_guard(before: &Snap, after: &Snap) -> Result<(), String> {
     Ok(())
 }
 
+fn shared_guard_gated(before: &Snap, after: &Snap) -> Result<(), String> {
+    shared_guard(before, after)?;
+    if before.remote_refs != after.remote_refs {
+        return Err("pushed outside relaybook".to_string());
+    }
+    Ok(())
+}
+
 fn dirty(cwd: &Path) -> Result<bool, String> {
     Ok(!crate::git::dirty_paths(cwd)?.is_empty())
+}
+
+fn frozen_workflow(run: &Run) -> &str {
+    run.workflow.as_deref().unwrap_or("classic")
+}
+
+fn is_gated(run: &Run) -> bool {
+    frozen_workflow(run) == "gated"
+}
+
+fn workflow_changed(run: &Run, settings: &relaybook_core::Settings) -> bool {
+    frozen_workflow(run) != settings.workflow
+}
+
+fn signoff_wait(cwd: &Path) -> String {
+    let head = git(cwd, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string());
+    format!("waiting for sign-off: relaybook release authorize --sha {head}")
+}
+
+fn release_authorized(ledger: &Ledger, cwd: &Path, run: &Run) -> Result<bool, String> {
+    let head = git(cwd, &["rev-parse", "HEAD"])?;
+    match ledger
+        .authorization_at(&head)
+        .map_err(|err| err.to_string())?
+    {
+        Some(auth) if auth.branch == run.branch && auth.commit_sha == head => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+fn refuse_existing_run_branch(
+    ledger: &mut Ledger,
+    cwd: &Path,
+    branch: &str,
+    remote_check: &str,
+) -> Result<(), String> {
+    let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let view = crate::remote::screen_named_branch(&root, branch, remote_check)
+        .map_err(|err| err.to_string())?;
+    ledger
+        .record_remote_check(&relaybook_core::RemoteCheckDraft {
+            context: "begin_run".to_string(),
+            branch: view.branch.clone(),
+            head_sha: view.head_sha.clone(),
+            remote: view.remote.clone(),
+            status: view.status.to_string(),
+            detail: view.detail.clone(),
+            overridden: false,
+        })
+        .map_err(|err| err.to_string())?;
+    if view.status == "present" || view.status == "unknown" {
+        return Err(view
+            .message
+            .unwrap_or_else(|| "remote check failed".to_string()));
+    }
+    Ok(())
+}
+
+fn enter_release_review(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
+    run.stage = "release_review".to_string();
+    if let Err(err) = ledger.save_run(run) {
+        return fail(&err.to_string());
+    }
+    halt(cwd, ledger, run, "codex routing not built")
+}
+
+fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
+    let head = match git(cwd, &["rev-parse", "HEAD"]) {
+        Ok(head) => head,
+        Err(err) => return halt(cwd, ledger, run, &err),
+    };
+    let authorized = match ledger.authorization_at(&head) {
+        Ok(Some(auth)) if auth.branch == run.branch && auth.commit_sha == head => true,
+        Ok(_) => false,
+        Err(err) => return halt(cwd, ledger, run, &err.to_string()),
+    };
+    if !authorized {
+        return halt(cwd, ledger, run, "HEAD moved after authorization");
+    }
+    if let Err(err) = crate::gate::ensure_gated_clean(cwd) {
+        return halt(cwd, ledger, run, &err.to_string());
+    }
+    let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    if let Err(err) = crate::gate::require_unpublished(ledger, &root, "publish") {
+        return halt(cwd, ledger, run, &err.to_string());
+    }
+    let origin = git(cwd, &["remote"])
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line == "origin");
+    if !origin {
+        return halt(cwd, ledger, run, "origin is missing");
+    }
+    let spec = format!("{head}:refs/heads/{}", run.branch);
+    if let Err(err) = git(cwd, &["push", "-u", "origin", &spec]) {
+        return halt(cwd, ledger, run, &err);
+    }
+    let body = report_body(ledger, run.id);
+    let title = format!("Relaybook run {}", run.branch);
+    match gh_pr(cwd, &run.branch, &title, &body) {
+        Ok(url) => {
+            run.status = "complete".to_string();
+            run.stage = "done".to_string();
+            run.stop_reason = Some(url.clone());
+            if let Err(err) = ledger.save_run(run) {
+                return fail(&err.to_string());
+            }
+            ok(&format!("opened {url}"))
+        }
+        Err(err) => halt(cwd, ledger, run, &err),
+    }
 }
 
 fn sync_main(cwd: &Path) -> Result<(), String> {
