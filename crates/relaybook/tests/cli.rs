@@ -1996,6 +1996,155 @@ fn graphify_hiding_helper_does_not_add_a_which_dev_dependency() {
 }
 
 #[test]
+fn relative_path_entry_resolves_from_nested_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    seed_graph_task(dir.path());
+    let mut ignore = fs::read_to_string(dir.path().join(".gitignore")).expect("gitignore");
+    ignore.push_str("fakebin/\nsub/\n");
+    fs::write(dir.path().join(".gitignore"), ignore).expect("gitignore");
+    git(dir.path(), &["add", ".gitignore"]);
+    commit_index(dir.path(), "ignore lookup fixtures");
+
+    let fakebin = dir.path().join("fakebin");
+    fs::create_dir_all(&fakebin).expect("fakebin");
+    let program = fakebin.join(if cfg!(windows) {
+        "graphify.exe"
+    } else {
+        "graphify"
+    });
+    fs::copy(env!("CARGO_BIN_EXE_fake"), &program).expect("copy fake");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&program).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).expect("chmod");
+    }
+    let sub = dir.path().join("sub");
+    fs::create_dir_all(&sub).expect("sub");
+    let log = fakebin.join("graphify.log");
+
+    // `../fakebin` is the entry under test. Later entries stay so `git` resolves.
+    let mut entries = vec![PathBuf::from("..").join("fakebin")];
+    if let Some(rest) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&rest));
+    }
+    let path = std::env::join_paths(&entries).expect("path");
+    let mut cmd = command(&sub);
+    cmd.env("PATH", &path);
+    cmd.env("GRAPHIFY_LOG", &log);
+    cmd.env("RELAYBOOK_FAKE_GRAPHIFY", "graph");
+    let output = cmd
+        .args(["graph", "refresh", "--step", "plan", "--json"])
+        .output()
+        .expect("output");
+    assert!(output.status.success(), "{}", summarize(&output));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(envelope["ok"], json!(true), "{envelope}");
+    assert_eq!(envelope["data"]["status"], json!("built"), "{envelope}");
+    let logged = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        logged.lines().any(|line| line == "update ."),
+        "GRAPHIFY_LOG={logged:?}"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn windows_empty_path_entry_does_not_resolve_cwd_shim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_repo(dir.path());
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    run(dir.path(), ["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+    fs::write(
+        dir.path().join("graphify.cmd"),
+        "@echo off\r\nexit /b 0\r\n",
+    )
+    .expect("cmd");
+
+    // A leading empty entry used to mean the current directory. which 8 skips it.
+    let mut entries = vec![PathBuf::new()];
+    if let Some(rest) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&rest) {
+            if which::which_in("graphify", Some(entry.as_os_str()), dir.path()).is_ok() {
+                continue;
+            }
+            entries.push(entry);
+        }
+    }
+    let path = std::env::join_paths(&entries).expect("path");
+    let data = json_with_path(
+        dir.path(),
+        &path,
+        ["graph", "refresh", "--step", "plan", "--json"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(data["commit_sha"], json!(head));
+    assert!(data["graph_sha"].is_null());
+    assert_eq!(data["status"], json!("skipped"));
+    assert_eq!(data["detail"], json!("no graph"));
+    assert_eq!(
+        graph_builds(dir.path()),
+        vec![("plan".to_string(), head, "skipped".to_string())]
+    );
+}
+
+#[test]
+fn agent_binary_used_only_when_version_names_cursor() {
+    let dir = classic_auto_repo();
+    let naming = plant_agent(dir.path(), true);
+    assert!(
+        which::which_in("agent", Some(naming.bin.as_os_str()), dir.path()).is_ok(),
+        "fake agent was not visible to which"
+    );
+    assert!(
+        which::which_in("cursor-agent", Some(naming.path.as_os_str()), dir.path()).is_err(),
+        "cursor-agent was still on PATH"
+    );
+    let output = run_with_agent(dir.path(), &naming);
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("cursor: plan account"), "{text}");
+    let cursor_args = fs::read_to_string(naming.log.join("cursor.args")).unwrap_or_default();
+    assert!(
+        cursor_args.contains("-p"),
+        "agent was not used as the cursor CLI: {cursor_args:?}"
+    );
+
+    let other = classic_auto_repo();
+    let unnamed = plant_agent(other.path(), false);
+    assert!(
+        which::which_in("agent", Some(unnamed.bin.as_os_str()), other.path()).is_ok(),
+        "non-cursor agent was not visible to which"
+    );
+    assert!(
+        which::which_in("cursor-agent", Some(unnamed.path.as_os_str()), other.path()).is_err(),
+        "cursor-agent was still on PATH"
+    );
+    let output = run_with_agent(other.path(), &unnamed);
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("cursor: not on PATH"), "{text}");
+    assert!(!text.contains("cursor: plan account"), "{text}");
+    assert!(
+        !unnamed.log.join("cursor.args").is_file(),
+        "rejected agent was still invoked"
+    );
+}
+
+#[test]
 fn flow_never_runs_graphify_extract() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_graph_task(dir.path());
@@ -3791,6 +3940,148 @@ fn json_on_path_without_graphify(
 }
 
 /// Drop every PATH entry for which production `which::which("graphify")` would succeed.
+#[cfg(windows)]
+fn json_with_path(
+    dir: &Path,
+    path: &std::ffi::OsStr,
+    args: impl IntoIterator<Item = &'static str>,
+) -> Value {
+    let output = command(dir)
+        .env("PATH", path)
+        .args(args)
+        .output()
+        .expect("output");
+    assert!(output.status.success(), "{}", summarize(&output));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(envelope["ok"], json!(true), "{envelope}");
+    envelope["data"].clone()
+}
+
+struct PlantedAgent {
+    _root: tempfile::TempDir,
+    bin: PathBuf,
+    path: OsString,
+    log: PathBuf,
+}
+
+fn classic_auto_repo() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_repo(dir.path());
+    git(
+        dir.path(),
+        &["config", "user.email", "relaybook@example.com"],
+    );
+    git(dir.path(), &["config", "user.name", "Relaybook"]);
+    git(dir.path(), &["config", "commit.gpgsign", "false"]);
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["mode", "auto"]).assert().success();
+    run(dir.path(), ["config", "set", "gates", "none"])
+        .assert()
+        .success();
+    fs::write(
+        dir.path().join("prd.md"),
+        "Build a tiny greeting command.\n",
+    )
+    .expect("prd");
+    git(dir.path(), &["add", "prd.md"]);
+    commit_index(dir.path(), "add prd");
+    dir
+}
+
+fn plant_agent(cwd: &Path, names_cursor: bool) -> PlantedAgent {
+    let root = tempfile::tempdir().expect("agent bin");
+    let bin = root.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin");
+    copy_named_fake(&bin, "claude");
+    copy_named_fake(&bin, "gh");
+    if names_cursor {
+        copy_named_fake(&bin, "agent");
+    } else {
+        write_other_agent(&bin);
+    }
+    let mut path = bin.as_os_str().to_os_string();
+    let rest = path_hiding(&["cursor-agent", "agent"], cwd);
+    if !rest.is_empty() {
+        path.push(if cfg!(windows) { ";" } else { ":" });
+        path.push(rest);
+    }
+    let log = root.path().join("log");
+    fs::create_dir_all(&log).expect("log");
+    PlantedAgent {
+        _root: root,
+        bin,
+        path,
+        log,
+    }
+}
+
+fn copy_named_fake(dir: &Path, name: &str) {
+    let dest = dir.join(if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    });
+    fs::copy(env!("CARGO_BIN_EXE_fake"), &dest).expect("copy fake");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&dest).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&dest, permissions).expect("chmod");
+    }
+}
+
+fn write_other_agent(dir: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dest = dir.join("agent");
+        fs::write(&dest, "#!/bin/sh\necho \"grok 1.0\"\nexit 0\n").expect("agent");
+        let mut permissions = fs::metadata(&dest).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&dest, permissions).expect("chmod");
+    }
+    #[cfg(windows)]
+    {
+        fs::write(
+            dir.join("agent.cmd"),
+            "@echo off\r\necho grok 1.0\r\nexit /b 0\r\n",
+        )
+        .expect("agent");
+    }
+}
+
+fn path_hiding(names: &[&str], cwd: &Path) -> OsString {
+    let mut filtered = OsString::new();
+    let mut first = true;
+    let raw = std::env::var_os("PATH").unwrap_or_default();
+    for entry in std::env::split_paths(&raw) {
+        if names
+            .iter()
+            .any(|name| which::which_in(name, Some(entry.as_os_str()), cwd).is_ok())
+        {
+            continue;
+        }
+        if !first {
+            filtered.push(if cfg!(windows) { ";" } else { ":" });
+        }
+        first = false;
+        filtered.push(&entry);
+    }
+    filtered
+}
+
+fn run_with_agent(dir: &Path, agent: &PlantedAgent) -> Output {
+    let mut cmd = command(dir);
+    cmd.env("PATH", &agent.path);
+    cmd.env("LOG", &agent.log);
+    cmd.env("RELAYBOOK_FAKE_KIND", "happy");
+    cmd.env("RELAYBOOK", env!("CARGO_BIN_EXE_relaybook"));
+    cmd.env_remove("ANTHROPIC_API_KEY");
+    cmd.args(["run", "--prd", "prd.md"]);
+    cmd.output().expect("run")
+}
+
 fn path_without_graphify(path: &std::ffi::OsStr, cwd: &Path) -> OsString {
     let mut filtered = OsString::new();
     let mut first = true;
