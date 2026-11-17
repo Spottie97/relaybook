@@ -106,9 +106,12 @@ enum Command {
     /// Refresh the graph and record the commit it was built from.
     #[command(subcommand)]
     Graph(GraphCmd),
-    /// Hand off a done task, or record its verdict.
+    /// Hand off a done task or the branch, or record its verdict.
     #[command(subcommand)]
     Review(ReviewCmd),
+    /// Sign off the checked-out commit, or show whether it is signed off.
+    #[command(subcommand)]
+    Release(ReleaseCmd),
     /// Print or set manual/auto mode.
     Mode {
         /// `manual` or `auto`. Omit to print the current mode.
@@ -318,11 +321,21 @@ enum GraphCmd {
 
 #[derive(Subcommand)]
 enum ReviewCmd {
-    /// Hand off one done task, including capped Graphify context.
-    Start { slug: String },
-    /// Record the verdict for the pending task review.
+    /// Hand off one done task, or the branch with `--release`.
+    Start {
+        /// Task slug. Omit this with `--release`.
+        slug: Option<String>,
+        /// Review `merge-base(main, HEAD)..HEAD`.
+        #[arg(long)]
+        release: bool,
+    },
+    /// Record the verdict for the pending task or release review.
     Record {
-        slug: String,
+        /// Task slug. Omit this with `--release`.
+        slug: Option<String>,
+        /// Record the branch review instead of one task.
+        #[arg(long)]
+        release: bool,
         /// Reviewer identity. Must match the `reviewer` setting.
         #[arg(long)]
         by: String,
@@ -332,10 +345,22 @@ enum ReviewCmd {
         /// `approved` or `changes-requested`.
         #[arg(long, allow_hyphen_values = true)]
         verdict: String,
-        /// Review body JSON: findings, security, tests_checked, not_checked.
+        /// Review body JSON. A release review also includes prd_covered and gaps.
         #[arg(long, allow_hyphen_values = true)]
         text: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ReleaseCmd {
+    /// Record maintainer sign-off for HEAD. Requires a terminal confirmation.
+    Authorize {
+        /// Full HEAD this sign-off applies to. Must equal the checked-out commit.
+        #[arg(long)]
+        sha: String,
+    },
+    /// Show whether HEAD is release-reviewed or signed off.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -592,14 +617,19 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         Command::Graph(GraphCmd::Refresh { step, task }) => {
             refresh_graph_cmd(&cwd, &step, task.as_deref())
         }
-        Command::Review(ReviewCmd::Start { slug }) => review_start(&cwd, &slug),
+        Command::Review(ReviewCmd::Start { slug, release }) => {
+            review_start(&cwd, slug.as_deref(), release)
+        }
         Command::Review(ReviewCmd::Record {
             slug,
+            release,
             by,
             sha,
             verdict,
             text,
-        }) => review_record(&cwd, &slug, &by, &sha, &verdict, &text),
+        }) => review_record(&cwd, slug.as_deref(), release, &by, &sha, &verdict, &text),
+        Command::Release(ReleaseCmd::Authorize { sha }) => release_authorize(&cwd, &sha),
+        Command::Release(ReleaseCmd::Status) => release_status(&cwd),
         Command::Mode { value } => match value {
             Some(value) => set_mode(&cwd, &value),
             None => choose_setting(&cwd, "mode", picker::MODES, set_mode, show_mode),
@@ -995,7 +1025,14 @@ fn refresh_graph_cmd(cwd: &Path, step: &str, task: Option<&str>) -> Result<Outco
     json_outcome(graph_json(step, task, &refresh), human)
 }
 
-fn review_start(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
+fn review_start(cwd: &Path, slug: Option<&str>, release: bool) -> Result<Outcome, Fail> {
+    match review_subject(slug, release)? {
+        ReviewSubject::Task(slug) => review_start_task(cwd, slug),
+        ReviewSubject::Release => review_start_release(cwd),
+    }
+}
+
+fn review_start_task(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let reviewer = {
         let settings = ledger.settings()?;
@@ -1067,6 +1104,21 @@ fn review_start(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
 
 fn review_record(
     cwd: &Path,
+    slug: Option<&str>,
+    release: bool,
+    by: &str,
+    sha: &str,
+    verdict: &str,
+    text: &str,
+) -> Result<Outcome, Fail> {
+    match review_subject(slug, release)? {
+        ReviewSubject::Task(slug) => review_record_task(cwd, slug, by, sha, verdict, text),
+        ReviewSubject::Release => review_record_release(cwd, by, sha, verdict, text),
+    }
+}
+
+fn review_record_task(
+    cwd: &Path,
     slug: &str,
     by: &str,
     sha: &str,
@@ -1104,10 +1156,262 @@ fn review_record(
         verdict,
         text,
         reviewer_override,
+        None,
         move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
     )?;
     let stored = review.verdict.clone().unwrap_or_default();
     json_outcome(review, render::line(&format!("recorded {slug} {stored}")))
+}
+
+enum ReviewSubject<'a> {
+    Task(&'a str),
+    Release,
+}
+
+fn review_subject(slug: Option<&str>, release: bool) -> Result<ReviewSubject<'_>, Fail> {
+    let slug = slug.map(str::trim).filter(|slug| !slug.is_empty());
+    match (slug, release) {
+        (Some(slug), false) => Ok(ReviewSubject::Task(slug)),
+        (None, true) => Ok(ReviewSubject::Release),
+        _ => Err(Fail::Usage("pass a task slug or --release".to_string())),
+    }
+}
+
+fn review_start_release(cwd: &Path) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let reviewer = {
+        let settings = ledger.settings()?;
+        if settings.workflow != "gated" {
+            return Err(invalid_setting("review start requires workflow=gated"));
+        }
+        settings.reviewer
+    };
+    let checkout = release_checkout(&ledger, cwd, "review start")?;
+    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    let refresh = record_graph_refresh(&mut ledger, cwd, "release-review", None)?;
+    ensure_gated_clean(&checkout.root)?;
+    if gitinfo::verified_head(&checkout.root).as_deref() != Some(checkout.range.head.as_str()) {
+        return Err(invalid_setting("HEAD changed during graph refresh"));
+    }
+    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    let fingerprint = crate::git::worktree_fingerprint(&checkout.root).map_err(invalid_setting)?;
+    let accepted = ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    ledger.start_review(
+        "release",
+        None,
+        env_run_id(),
+        &checkout.branch,
+        &reviewer,
+        Some(checkout.range.base.as_str()),
+        &checkout.range.head,
+        refresh.graph_sha.as_deref(),
+        &fingerprint,
+    )?;
+    let graph_context = if refresh.status == "built" {
+        crate::graphify::graph_context(&checkout.root, &checkout.range.base, &checkout.range.head)
+    } else {
+        crate::graphify::NO_GRAPH.to_string()
+    };
+    let data = serde_json::json!({
+        "slug": serde_json::Value::Null,
+        "base_sha": checkout.range.base,
+        "commit_sha": checkout.range.head,
+        "range": range_text(&checkout.range),
+        "graph_sha": refresh.graph_sha,
+        "graph_status": refresh.status,
+        "detail": refresh.detail,
+        "tasks": accepted,
+        "graph_context": graph_context,
+    });
+    json_outcome(data, render::line("review start release"))
+}
+
+fn review_record_release(
+    cwd: &Path,
+    by: &str,
+    sha: &str,
+    verdict: &str,
+    text: &str,
+) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let configured = {
+        let settings = ledger.settings()?;
+        if settings.workflow != "gated" {
+            return Err(invalid_setting("review record requires workflow=gated"));
+        }
+        settings.reviewer
+    };
+    let checkout = release_checkout(&ledger, cwd, "review record")?;
+    refuse_published_branch(&checkout.root)?;
+    let sha = sha.trim();
+    if sha != checkout.range.head {
+        return Err(invalid_setting("sha does not match HEAD"));
+    }
+    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    let reviewer_override = reviewer_override(&configured, by)?;
+    let checkout = release_checkout(&ledger, cwd, "review record")?;
+    refuse_published_branch(&checkout.root)?;
+    if sha != checkout.range.head {
+        return Err(invalid_setting("sha does not match HEAD"));
+    }
+    let fingerprint = crate::git::worktree_fingerprint(&checkout.root).map_err(invalid_setting)?;
+    let sha_owned = sha.to_string();
+    let fingerprint_now = fingerprint.clone();
+    let root = checkout.root.clone();
+    let commits = checkout.range.commits.clone();
+    let review = ledger.record_review_with(
+        "release",
+        None,
+        by.trim(),
+        sha,
+        &checkout.range.head,
+        &fingerprint,
+        verdict,
+        text,
+        reviewer_override,
+        Some(&commits),
+        move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
+    )?;
+    let stored = review.verdict.clone().unwrap_or_default();
+    json_outcome(review, render::line(&format!("recorded release {stored}")))
+}
+
+struct ReleaseCheckout {
+    root: PathBuf,
+    branch: String,
+    range: gitinfo::ReleaseRange,
+}
+
+fn release_checkout(ledger: &Ledger, cwd: &Path, action: &str) -> Result<ReleaseCheckout, Fail> {
+    require_gated_clean_tree(cwd, ledger)?;
+    let root = gitinfo::toplevel(cwd)
+        .ok_or_else(|| invalid_setting(format!("{action} requires a git repository")))?;
+    let branch = require_named_branch(&root, action)?;
+    let range = gitinfo::release_range(&root).map_err(invalid_setting)?;
+    Ok(ReleaseCheckout {
+        root,
+        branch,
+        range,
+    })
+}
+
+fn require_named_branch(root: &Path, action: &str) -> Result<String, Fail> {
+    match gitinfo::branch(root).as_deref() {
+        Some(name) if name != "HEAD" => Ok(name.to_string()),
+        _ => Err(invalid_setting(format!("{action} requires a branch"))),
+    }
+}
+
+fn range_text(range: &gitinfo::ReleaseRange) -> String {
+    format!("{}..{}", range.base, range.head)
+}
+
+fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
+    let sha = sha.trim();
+    let mut ledger = open_ledger(cwd)?;
+    prepare_authorize(&ledger, cwd, sha)?;
+    confirm_release()?;
+    let checkout = prepare_authorize(&ledger, cwd, sha)?;
+    let root = checkout.root.clone();
+    let sha_owned = sha.to_string();
+    let commits = checkout.range.commits.clone();
+    let authorization = ledger.authorize_release_with(
+        &checkout.branch,
+        sha,
+        &checkout.range.head,
+        "maintainer",
+        env_run_id(),
+        Some(&commits),
+        move || recheck_release_authorize(&root, &sha_owned),
+    )?;
+    json_outcome(authorization, render::line(&format!("authorized {sha}")))
+}
+
+fn prepare_authorize(ledger: &Ledger, cwd: &Path, sha: &str) -> Result<ReleaseCheckout, Fail> {
+    if ledger.settings()?.workflow != "gated" {
+        return Err(invalid_setting("release authorize requires workflow=gated"));
+    }
+    let checkout = release_checkout(ledger, cwd, "release authorize")?;
+    refuse_published_branch(&checkout.root)?;
+    if sha != checkout.range.head {
+        return Err(invalid_setting("sha does not match HEAD"));
+    }
+    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    match ledger.release_review_at(sha)? {
+        Some(review) if review.verdict.as_deref() == Some("approved") => {}
+        _ => {
+            return Err(invalid_setting("no approved release review"));
+        }
+    }
+    Ok(checkout)
+}
+
+fn confirm_release() -> Result<(), Fail> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(invalid_setting(
+            "release authorize requires confirmation at a TTY",
+        ));
+    }
+    match uninstall::confirm("Authorize this release?") {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(invalid_setting("release was not confirmed")),
+        Err(message) => Err(invalid_setting(message)),
+    }
+}
+
+fn recheck_release_authorize(root: &Path, sha: &str) -> Result<(), Error> {
+    ensure_gated_clean(root)?;
+    published_origin(root)?;
+    let head = gitinfo::verified_head(root).ok_or_else(|| {
+        Error::InvalidSetting("release authorize requires a commit at HEAD".to_string())
+    })?;
+    if head != sha {
+        return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
+    }
+    Ok(())
+}
+
+fn release_status(cwd: &Path) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    if ledger.settings()?.workflow != "gated" {
+        return Err(invalid_setting("release status requires workflow=gated"));
+    }
+    let root = gitinfo::toplevel(cwd)
+        .ok_or_else(|| invalid_setting("release status requires a git repository"))?;
+    let branch = match gitinfo::branch(&root).as_deref() {
+        Some(name) if name != "HEAD" => Some(name.to_string()),
+        _ => None,
+    };
+    let range = gitinfo::release_range(&root).map_err(invalid_setting)?;
+    let life = ledger.lifecycle(&range.head, &range.commits)?;
+    let release = life.release.map(|phase| phase.as_str());
+    let tasks: Vec<serde_json::Value> = life
+        .tasks
+        .iter()
+        .map(|task| {
+            serde_json::json!({
+                "slug": task.slug,
+                "phase": task.phase.map(|phase| phase.as_str()),
+            })
+        })
+        .collect();
+    let review = ledger.release_review_at(&range.head)?;
+    let authorization = ledger.authorization_at(&range.head)?;
+    let label = release.unwrap_or("unsigned");
+    let data = serde_json::json!({
+        "branch": branch,
+        "base_sha": range.base,
+        "commit_sha": range.head,
+        "range": range_text(&range),
+        "release": release,
+        "tasks": tasks,
+        "review": review,
+        "authorization": authorization,
+    });
+    json_outcome(
+        data,
+        render::line(&format!("release {label} {}", range.head)),
+    )
 }
 
 fn refuse_published_branch(root: &Path) -> Result<(), Fail> {

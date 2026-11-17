@@ -98,6 +98,15 @@ pub struct GraphBuild {
     pub created_at: String,
 }
 
+/// An accepted task with a report commit inside a release range.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ScopedTask {
+    pub slug: String,
+    /// Commit of the latest task report.
+    pub commit_sha: String,
+    pub base_sha: Option<String>,
+}
+
 /// One row of `release_authorizations`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReleaseAuthorization {
@@ -811,14 +820,18 @@ impl Ledger {
             verdict,
             body,
             reviewer_override,
+            None,
             || Ok(()),
         )
     }
 
-    /// Same as [`Self::record_review`]. `revalidate` runs inside this write
-    /// transaction after the verdict is stored and before commit. An error
-    /// rolls the recording back, including a repository check that failed
-    /// after the lock wait.
+    /// Same as [`Self::record_review`]. `release_commits` is the
+    /// `merge-base(main, HEAD)..HEAD` list for a release review; task reviews
+    /// pass `None`. When it is set, every in-scope task must be accepted and
+    /// no task may be claimed. `revalidate` runs inside this write transaction
+    /// after the verdict is stored and before commit. An error rolls the
+    /// recording back, including a repository check that failed after the
+    /// lock wait.
     #[allow(clippy::too_many_arguments)] // same arguments as record_review, plus the recheck
     pub fn record_review_with(
         &mut self,
@@ -831,6 +844,7 @@ impl Ledger {
         verdict: &str,
         body: &str,
         reviewer_override: bool,
+        release_commits: Option<&[String]>,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Review, Error> {
         let scope = review_scope(scope)?;
@@ -862,6 +876,11 @@ impl Ledger {
                 return Err(Error::InvalidSetting(
                     "ledger changed during review".to_string(),
                 ));
+            }
+            if scope == "release"
+                && let Some(commits) = release_commits
+            {
+                accepted_in_scope(conn, commits)?;
             }
             let recorded_at = now(conn)?;
             conn.execute(
@@ -1016,6 +1035,24 @@ impl Ledger {
         authorized_by: &str,
         run_id: Option<i64>,
     ) -> Result<ReleaseAuthorization, Error> {
+        self.authorize_release_with(branch, sha, head, authorized_by, run_id, None, || Ok(()))
+    }
+
+    /// Same as [`Self::authorize_release`]. `release_commits` is the release
+    /// range; when set, every in-scope task must be accepted and no task may
+    /// be claimed. `revalidate` runs inside the write transaction after the
+    /// row is inserted and before commit.
+    #[allow(clippy::too_many_arguments)] // sha, head, the range, and the recheck are distinct
+    pub fn authorize_release_with(
+        &mut self,
+        branch: &str,
+        sha: &str,
+        head: &str,
+        authorized_by: &str,
+        run_id: Option<i64>,
+        release_commits: Option<&[String]>,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<ReleaseAuthorization, Error> {
         let branch = required_text("branch", branch)?;
         let sha = required_text("sha", sha)?;
         let head = required_text("head", head)?;
@@ -1024,6 +1061,9 @@ impl Ledger {
             return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
         }
         self.transaction(|conn| {
+            if let Some(commits) = release_commits {
+                accepted_in_scope(conn, commits)?;
+            }
             let review_id = match crate::lifecycle::latest_release_review_at(conn, &sha)? {
                 Some(review) if review.verdict.as_deref() == Some("approved") => review.id,
                 _ => {
@@ -1039,8 +1079,46 @@ impl Ledger {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![run_id, branch, sha, review_id, authorized_by, created_at],
             )?;
+            revalidate()?;
             load_authorization(conn, conn.last_insert_rowid())
         })
+    }
+
+    /// Accepted tasks with a report commit in `commits`.
+    ///
+    /// A claimed task is an error. A task with any report commit in `commits`
+    /// must be accepted. Tasks outside that set are ignored.
+    pub fn accepted_tasks_in_scope(&self, commits: &[String]) -> Result<Vec<ScopedTask>, Error> {
+        accepted_in_scope(&self.conn, commits)
+    }
+
+    /// Latest release review recorded at `sha`, including a still-pending row.
+    pub fn release_review_at(&self, sha: &str) -> Result<Option<Review>, Error> {
+        let sha = required_text("sha", sha)?;
+        let Some(found) = crate::lifecycle::latest_release_review_at(&self.conn, &sha)? else {
+            return Ok(None);
+        };
+        Ok(Some(load_review(&self.conn, found.id)?))
+    }
+
+    /// Latest sign-off whose `commit_sha` is `sha`.
+    pub fn authorization_at(&self, sha: &str) -> Result<Option<ReleaseAuthorization>, Error> {
+        let sha = required_text("sha", sha)?;
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM release_authorizations
+                 WHERE commit_sha = ?1
+                 ORDER BY id DESC
+                 LIMIT 1",
+                params![sha],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => Ok(Some(load_authorization(&self.conn, id)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn lifecycle(
@@ -1808,6 +1886,93 @@ fn reopen_done_task(conn: &Connection, task: &Task, reason: &str) -> Result<(), 
         }),
     )?;
     reports::mark_latest_reopened(conn, task.id, reason, &ts)?;
+    Ok(())
+}
+
+struct ScopeReport {
+    slug: String,
+    status: String,
+    commit_sha: Option<String>,
+    base_sha: Option<String>,
+    verdict: Option<String>,
+}
+
+fn accepted_in_scope(conn: &Connection, commits: &[String]) -> Result<Vec<ScopedTask>, Error> {
+    let claimed: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'claimed'",
+        [],
+        |row| row.get(0),
+    )?;
+    if claimed > 0 {
+        return Err(Error::InvalidSetting("a task is claimed".to_string()));
+    }
+    let mut statement = conn.prepare(
+        "SELECT t.slug, t.status, r.commit_sha, r.base_sha, r.verdict
+         FROM tasks AS t
+         JOIN reports AS r ON r.task_id = t.id AND r.kind = 'task'
+         ORDER BY t.id ASC, r.id ASC",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ScopeReport {
+            slug: row.get(0)?,
+            status: row.get(1)?,
+            commit_sha: row.get(2)?,
+            base_sha: row.get(3)?,
+            verdict: row.get(4)?,
+        })
+    })?;
+    let mut grouped: Vec<ScopeReport> = Vec::new();
+    let mut accepted = Vec::new();
+    for row in rows {
+        let row = row?;
+        if grouped
+            .last()
+            .is_some_and(|previous| previous.slug != row.slug)
+        {
+            push_accepted_scope(&grouped, commits, &mut accepted)?;
+            grouped.clear();
+        }
+        grouped.push(row);
+    }
+    push_accepted_scope(&grouped, commits, &mut accepted)?;
+    Ok(accepted)
+}
+
+fn push_accepted_scope(
+    group: &[ScopeReport],
+    commits: &[String],
+    accepted: &mut Vec<ScopedTask>,
+) -> Result<(), Error> {
+    if group.is_empty() {
+        return Ok(());
+    }
+    let in_scope = group.iter().any(|report| {
+        report
+            .commit_sha
+            .as_deref()
+            .is_some_and(|sha| commits.iter().any(|item| item == sha))
+    });
+    if !in_scope {
+        return Ok(());
+    }
+    let Some(latest) = group.last() else {
+        return Ok(());
+    };
+    let Some(commit_sha) = latest.commit_sha.clone() else {
+        return Err(Error::InvalidSetting(
+            "not every task in scope is accepted".to_string(),
+        ));
+    };
+    if latest.status != "done" || latest.verdict.as_deref() != Some("accepted") {
+        return Err(Error::InvalidSetting(
+            "not every task in scope is accepted".to_string(),
+        ));
+    }
+    accepted.push(ScopedTask {
+        slug: latest.slug.clone(),
+        commit_sha,
+        base_sha: latest.base_sha.clone(),
+    });
     Ok(())
 }
 

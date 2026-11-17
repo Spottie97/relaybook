@@ -2660,6 +2660,344 @@ fn gated_refuses_when_origin_branch_exists() {
     assert_eq!(recorded["commit_sha"], json!(head));
 }
 
+const RELEASE_REVIEW_TEXT: &str = r#"{"findings":"none","security":"ok","tests_checked":"cargo test","not_checked":"none","prd_covered":true,"gaps":"none"}"#;
+
+#[test]
+fn release_review_requires_all_tasks_accepted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    seed_graph_task(dir.path());
+    run(dir.path(), ["task", "create", "old", "--title", "Old work"])
+        .assert()
+        .success();
+    let old = finish_task(dir.path(), &fake, "old", "old.txt");
+    git(dir.path(), &["checkout", "-b", "feature"]);
+    let head = finish_task(dir.path(), &fake, "auth", "work.txt");
+    assert_ne!(old, head);
+    assert_failure(
+        &fake_output(
+            dir.path(),
+            &fake,
+            "graph",
+            &["review", "start", "--release"],
+        ),
+        "not every task in scope is accepted",
+    );
+    assert!(release_reviews(dir.path()).is_empty());
+
+    run(dir.path(), ["task", "create", "notes", "--title", "Notes"])
+        .assert()
+        .success();
+    assert_failure(
+        &fake_output(
+            dir.path(),
+            &fake,
+            "graph",
+            &["review", "start", "--release"],
+        ),
+        "not every task in scope is accepted",
+    );
+    accept_task(dir.path(), &fake, "auth", &head);
+
+    let started = fake_data(
+        dir.path(),
+        &fake,
+        "affected-large",
+        ["review", "start", "--release", "--json"],
+    );
+    let base = git(dir.path(), &["merge-base", "main", "HEAD"]);
+    assert_eq!(base, old);
+    assert!(started["slug"].is_null());
+    assert_eq!(started["base_sha"], json!(base));
+    assert_eq!(started["commit_sha"], json!(head));
+    assert_eq!(started["range"], json!(format!("{base}..{head}")));
+    assert_eq!(started["graph_status"], json!("built"));
+    assert_eq!(started["graph_sha"], json!(head));
+    let tasks = started["tasks"].as_array().expect("tasks");
+    assert_eq!(tasks.len(), 1, "{tasks:?}");
+    assert_eq!(tasks[0]["slug"], json!("auth"));
+    assert_eq!(tasks[0]["commit_sha"], json!(head));
+    let context = started["graph_context"].as_str().expect("context");
+    assert_eq!(context.len(), 4000, "{context}");
+    assert!(context.ends_with("\n[truncated]"), "{context}");
+    let log = fake.log_text();
+    assert!(log.contains("affected work.txt"), "{log}");
+    assert!(!log.contains("extract"), "{log}");
+    assert_eq!(release_reviews(dir.path()).len(), 1);
+    assert_eq!(release_reviews(dir.path())[0].0, None);
+
+    assert_failure(
+        &record_release(dir.path(), "codex", &head, "approved", TASK_REVIEW_TEXT),
+        "review body is missing prd_covered",
+    );
+    assert_eq!(release_reviews(dir.path())[0].0, None);
+    let recorded = data_of(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "--release",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            RELEASE_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_eq!(recorded["scope"], json!("release"));
+    assert_eq!(recorded["verdict"], json!("approved"));
+    assert_eq!(recorded["commit_sha"], json!(head));
+    assert_eq!(recorded["base_sha"], json!(base));
+    assert!(recorded["task_id"].is_null());
+
+    let status = data_of(dir.path(), &["release", "status", "--json"]);
+    assert_eq!(status["release"], json!("release-reviewed"));
+    assert_eq!(status["commit_sha"], json!(head));
+    assert_eq!(status["branch"], json!("feature"));
+    assert!(status["authorization"].is_null());
+    assert_eq!(task_phase(&status["tasks"], "auth"), "accepted");
+    assert_eq!(task_phase(&status["tasks"], "old"), "implemented");
+    assert_eq!(task_phase(&status["tasks"], "notes"), "planned");
+
+    run(dir.path(), ["task", "create", "extra", "--title", "Extra"])
+        .assert()
+        .success();
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["task", "claim", "extra", "--by", "cursor", "--json"],
+    );
+    assert_failure(
+        &fake_output(
+            dir.path(),
+            &fake,
+            "graph",
+            &["review", "start", "--release"],
+        ),
+        "a task is claimed",
+    );
+    let rows = release_reviews(dir.path());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0.as_deref(), Some("approved"));
+}
+
+#[test]
+fn release_authorize_refuses_without_tty_or_wrong_sha() {
+    let classic = tempfile::tempdir().expect("tempdir");
+    run(classic.path(), ["init"]).assert().success();
+    assert_failure(
+        &relay_output(classic.path(), &["release", "authorize", "--sha", "abc"]),
+        "release authorize requires workflow=gated",
+    );
+    assert_failure(
+        &relay_output(classic.path(), &["release", "status"]),
+        "release status requires workflow=gated",
+    );
+    assert_failure(
+        &relay_output(classic.path(), &["review", "start", "--release"]),
+        "review start requires workflow=gated",
+    );
+    assert!(authorizations(classic.path()).is_empty());
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    fs::write(dir.path().join("scratch.txt"), "x\n").expect("scratch");
+    assert_failure(
+        &relay_output(dir.path(), &["release", "authorize", "--sha", &head]),
+        "working tree is not clean",
+    );
+    fs::remove_file(dir.path().join("scratch.txt")).expect("remove");
+    let other = git(dir.path(), &["rev-parse", "HEAD^"]);
+    assert_failure(
+        &relay_output(dir.path(), &["release", "authorize", "--sha", &other]),
+        "sha does not match HEAD",
+    );
+    assert_failure(
+        &relay_output(dir.path(), &["release", "authorize", "--sha", &head[..12]]),
+        "sha does not match HEAD",
+    );
+    git(
+        dir.path(),
+        &["update-ref", "refs/remotes/origin/feature", &head],
+    );
+    assert_failure(
+        &relay_output(dir.path(), &["release", "authorize", "--sha", &head]),
+        "refs/remotes/origin/feature exists",
+    );
+    git(
+        dir.path(),
+        &["update-ref", "-d", "refs/remotes/origin/feature"],
+    );
+    let output = command(dir.path())
+        .stdin(Stdio::null())
+        .args(["release", "authorize", "--sha", &head])
+        .output()
+        .expect("output");
+    assert_failure(&output, "release authorize requires confirmation at a TTY");
+    assert!(authorizations(dir.path()).is_empty());
+}
+
+#[test]
+fn commit_after_release_review_invalidates_signoff() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    let reviewed = data_of(dir.path(), &["release", "status", "--json"]);
+    assert_eq!(reviewed["release"], json!("release-reviewed"));
+    assert_eq!(reviewed["commit_sha"], json!(head));
+    assert!(reviewed["authorization"].is_null());
+
+    let authorized = authorize_at_tty(dir.path(), &fake, None, &head);
+    assert!(
+        authorized.success,
+        "code {} {}",
+        authorized.code, authorized.output
+    );
+    assert!(
+        authorized.output.contains(&format!("authorized {head}")),
+        "{}",
+        authorized.output
+    );
+    let signed = data_of(dir.path(), &["release", "status", "--json"]);
+    assert_eq!(signed["release"], json!("signed-off"));
+    assert_eq!(signed["authorization"]["commit_sha"], json!(head));
+    assert_eq!(
+        signed["authorization"]["authorized_by"],
+        json!("maintainer")
+    );
+    assert_eq!(authorizations(dir.path()), vec![head.clone()]);
+
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "user.email=relaybook@example.com",
+            "-c",
+            "user.name=Relaybook",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "after sign-off",
+        ],
+    );
+    let next = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_ne!(next, head);
+    let stale = data_of(dir.path(), &["release", "status", "--json"]);
+    assert!(stale["release"].is_null(), "{stale}");
+    assert!(stale["authorization"].is_null(), "{stale}");
+    assert_eq!(stale["commit_sha"], json!(next));
+    assert_eq!(authorizations(dir.path()), vec![head.clone()]);
+    assert_failure(
+        &relay_output(dir.path(), &["release", "authorize", "--sha", &head]),
+        "sha does not match HEAD",
+    );
+    assert_failure(
+        &relay_output(dir.path(), &["release", "authorize", "--sha", &next]),
+        "no approved release review",
+    );
+    assert_eq!(authorizations(dir.path()), vec![head]);
+}
+
+#[test]
+fn gated_manual_flow_never_pushes_or_calls_gh() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    install_gh(&fake);
+    let log = fake.outside("agent-log");
+    fs::create_dir_all(&log).expect("log");
+    seed_graph_task(dir.path());
+    let _origin = add_origin(dir.path());
+    git(dir.path(), &["checkout", "-b", "feature"]);
+
+    logged_ok(
+        dir.path(),
+        &fake,
+        &log,
+        &["graph", "refresh", "--step", "plan"],
+    );
+    logged_ok(
+        dir.path(),
+        &fake,
+        &log,
+        &["task", "claim", "auth", "--by", "cursor"],
+    );
+    fs::write(dir.path().join("work.txt"), "work\n").expect("work");
+    git(dir.path(), &["add", "work.txt"]);
+    commit_index(dir.path(), "do the work");
+    logged_ok(
+        dir.path(),
+        &fake,
+        &log,
+        &["task", "done", "auth", "--changed", "shipped"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    logged_ok(dir.path(), &fake, &log, &["review", "start", "auth"]);
+    logged_ok(
+        dir.path(),
+        &fake,
+        &log,
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ],
+    );
+    logged_ok(dir.path(), &fake, &log, &["report", "accept", "auth"]);
+    logged_ok(dir.path(), &fake, &log, &["review", "start", "--release"]);
+    logged_ok(
+        dir.path(),
+        &fake,
+        &log,
+        &[
+            "review",
+            "record",
+            "--release",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            RELEASE_REVIEW_TEXT,
+        ],
+    );
+    let authorized = authorize_at_tty(dir.path(), &fake, Some(&log), &head);
+    assert!(
+        authorized.success,
+        "code {} {}",
+        authorized.code, authorized.output
+    );
+    let status = logged_json(dir.path(), &fake, &log, &["release", "status", "--json"]);
+    assert_eq!(status["release"], json!("signed-off"));
+    assert_eq!(status["authorization"]["commit_sha"], json!(head));
+    assert_eq!(status["commit_sha"], json!(head));
+    assert!(!log.join("gh.args").exists(), "gh was invoked");
+    assert!(
+        rev_missing(dir.path(), "refs/remotes/origin/feature"),
+        "feature was published"
+    );
+    let origin_main = git(dir.path(), &["rev-parse", "refs/remotes/origin/main"]);
+    assert!(!origin_main.is_empty());
+    assert!(!fake.log_text().contains("extract"));
+}
+
 #[test]
 fn install_is_idempotent_and_keeps_existing_text() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -3330,4 +3668,279 @@ fn graph_builds(dir: &Path) -> Vec<(String, String, String)> {
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .expect("query");
     rows.collect::<Result<Vec<_>, _>>().expect("rows")
+}
+
+fn finish_task(dir: &Path, fake: &GraphifyFake, slug: &'static str, file: &'static str) -> String {
+    fake_data(
+        dir,
+        fake,
+        "graph",
+        ["task", "claim", slug, "--by", "cursor", "--json"],
+    );
+    fs::write(dir.join(file), "work\n").expect("work");
+    git(dir, &["add", file]);
+    commit_index(dir, slug);
+    let done = fake_data(
+        dir,
+        fake,
+        "graph",
+        ["task", "done", slug, "--changed", "shipped", "--json"],
+    );
+    let head = git(dir, &["rev-parse", "HEAD"]);
+    assert_eq!(done["commit_sha"], json!(head));
+    head
+}
+
+fn accept_task(dir: &Path, fake: &GraphifyFake, slug: &'static str, head: &str) {
+    fake_data(dir, fake, "graph", ["review", "start", slug, "--json"]);
+    let recorded = data_of(
+        dir,
+        &[
+            "review",
+            "record",
+            slug,
+            "--by",
+            "codex",
+            "--sha",
+            head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_eq!(recorded["verdict"], json!("approved"));
+    run(dir, ["report", "accept", slug]).assert().success();
+}
+
+fn release_reviewed(dir: &Path, fake: &GraphifyFake) -> String {
+    seed_graph_task(dir);
+    git(dir, &["checkout", "-b", "feature"]);
+    let head = finish_task(dir, fake, "auth", "work.txt");
+    accept_task(dir, fake, "auth", &head);
+    fake_data(
+        dir,
+        fake,
+        "graph",
+        ["review", "start", "--release", "--json"],
+    );
+    let recorded = data_of(
+        dir,
+        &[
+            "review",
+            "record",
+            "--release",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            RELEASE_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_eq!(recorded["verdict"], json!("approved"));
+    head
+}
+
+fn record_release(dir: &Path, by: &str, sha: &str, verdict: &str, text: &str) -> Output {
+    relay_output(
+        dir,
+        &[
+            "review",
+            "record",
+            "--release",
+            "--by",
+            by,
+            "--sha",
+            sha,
+            "--verdict",
+            verdict,
+            "--text",
+            text,
+        ],
+    )
+}
+
+fn release_reviews(dir: &Path) -> Vec<(Option<String>, String)> {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(db).expect("open");
+    let mut statement = conn
+        .prepare(
+            "SELECT verdict, commit_sha FROM reviews
+             WHERE scope = 'release'
+             ORDER BY id",
+        )
+        .expect("prepare");
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("rows");
+    rows.map(|row| row.expect("row")).collect()
+}
+
+fn authorizations(dir: &Path) -> Vec<String> {
+    let db = dir.join(".relaybook").join("ledger.db");
+    if !db.is_file() {
+        return Vec::new();
+    }
+    let conn = rusqlite::Connection::open(db).expect("open");
+    let mut statement = conn
+        .prepare("SELECT commit_sha FROM release_authorizations ORDER BY id")
+        .expect("prepare");
+    let rows = statement.query_map([], |row| row.get(0)).expect("rows");
+    rows.map(|row| row.expect("row")).collect()
+}
+
+fn task_phase(tasks: &Value, slug: &str) -> String {
+    tasks
+        .as_array()
+        .expect("tasks")
+        .iter()
+        .find(|task| task["slug"] == slug)
+        .unwrap_or_else(|| panic!("missing {slug} in {tasks}"))["phase"]
+        .as_str()
+        .expect("phase")
+        .to_string()
+}
+
+fn add_origin(dir: &Path) -> tempfile::TempDir {
+    let origin = tempfile::tempdir().expect("origin");
+    let path = origin.path().to_str().expect("utf8 origin");
+    git(dir, &["init", "--bare", "-b", "main", path]);
+    git(dir, &["remote", "add", "origin", path]);
+    git(dir, &["push", "origin", "main"]);
+    origin
+}
+
+fn install_gh(fake: &GraphifyFake) {
+    let bin = std::env::split_paths(&fake.path).next().expect("fake bin");
+    let dest = bin.join(if cfg!(windows) { "gh.exe" } else { "gh" });
+    fs::copy(env!("CARGO_BIN_EXE_fake"), &dest).expect("copy gh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&dest).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&dest, permissions).expect("chmod");
+    }
+}
+
+fn logged(dir: &Path, fake: &GraphifyFake, log: &Path, args: &[&str]) -> Output {
+    let mut cmd = command(dir);
+    fake.apply(&mut cmd, "graph");
+    cmd.env("LOG", log);
+    cmd.args(args).output().expect("output")
+}
+
+fn logged_ok(dir: &Path, fake: &GraphifyFake, log: &Path, args: &[&str]) {
+    let output = logged(dir, fake, log, args);
+    assert!(output.status.success(), "{}", summarize(&output));
+}
+
+fn logged_json(dir: &Path, fake: &GraphifyFake, log: &Path, args: &[&str]) -> Value {
+    let output = logged(dir, fake, log, args);
+    assert!(output.status.success(), "{}", summarize(&output));
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(envelope["ok"], json!(true), "{envelope}");
+    envelope["data"].clone()
+}
+
+fn rev_missing(dir: &Path, rev: &str) -> bool {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options", rev])
+        .output()
+        .expect("git");
+    !output.status.success()
+}
+
+struct PtyOutput {
+    success: bool,
+    code: u32,
+    output: String,
+}
+
+fn authorize_at_tty(dir: &Path, fake: &GraphifyFake, log: Option<&Path>, sha: &str) -> PtyOutput {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    use portable_pty::{
+        Child as PtyChild, ChildKiller, CommandBuilder, PtySize, native_pty_system,
+    };
+
+    let system = native_pty_system();
+    let pair = system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("pty");
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_relaybook"));
+    cmd.arg("release");
+    cmd.arg("authorize");
+    cmd.arg("--sha");
+    cmd.arg(sha);
+    cmd.cwd(dir);
+    cmd.env("PATH", &fake.path);
+    cmd.env("GRAPHIFY_LOG", &fake.log);
+    cmd.env("RELAYBOOK_FAKE_GRAPHIFY", "graph");
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
+    if let Some(log) = log {
+        cmd.env("LOG", log);
+    }
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("reader");
+    let mut writer = pair.master.take_writer().expect("writer");
+    let (send, recv) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 1024];
+        let mut sent = false;
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(count) => {
+                    buf.extend_from_slice(&tmp[..count]);
+                    if !sent && buf.windows(5).any(|window| window == b"[y/N]") {
+                        let _ = writer.write_all(b"y\n");
+                        let _ = writer.flush();
+                        sent = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = send.send(buf);
+    });
+    let started = Instant::now();
+    let status = loop {
+        match PtyChild::try_wait(child.as_mut()) {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(20) => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = ChildKiller::kill(child.as_mut());
+                panic!("timed out waiting for release authorize");
+            }
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    };
+    let buf = recv
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    PtyOutput {
+        success: status.success(),
+        code: status.exit_code(),
+        output: String::from_utf8_lossy(&buf).into_owned(),
+    }
 }

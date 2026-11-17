@@ -671,6 +671,7 @@ fn record_review_revalidate_holds_the_write_lock_and_rolls_back() {
             "changes_requested",
             body,
             false,
+            None,
             move || {
                 let conn = rusqlite::Connection::open(&db).expect("open");
                 conn.busy_timeout(std::time::Duration::from_millis(0))

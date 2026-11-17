@@ -16,7 +16,7 @@ mod settings;
 pub use error::Error;
 pub use ledger::{
     Absorb, AnchoredClaim, ClaimAnchor, GraphBuild, Ledger, ReleaseAuthorization, Review,
-    TaskReport,
+    ScopedTask, TaskReport,
 };
 pub use legacy::{LegacyMove, migrate_legacy_ledger};
 pub use model::{
