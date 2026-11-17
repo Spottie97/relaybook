@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -15,16 +16,21 @@ fn empty_sections() -> Sections {
     }
 }
 use crate::error::Error;
-use crate::migrate::migrate;
+use crate::migrate::{apply_current_schema, ensure_guards, migrate, newer_ledger, user_version};
 use crate::model::{
     Context, Decision, Event, EventKind, Status, Step, Task, TaskDetail, checked_slug,
     required_text,
 };
-use crate::schema::{SCHEMA, SCHEMA_VERSION};
+use crate::schema::SCHEMA_VERSION;
+
+thread_local! {
+    static REPORT_RESTORED_GUARD: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Open SQLite ledger. Projection tables hold current state; `events` is insert-only.
 pub struct Ledger {
     conn: Connection,
+    guards_restored: bool,
 }
 
 /// One row of `reviews`. `verdict` is empty while the review is pending.
@@ -129,25 +135,50 @@ impl Ledger {
         configure(&conn)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         if fresh {
-            conn.execute_batch(SCHEMA)?;
+            apply_current_schema(&conn)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         migrate(&mut conn)?;
-        Ok(Self { conn })
+        let guards_restored = note_guards(&conn)?;
+        Ok(Self {
+            conn,
+            guards_restored,
+        })
     }
 
     pub fn open(path: &std::path::Path) -> Result<Self, Error> {
         let mut conn = Connection::open(path)?;
         configure(&conn)?;
         migrate(&mut conn)?;
-        Ok(Self { conn })
+        let guards_restored = note_guards(&conn)?;
+        Ok(Self {
+            conn,
+            guards_restored,
+        })
     }
 
-    /// Open without migrating. Used by the prompt hook, which must stay read-only.
+    /// Open without migrating. A ledger newer than this binary is refused.
+    /// Read-only opens do not restore triggers.
     pub fn open_readonly(path: &std::path::Path) -> Result<Self, Error> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         configure(&conn)?;
-        Ok(Self { conn })
+        if user_version(&conn)? > SCHEMA_VERSION {
+            return Err(newer_ledger());
+        }
+        Ok(Self {
+            conn,
+            guards_restored: false,
+        })
+    }
+
+    /// This open recreated at least one missing guard trigger.
+    pub fn guards_restored(&self) -> bool {
+        self.guards_restored
+    }
+
+    /// A gated open in this process recreated missing guard triggers.
+    pub fn reported_restored_guard() -> bool {
+        REPORT_RESTORED_GUARD.with(Cell::get)
     }
 
     pub fn create_task(&mut self, slug: &str, title: &str) -> Result<Task, Error> {
@@ -649,15 +680,18 @@ impl Ledger {
         crate::runs::resumable(&self.conn)
     }
 
+    /// Start a run. `workflow` is stored on the row. Gated runs pass `Some("gated")`
+    /// so the insert guard allows them. `None` stores NULL.
     pub fn start_run(
         &mut self,
         prd_path: &str,
         prd_sha256: &str,
         branch: &str,
+        workflow: Option<&str>,
     ) -> Result<crate::runs::Run, Error> {
         self.transaction(|conn| {
             let ts = now(conn)?;
-            crate::runs::insert(conn, prd_path, prd_sha256, branch, &ts)
+            crate::runs::insert(conn, prd_path, prd_sha256, branch, &ts, workflow)
         })
     }
 
@@ -1573,6 +1607,18 @@ fn report_graph_sha(conn: &Connection, slug: &str) -> Result<Option<String>, Err
         )
         .optional()?;
     Ok(sha.flatten())
+}
+
+fn note_guards(conn: &Connection) -> Result<bool, Error> {
+    let restored = ensure_guards(conn)?;
+    if restored
+        && crate::settings::load(conn)
+            .map(|settings| settings.workflow == "gated")
+            .unwrap_or(false)
+    {
+        REPORT_RESTORED_GUARD.with(|flag| flag.set(true));
+    }
+    Ok(restored)
 }
 
 fn configure(conn: &Connection) -> Result<(), Error> {
@@ -2617,7 +2663,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let deps: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'task_deps'",
@@ -2633,7 +2679,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let stored_again: String = conn
             .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
                 row.get(0)
@@ -2688,7 +2734,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     #[test]
@@ -2742,6 +2788,6 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 }

@@ -38,14 +38,11 @@ pub(crate) fn execute() -> ExitCode {
     }
     match dispatch(cli) {
         Ok(outcome) => {
+            let data = attach_restored_guard(outcome.data);
             if json {
                 print!(
                     "{}",
-                    envelope(
-                        outcome.code == 0,
-                        Some(&outcome.data),
-                        outcome.error.as_deref()
-                    )
+                    envelope(outcome.code == 0, Some(&data), outcome.error.as_deref())
                 );
             } else {
                 print!("{}", outcome.human);
@@ -54,13 +51,36 @@ pub(crate) fn execute() -> ExitCode {
         }
         Err(err) => {
             if json {
-                print!("{}", envelope(false, None, Some(&err.to_string())));
+                print!(
+                    "{}",
+                    envelope(
+                        false,
+                        restored_guard_data().as_ref(),
+                        Some(&err.to_string())
+                    )
+                );
             } else {
                 eprintln!("{err}");
             }
             ExitCode::from(err.code())
         }
     }
+}
+
+fn attach_restored_guard(mut data: serde_json::Value) -> serde_json::Value {
+    if Ledger::reported_restored_guard()
+        && let Some(map) = data.as_object_mut()
+    {
+        map.insert(
+            "ledger_guard".to_string(),
+            serde_json::Value::String("restored".to_string()),
+        );
+    }
+    data
+}
+
+fn restored_guard_data() -> Option<serde_json::Value> {
+    Ledger::reported_restored_guard().then(|| serde_json::json!({ "ledger_guard": "restored" }))
 }
 
 #[derive(Parser)]

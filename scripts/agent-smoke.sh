@@ -47,6 +47,175 @@ run_graphify() {
   run_in_repo "$graph" "$graph_home" "$@"
 }
 
+# Build 0.3.3 and check schema 8 guards. Not part of CI.
+# Classic run --prd is capped with timeout: it must get past the insert and
+# must not print the guard. It does not have to finish the agent loop.
+# Classic run --resume stays in manual mode, so 0.3.3 saves the run and then
+# stops with "mode is manual". Gated run commands must print the guard.
+# Reaching a run statement needs the signed-in claude and Cursor CLI that the
+# rest of this smoke already requires, because 0.3.3 preflight runs first.
+smoke_schema_v8() {
+  _root=$1
+  _new=$2
+  _guard="workflow=gated: this ledger needs relaybook 0.4.0 or later (schema 8)"
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "sqlite3 is not on PATH" >&2
+    exit 1
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "timeout is not on PATH" >&2
+    exit 1
+  fi
+  _sqlver=$(sqlite3 -version | awk '{print $1}')
+  if [ "$_sqlver" != "3.45.1" ]; then
+    echo "sqlite3 is $_sqlver, want 3.45.1" >&2
+    exit 1
+  fi
+  oldsrc=$(mktemp -d)
+  rmdir "$oldsrc"
+  echo "schema v8: building 0.3.3 at c25c29f"
+  git -C "$_root" worktree add --detach "$oldsrc" c25c29f
+  (
+    cd "$oldsrc" || exit 1
+    CARGO_TARGET_DIR="$oldsrc/target" cargo build -q --bin relaybook
+  )
+  _old="$oldsrc/target/debug/relaybook"
+  _gated=$(mktemp -d)
+  _classic=$(mktemp -d)
+  _out=$(mktemp)
+  _err=$(mktemp)
+  init_throwaway "$_gated" ""
+  init_throwaway "$_classic" ""
+  printf '# prd\n' > "$_gated/prd.md"
+  printf '# prd\n' > "$_classic/prd.md"
+  run_in_repo "$_gated" "" git add prd.md
+  run_in_repo "$_gated" "" git commit -q -m "prd"
+  run_in_repo "$_classic" "" git add prd.md
+  run_in_repo "$_classic" "" git commit -q -m "prd"
+
+  run_in_repo "$_gated" "" "$_new" init
+  run_in_repo "$_gated" "" "$_new" config set reviewer codex
+  run_in_repo "$_gated" "" "$_new" config set workflow gated
+  _db="$_gated/.relaybook/ledger.db"
+  _triggers=$(sqlite3 "$_db" "SELECT count(*) FROM sqlite_master WHERE type='trigger';")
+  if [ "$_triggers" != "5" ]; then
+    echo "sqlite3 3.45.1 saw $_triggers triggers, want 5" >&2
+    exit 1
+  fi
+  sqlite3 "$_db" "SELECT count(*) FROM tasks;" >/dev/null
+  run_in_repo "$_gated" "" "$_old" task create auth --title "Add auth"
+  sqlite3 "$_db" "UPDATE tasks SET status='claimed', claimed_by='cursor' WHERE slug='auth';"
+  _rc=0
+  run_in_repo "$_gated" "" "$_old" task done auth --no-report >"$_out" 2>"$_err" || _rc=$?
+  if [ "$_rc" -eq 0 ] || { ! grep -F -q "$_guard" "$_out" && ! grep -F -q "$_guard" "$_err"; }; then
+    echo "gated task done did not fail with the guard" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  _status=$(sqlite3 "$_db" "SELECT status FROM tasks WHERE slug='auth';")
+  if [ "$_status" != "claimed" ]; then
+    echo "gated task done changed status to $_status" >&2
+    exit 1
+  fi
+  sqlite3 "$_db" "INSERT INTO reports (task_id, kind, author, body, bytes, created_at, commit_sha) SELECT id, 'task', 'cursor', '{}', 2, '2026-01-01T00:00:00.000Z', 'abc' FROM tasks WHERE slug='auth';"
+  _rc=0
+  run_in_repo "$_gated" "" "$_old" report accept auth >"$_out" 2>"$_err" || _rc=$?
+  if [ "$_rc" -eq 0 ] || { ! grep -F -q "$_guard" "$_out" && ! grep -F -q "$_guard" "$_err"; }; then
+    echo "gated report accept did not fail with the guard" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  _verdict=$(sqlite3 "$_db" "SELECT coalesce(verdict, '') FROM reports WHERE kind='task' ORDER BY id DESC LIMIT 1;")
+  if [ -n "$_verdict" ]; then
+    echo "gated report accept stored verdict $_verdict" >&2
+    exit 1
+  fi
+  run_in_repo "$_gated" "" "$_new" mode auto
+  _rc=0
+  run_in_repo "$_gated" "" timeout 90 "$_old" run --prd prd.md >"$_out" 2>"$_err" || _rc=$?
+  if [ "$_rc" -eq 0 ] || { ! grep -F -q "$_guard" "$_out" && ! grep -F -q "$_guard" "$_err"; }; then
+    echo "gated run --prd did not fail with the guard" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  _runs=$(sqlite3 "$_db" "SELECT count(*) FROM runs;")
+  if [ "$_runs" != "0" ]; then
+    echo "gated run --prd left $_runs run rows" >&2
+    exit 1
+  fi
+  sqlite3 "$_db" "INSERT INTO runs (prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd, status, started_at, failure_streak, complete_requested, workflow, write_stamp) VALUES ('prd.md', 'abc', 'main', 'plan', 0, 0, 0, 'paused', '2026-01-01T00:00:00.000Z', 0, 0, 'gated', 0);"
+  _rc=0
+  run_in_repo "$_gated" "" timeout 90 "$_old" run --resume >"$_out" 2>"$_err" || _rc=$?
+  if [ "$_rc" -eq 0 ] || { ! grep -F -q "$_guard" "$_out" && ! grep -F -q "$_guard" "$_err"; }; then
+    echo "gated run --resume did not fail with the guard" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  _status=$(sqlite3 "$_db" "SELECT status FROM runs ORDER BY id DESC LIMIT 1;")
+  if [ "$_status" != "paused" ]; then
+    echo "gated run --resume changed status to $_status" >&2
+    exit 1
+  fi
+  sqlite3 "$_db" "SELECT count(*) FROM tasks;" >/dev/null
+
+  run_in_repo "$_classic" "" "$_new" init
+  run_in_repo "$_classic" "" "$_old" task create auth --title "Add auth"
+  run_in_repo "$_classic" "" "$_old" task claim auth --by cursor
+  _rc=0
+  run_in_repo "$_classic" "" "$_old" task done auth --no-report >"$_out" 2>"$_err" || _rc=$?
+  if [ "$_rc" -ne 0 ] || grep -F -q "$_guard" "$_out" || grep -F -q "$_guard" "$_err"; then
+    echo "classic task done failed" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  _rc=0
+  run_in_repo "$_classic" "" "$_old" report accept auth >"$_out" 2>"$_err" || _rc=$?
+  if [ "$_rc" -ne 0 ] || grep -F -q "$_guard" "$_out" || grep -F -q "$_guard" "$_err"; then
+    echo "classic report accept failed" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  run_in_repo "$_classic" "" "$_new" mode auto
+  _cdb="$_classic/.relaybook/ledger.db"
+  _rc=0
+  run_in_repo "$_classic" "" timeout 45 "$_old" run --prd prd.md >"$_out" 2>"$_err" || _rc=$?
+  if grep -F -q "$_guard" "$_out" || grep -F -q "$_guard" "$_err"; then
+    echo "classic run --prd hit the guard" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  _runs=$(sqlite3 "$_cdb" "SELECT count(*) FROM runs;")
+  if [ "$_runs" = "0" ]; then
+    echo "classic run --prd did not insert a run (rc $_rc)" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  sqlite3 "$_cdb" "UPDATE runs SET status='paused', stop_reason=NULL WHERE id = (SELECT id FROM runs ORDER BY id DESC LIMIT 1);"
+  run_in_repo "$_classic" "" "$_new" mode manual
+  _rc=0
+  run_in_repo "$_classic" "" timeout 90 "$_old" run --resume >"$_out" 2>"$_err" || _rc=$?
+  if grep -F -q "$_guard" "$_out" || grep -F -q "$_guard" "$_err"; then
+    echo "classic run --resume hit the guard" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  if ! grep -F -q "mode is manual" "$_out" && ! grep -F -q "mode is manual" "$_err"; then
+    echo "classic run --resume did not reach the manual stop (rc $_rc)" >&2
+    cat "$_out" "$_err" >&2
+    exit 1
+  fi
+  _status=$(sqlite3 "$_cdb" "SELECT status FROM runs ORDER BY id DESC LIMIT 1;")
+  if [ "$_status" = "paused" ]; then
+    echo "classic run --resume left the run paused" >&2
+    exit 1
+  fi
+  git -C "$_root" worktree remove --force "$oldsrc"
+  oldsrc=
+  rm -rf "$_gated" "$_classic"
+  rm -f "$_out" "$_err"
+  echo "schema v8: 0.3.3 guards and sqlite3 3.45.1 ok"
+}
+
 if [ "${RELAYBOOK_SMOKE_LIB:-}" = 1 ]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -78,8 +247,10 @@ fi
 work=$(mktemp -d)
 graph=$(mktemp -d)
 graph_home=$(mktemp -d)
+oldsrc=
 cleanup() {
-  rm -rf "$work" "$graph" "$graph_home"
+  rm -rf "$work" "$graph" "$graph_home" "$oldsrc" ${_gated:+"$_gated"} ${_classic:+"$_classic"}
+  rm -f ${_out:+"$_out"} ${_err:+"$_err"}
 }
 trap cleanup EXIT
 
@@ -91,6 +262,15 @@ export PATH
 # The graphify phase uses a temporary HOME. The agent phase keeps the
 # caller's HOME. The optional build above writes under this checkout.
 clear_git_repo_env
+
+cleanup() {
+  if [ -n "${oldsrc:-}" ]; then
+    git -C "$root" worktree remove --force "$oldsrc" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$work" "$graph" "$graph_home" "$oldsrc" ${_gated:+"$_gated"} ${_classic:+"$_classic"}
+  rm -f ${_out:+"$_out"} ${_err:+"$_err"}
+}
+trap cleanup EXIT
 
 init_throwaway "$graph" "$graph_home"
 mkdir -p "$graph/src"
@@ -163,6 +343,8 @@ if [ "$still" != "$before" ]; then
   exit 1
 fi
 echo "graphify: driver kept, CLAUDE.md warned, dry-run listed side effects"
+
+smoke_schema_v8 "$root" "$relaybook"
 
 init_throwaway "$work" ""
 cd "$work" || exit 1

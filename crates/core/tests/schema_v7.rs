@@ -82,7 +82,7 @@ fn fresh_ledger_is_schema_v7() {
     let (_dir, path) = fresh_path();
     let ledger = Ledger::initialize(&path).expect("init");
     drop(ledger);
-    assert_eq!(user_version(&path), 7);
+    assert_eq!(user_version(&path), 8);
     assert_v7_tables(&path);
     insert_v6_report(&path, "orca", r#"{"text":"hi"}"#);
 }
@@ -96,7 +96,7 @@ fn empty_database_migrates_to_v7() {
         .ok();
     let ledger = Ledger::open(&path).expect("migrate");
     drop(ledger);
-    assert_eq!(user_version(&path), 7);
+    assert_eq!(user_version(&path), 8);
     assert_v7_tables(&path);
     insert_v6_report(&path, "orca", r#"{"text":"hi"}"#);
 }
@@ -138,7 +138,7 @@ fn v1_ledger_migrates_to_v7_without_changing_events() {
     }
     let ledger = Ledger::open(&path).expect("migrate");
     drop(ledger);
-    assert_eq!(user_version(&path), 7);
+    assert_eq!(user_version(&path), 8);
     assert_v7_tables(&path);
     let conn = Connection::open(&path).expect("reopen");
     let stored: (i64, String) = conn
@@ -219,7 +219,7 @@ fn v6_ledger_migrates_to_v7_with_payloads_unchanged() {
 
     let ledger = Ledger::open(&path).expect("migrate");
     drop(ledger);
-    assert_eq!(user_version(&path), 7);
+    assert_eq!(user_version(&path), 8);
     assert_v7_tables(&path);
 
     let conn = Connection::open(&path).expect("reopen");
@@ -263,7 +263,7 @@ fn v6_ledger_migrates_to_v7_with_payloads_unchanged() {
     insert_v6_report(&path, "orca", r#"{"text":"still works"}"#);
     let ledger = Ledger::open(&path).expect("second open");
     drop(ledger);
-    assert_eq!(user_version(&path), 7);
+    assert_eq!(user_version(&path), 8);
     let conn = Connection::open(&path).expect("reopen");
     let again: String = conn
         .query_row("SELECT body FROM reports WHERE id = 9", [], |row| {
@@ -485,7 +485,7 @@ fn readonly_v7_context_returns_review_and_graph_sha() {
     assert!(review["verdict"].is_null());
     assert_eq!(ctx.graph_sha.as_deref(), Some("graphsha"));
     drop(ledger);
-    assert_eq!(user_version(&path), 7);
+    assert_eq!(user_version(&path), 8);
 }
 
 #[test]

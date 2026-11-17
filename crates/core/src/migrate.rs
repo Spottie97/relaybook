@@ -2,13 +2,16 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::Error;
 use crate::schema::{
-    MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4, MIGRATE_V5_TO_V6, MIGRATE_V6_TO_V7,
-    SCHEMA, SCHEMA_VERSION,
+    GUARD_MESSAGE, GUARD_NAMES, GUARDS, MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4,
+    MIGRATE_V5_TO_V6, MIGRATE_V6_TO_V7, MIGRATE_V7_TO_V8, SCHEMA, SCHEMA_VERSION,
 };
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version >= SCHEMA_VERSION {
+    let version = user_version(conn)?;
+    if version > SCHEMA_VERSION {
+        return Err(newer_ledger());
+    }
+    if version == SCHEMA_VERSION {
         return Ok(());
     }
     let has_events = conn
@@ -20,7 +23,7 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
         .optional()?
         .is_some();
     if !has_events {
-        conn.execute_batch(SCHEMA)?;
+        apply_current_schema(conn)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         return Ok(());
     }
@@ -61,9 +64,82 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
         }
         tx.execute_batch(MIGRATE_V6_TO_V7)?;
     }
+    if version < 8 {
+        if table_exists(&tx, "runs")? && !column_exists(&tx, "runs", "workflow")? {
+            tx.execute("ALTER TABLE runs ADD COLUMN workflow TEXT", [])?;
+        }
+        if table_exists(&tx, "runs")? && !column_exists(&tx, "runs", "write_stamp")? {
+            tx.execute(
+                "ALTER TABLE runs ADD COLUMN write_stamp INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if table_exists(&tx, "release_authorizations")?
+            && !column_exists(&tx, "release_authorizations", "method")?
+        {
+            tx.execute(
+                "ALTER TABLE release_authorizations ADD COLUMN method TEXT",
+                [],
+            )?;
+        }
+        if table_exists(&tx, "release_authorizations")?
+            && !column_exists(&tx, "release_authorizations", "evidence")?
+        {
+            tx.execute(
+                "ALTER TABLE release_authorizations ADD COLUMN evidence TEXT",
+                [],
+            )?;
+        }
+        tx.execute_batch(MIGRATE_V7_TO_V8)?;
+        tx.execute_batch(GUARDS)?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
+}
+
+pub(crate) fn apply_current_schema(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(SCHEMA)?;
+    conn.execute_batch(GUARDS)?;
+    Ok(())
+}
+
+pub(crate) fn user_version(conn: &Connection) -> Result<i64, Error> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+pub(crate) fn newer_ledger() -> Error {
+    Error::InvalidSetting("this ledger needs a newer relaybook".to_string())
+}
+
+/// Recreate any missing schema-8 trigger. Returns whether one was missing.
+pub(crate) fn ensure_guards(conn: &Connection) -> Result<bool, Error> {
+    debug_assert!(
+        GUARDS.contains(GUARD_MESSAGE),
+        "guard SQL must raise {GUARD_MESSAGE}"
+    );
+    let mut missing = false;
+    for name in GUARD_NAMES {
+        if !trigger_exists(conn, name)? {
+            missing = true;
+            break;
+        }
+    }
+    if missing {
+        conn.execute_batch(GUARDS)?;
+    }
+    Ok(missing)
+}
+
+fn trigger_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+            [name],
+            |_| Ok(1_i64),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 fn table_exists(conn: &Connection, name: &str) -> Result<bool, Error> {

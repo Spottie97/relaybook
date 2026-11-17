@@ -174,7 +174,12 @@ fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Resul
     sync_main(cwd)?;
     git(cwd, &["checkout", "-B", &branch, "main"])?;
     let run = ledger
-        .start_run(&prd_path, &digest, &branch)
+        .start_run(
+            &prd_path,
+            &digest,
+            &branch,
+            Some(settings.workflow.as_str()),
+        )
         .map_err(|err| err.to_string())?;
     if !new_only {
         let adopted = match adopt_existing(&mut ledger, run.id) {

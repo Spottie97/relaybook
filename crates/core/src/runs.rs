@@ -74,13 +74,14 @@ pub fn insert(
     prd_sha256: &str,
     branch: &str,
     started_at: &str,
+    workflow: Option<&str>,
 ) -> Result<Run, Error> {
     conn.execute(
         "INSERT INTO runs (
             prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd,
-            status, started_at, failure_streak, complete_requested
-         ) VALUES (?1, ?2, ?3, 'plan', 0, 0, 0, 'active', ?4, 0, 0)",
-        params![prd_path, prd_sha256, branch, started_at],
+            status, started_at, failure_streak, complete_requested, workflow
+         ) VALUES (?1, ?2, ?3, 'plan', 0, 0, 0, 'active', ?4, 0, 0, ?5)",
+        params![prd_path, prd_sha256, branch, started_at, workflow],
     )?;
     load(conn, conn.last_insert_rowid())
 }
@@ -89,7 +90,8 @@ pub fn save(conn: &Connection, run: &Run) -> Result<(), Error> {
     conn.execute(
         "UPDATE runs SET
             stage = ?1, cycle = ?2, agent_calls = ?3, est_cost_usd = ?4, status = ?5,
-            stop_reason = ?6, failure_streak = ?7, current_slug = ?8, complete_requested = ?9
+            stop_reason = ?6, failure_streak = ?7, current_slug = ?8, complete_requested = ?9,
+            write_stamp = write_stamp + 1
          WHERE id = ?10",
         params![
             run.stage,
