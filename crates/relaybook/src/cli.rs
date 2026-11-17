@@ -1138,9 +1138,9 @@ fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
     let checkout = gate::prepare_authorize(&ledger, cwd, sha)?;
     match gate::screen_publish(&mut ledger, &checkout.root, "authorize")? {
         gate::PublishScreen::Present(message) => return Err(invalid_setting(message)),
-        gate::PublishScreen::Unknown(_) => {
+        gate::PublishScreen::Unknown { check_id, .. } => {
             confirm_without_remote()?;
-            ledger.set_latest_remote_override()?;
+            ledger.set_remote_check_override(check_id)?;
         }
         gate::PublishScreen::Clear => {}
     }

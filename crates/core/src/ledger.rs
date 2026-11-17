@@ -651,7 +651,8 @@ impl Ledger {
         })
     }
 
-    pub fn record_remote_check(&mut self, draft: &RemoteCheckDraft) -> Result<(), Error> {
+    /// Inserts one check and returns its row id.
+    pub fn record_remote_check(&mut self, draft: &RemoteCheckDraft) -> Result<i64, Error> {
         match draft.status.as_str() {
             "absent" | "present" | "unknown" | "local" => {}
             _ => {
@@ -678,7 +679,7 @@ impl Ledger {
                     ts
                 ],
             )?;
-            Ok(())
+            Ok(conn.last_insert_rowid())
         })
     }
 
@@ -708,12 +709,25 @@ impl Ledger {
         Ok(row)
     }
 
-    pub fn set_latest_remote_override(&mut self) -> Result<(), Error> {
+    /// Marks one check as the authorization that proceeded without a remote query.
+    ///
+    /// The id is the row recorded for that confirmation. Updating the newest
+    /// row would attach the override to a check inserted while the prompt waited.
+    pub fn set_remote_check_override(&mut self, id: i64) -> Result<(), Error> {
         self.transaction(|conn| {
+            let exists: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM remote_checks WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )?;
+            if exists != 1 {
+                return Err(Error::InvalidSetting(
+                    "remote check to override was not found".to_string(),
+                ));
+            }
             conn.execute(
-                "UPDATE remote_checks SET override = 1
-                 WHERE id = (SELECT MAX(id) FROM remote_checks)",
-                [],
+                "UPDATE remote_checks SET override = 1 WHERE id = ?1",
+                params![id],
             )?;
             Ok(())
         })

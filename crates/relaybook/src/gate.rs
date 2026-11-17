@@ -489,7 +489,7 @@ pub(crate) fn recheck_review_record(
 pub(crate) enum PublishScreen {
     Clear,
     Present(String),
-    Unknown(String),
+    Unknown { message: String, check_id: i64 },
 }
 
 pub(crate) fn screen_publish(
@@ -499,7 +499,7 @@ pub(crate) fn screen_publish(
 ) -> Result<PublishScreen, Error> {
     let mode = ledger.settings()?.remote_check;
     let view = crate::remote::screen(root, &mode)?;
-    ledger.record_remote_check(&relaybook_core::RemoteCheckDraft {
+    let check_id = ledger.record_remote_check(&relaybook_core::RemoteCheckDraft {
         context: context.to_string(),
         branch: view.branch.clone(),
         head_sha: view.head_sha.clone(),
@@ -512,10 +512,12 @@ pub(crate) fn screen_publish(
         "present" => Ok(PublishScreen::Present(
             view.message.unwrap_or_else(|| "published".to_string()),
         )),
-        "unknown" => Ok(PublishScreen::Unknown(
-            view.message
+        "unknown" => Ok(PublishScreen::Unknown {
+            message: view
+                .message
                 .unwrap_or_else(|| "remote check failed".to_string()),
-        )),
+            check_id,
+        }),
         _ => Ok(PublishScreen::Clear),
     }
 }
@@ -527,7 +529,7 @@ pub(crate) fn require_unpublished(
 ) -> Result<(), Error> {
     match screen_publish(ledger, root, context)? {
         PublishScreen::Clear => Ok(()),
-        PublishScreen::Present(message) | PublishScreen::Unknown(message) => {
+        PublishScreen::Present(message) | PublishScreen::Unknown { message, .. } => {
             Err(Error::InvalidSetting(message))
         }
     }

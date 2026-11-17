@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,7 +52,7 @@ pub(crate) fn screen(root: &Path, remote_check: &str) -> Result<RemoteView, Erro
     let branch = require_branch(root)?;
     let head = gitinfo::verified_head(root)
         .ok_or_else(|| Error::InvalidSetting("a commit at HEAD is required".to_string()))?;
-    let interesting = interesting_commits(root, &head);
+    let range = interesting_commits(root, &head);
     let local = local_refs(root)?;
     let listed = remote_names(root);
     let remotes = listed.as_ref().cloned().unwrap_or_default();
@@ -61,16 +61,31 @@ pub(crate) fn screen(root: &Path, remote_check: &str) -> Result<RemoteView, Erro
         .filter_map(|name| fetch_url(root, name).map(|url| (name.clone(), url)))
         .collect();
     let push_differs = remotes.iter().any(|name| push_url_differs(root, name));
+    let empty = BTreeSet::new();
+    let interesting = range.as_ref().unwrap_or(&empty);
     let check = Check {
         branch: &branch,
         head: &head,
-        interesting: &interesting,
+        interesting,
         local: &local,
         online: &[],
         local_only: remote_check == "local",
         push_differs,
         urls: &urls,
     };
+    if let Err(message) = &range {
+        // Branch-name evidence does not need the commit list. Anything else
+        // must not be reported as absent when that list could not be built.
+        if let Some((remote, hit)) = local_hit(&branch, interesting, &local, None) {
+            return Ok(finish(&check, remote, "present", Some(hit)));
+        }
+        return Ok(finish(
+            &check,
+            None,
+            "unknown",
+            Some(format!("remote check failed: {message}")),
+        ));
+    }
     if remote_check == "local" {
         return Ok(decide(&check));
     }
@@ -112,7 +127,7 @@ struct Check<'a> {
 pub(crate) fn refuse_local(root: &Path) -> Result<(), Error> {
     let branch = require_branch(root)?;
     let interesting = match gitinfo::verified_head(root) {
-        Some(head) => interesting_commits(root, &head),
+        Some(head) => interesting_commits(root, &head).map_err(Error::InvalidSetting)?,
         None => BTreeSet::new(),
     };
     let local = local_refs(root)?;
@@ -125,17 +140,16 @@ pub(crate) fn refuse_local(root: &Path) -> Result<(), Error> {
 /// Release-range commits, plus `HEAD`.
 ///
 /// The range excludes the merge base, so an already published `main` does not
-/// by itself mark a feature branch published. `HEAD` is added because that
-/// range is empty when the branch is `main`: a tip commit pushed under another
-/// name would otherwise be invisible. If `main` cannot be resolved, only
-/// `HEAD` is used and the branch-name rule still applies.
-fn interesting_commits(root: &Path, head: &str) -> BTreeSet<String> {
+/// by itself mark a feature branch published. `HEAD` is included because that
+/// range is empty when the branch is `main`. A missing `main` or a failed
+/// `rev-list` is an error: checking only `HEAD` would hide an earlier commit
+/// published under another name.
+fn interesting_commits(root: &Path, head: &str) -> Result<BTreeSet<String>, String> {
+    let range = gitinfo::release_range(root)?;
     let mut commits = BTreeSet::from([head.to_string()]);
-    if let Ok(range) = gitinfo::release_range(root) {
-        commits.extend(range.commits);
-        commits.insert(range.head);
-    }
-    commits
+    commits.extend(range.commits);
+    commits.insert(range.head);
+    Ok(commits)
 }
 
 fn decide(check: &Check<'_>) -> RemoteView {
@@ -203,12 +217,7 @@ fn detail(
     }
     let mut text = lines.join("\n");
     text.push('\n');
-    if text.len() > 4000 {
-        text.truncate(4000);
-        while !text.is_char_boundary(text.len()) {
-            text.pop();
-        }
-    }
+    truncate_utf8(&mut text, 4000);
     text
 }
 
@@ -357,42 +366,153 @@ fn ls_remote(root: &Path, name: &str) -> LsRemote {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("GIT_TERMINAL_PROMPT", "0");
+    // Own process group so the timeout can signal git and helpers it spawned.
+    // A helper that calls setsid escapes that group; pipe reads are still bounded.
+    isolate_process_group(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => return LsRemote::Failed(err.to_string()),
     };
+    let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_thread = thread::spawn(move || read_pipe(stdout));
     let stderr_thread = thread::spawn(move || read_pipe(stderr));
-    let timeout = remote_timeout();
-    let started = Instant::now();
+    let deadline = Instant::now() + remote_timeout();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stderr = join_lossy(stderr_thread);
-                return match join_utf8(stdout_thread) {
-                    Some(stdout) if status.success() => LsRemote::Ok(stdout),
-                    Some(_) => LsRemote::Failed(stderr),
-                    None => LsRemote::Failed(stderr),
-                };
+                let (stdout, stderr) = collect_output(stdout_thread, stderr_thread, deadline);
+                return classify_exit(status.success(), stdout, stderr);
             }
-            Ok(None) if started.elapsed() >= timeout => {
+            Ok(None) if Instant::now() >= deadline => {
+                // Kill while this pid is still the live group leader. Reaping
+                // first would let that pid be reused before the group signal.
+                stop_process_group(pid);
                 let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
+                reap_child(&mut child, Duration::from_millis(500));
+                abandon_output(stdout_thread, stderr_thread, Duration::from_millis(300));
                 return LsRemote::TimedOut;
             }
             Ok(None) => thread::sleep(Duration::from_millis(50)),
             Err(err) => {
+                stop_process_group(pid);
                 let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
+                reap_child(&mut child, Duration::from_millis(500));
+                abandon_output(stdout_thread, stderr_thread, Duration::from_millis(300));
                 return LsRemote::Failed(err.to_string());
             }
         }
+    }
+}
+
+fn isolate_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+fn stop_process_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        if pid == 0 {
+            return;
+        }
+        let Ok(pid) = i32::try_from(pid) else {
+            return;
+        };
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        // SAFETY: `kill` with SIGKILL targets the process group of the child
+        // spawned above. The pid is still alive, so it has not been reused.
+        unsafe {
+            let _ = kill(-pid, SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+fn reap_child(child: &mut Child, bound: Duration) {
+    let deadline = Instant::now() + bound;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() >= deadline => return,
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+/// Read both pipes until `deadline`. A reader that is still blocked is
+/// detached so a descendant holding the write end cannot stall the check.
+fn collect_output(
+    stdout_thread: thread::JoinHandle<Vec<u8>>,
+    stderr_thread: thread::JoinHandle<Vec<u8>>,
+    deadline: Instant,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let mut stdout_thread = Some(stdout_thread);
+    let mut stderr_thread = Some(stderr_thread);
+    let mut stdout = None;
+    let mut stderr = None;
+    loop {
+        if stdout.is_none()
+            && stdout_thread
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+        {
+            stdout = stdout_thread.take().and_then(|handle| handle.join().ok());
+        }
+        if stderr.is_none()
+            && stderr_thread
+                .as_ref()
+                .is_some_and(|handle| handle.is_finished())
+        {
+            stderr = stderr_thread.take().and_then(|handle| handle.join().ok());
+        }
+        if stdout_thread.is_none() && stderr_thread.is_none() {
+            return (stdout, stderr);
+        }
+        if Instant::now() >= deadline {
+            return (stdout, stderr);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn abandon_output(
+    stdout_thread: thread::JoinHandle<Vec<u8>>,
+    stderr_thread: thread::JoinHandle<Vec<u8>>,
+    bound: Duration,
+) {
+    let _ = collect_output(stdout_thread, stderr_thread, Instant::now() + bound);
+}
+
+fn classify_exit(success: bool, stdout: Option<Vec<u8>>, stderr: Option<Vec<u8>>) -> LsRemote {
+    let stderr = stderr
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+        .unwrap_or_default();
+    match stdout {
+        Some(bytes) if success => match String::from_utf8(bytes) {
+            Ok(text) => LsRemote::Ok(text),
+            Err(_) => LsRemote::Failed(stderr),
+        },
+        Some(_) => LsRemote::Failed(stderr),
+        None => LsRemote::Failed(if stderr.is_empty() {
+            "ls-remote output was not read before the deadline".to_string()
+        } else {
+            stderr
+        }),
     }
 }
 
@@ -415,18 +535,6 @@ fn read_pipe(pipe: Option<impl Read>) -> Vec<u8> {
     buf
 }
 
-fn join_utf8(handle: thread::JoinHandle<Vec<u8>>) -> Option<String> {
-    let bytes = handle.join().ok()?;
-    String::from_utf8(bytes).ok()
-}
-
-fn join_lossy(handle: thread::JoinHandle<Vec<u8>>) -> String {
-    let Ok(bytes) = handle.join() else {
-        return String::new();
-    };
-    String::from_utf8_lossy(&bytes).trim().to_string()
-}
-
 fn parse_ls_remote(text: &str) -> Option<Vec<ListedRef>> {
     let mut refs = Vec::new();
     for line in text.lines() {
@@ -447,6 +555,7 @@ fn parse_ls_remote(text: &str) -> Option<Vec<ListedRef>> {
 }
 
 fn local_refs(root: &Path) -> Result<Vec<LocalRef>, Error> {
+    let remotes = remote_names(root).unwrap_or_default();
     let text = git_stdout(
         root,
         &[
@@ -466,7 +575,7 @@ fn local_refs(root: &Path) -> Result<Vec<LocalRef>, Error> {
         let Some((sha, refname)) = line.split_once(' ') else {
             return Err(Error::InvalidSetting("git for-each-ref failed".to_string()));
         };
-        let Some((remote, branch)) = split_remote_ref(refname) else {
+        let Some((remote, branch)) = split_remote_ref(refname, &remotes) else {
             continue;
         };
         // for-each-ref listed the name. Confirm it still resolves. A missing
@@ -484,8 +593,32 @@ fn local_refs(root: &Path) -> Result<Vec<LocalRef>, Error> {
     Ok(refs)
 }
 
-fn split_remote_ref(name: &str) -> Option<(String, String)> {
+/// Split `refs/remotes/<remote>/<branch>`.
+///
+/// Configured remote names win, longest first, so `team/upstream` is not read
+/// as remote `team`. A ref whose remote is no longer configured keeps the
+/// first-slash split, so a stale `refs/remotes/origin/main` still refuses.
+fn split_remote_ref(name: &str, remotes: &[String]) -> Option<(String, String)> {
     let rest = name.strip_prefix("refs/remotes/")?;
+    let mut best: Option<(&str, &str)> = None;
+    for remote in remotes {
+        let Some(after) = rest.strip_prefix(remote.as_str()) else {
+            continue;
+        };
+        let Some(branch) = after.strip_prefix('/') else {
+            continue;
+        };
+        if branch.is_empty() {
+            continue;
+        }
+        let replace = best.is_none_or(|(current, _)| remote.len() > current.len());
+        if replace {
+            best = Some((remote.as_str(), branch));
+        }
+    }
+    if let Some((remote, branch)) = best {
+        return Some((remote.to_string(), branch.to_string()));
+    }
     let (remote, branch) = rest.split_once('/')?;
     if remote.is_empty() || branch.is_empty() {
         return None;
@@ -557,21 +690,29 @@ fn trim_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+fn truncate_utf8(text: &mut String, max: usize) {
+    if text.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+}
+
+/// Replace URL userinfo that contains a password. The userinfo runs up to `@`
+/// and may include punctuation (`sub-delims` in RFC 3986); those characters
+/// are not treated as the start of a new URL.
 pub(crate) fn redact_userinfo(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find('@') {
         let (before, after_at) = rest.split_at(at);
         let host = &after_at[1..];
-        let start = before
-            .rfind(|c: char| {
-                c.is_ascii_whitespace() || matches!(c, '"' | '\'' | '<' | '(' | '>' | ',' | ';')
-            })
-            .map_or(0, |index| index + 1);
-        let userinfo = &before[start..];
-        if let Some(rewritten) = redact_one(userinfo) {
+        if let Some(start) = userinfo_start(before) {
             out.push_str(&before[..start]);
-            out.push_str(&rewritten);
+            out.push_str("***");
             out.push('@');
             rest = host;
             continue;
@@ -584,32 +725,52 @@ pub(crate) fn redact_userinfo(text: &str) -> String {
     out
 }
 
-fn redact_one(userinfo: &str) -> Option<String> {
-    if let Some(scheme) = userinfo.find("://") {
-        let creds = &userinfo[scheme + 3..];
-        let colon = creds.find(':')?;
-        if creds[colon + 1..].is_empty() || creds.contains('/') {
-            return None;
-        }
-        return Some(format!("{}***", &userinfo[..scheme + 3]));
+/// Byte index where the userinfo before `@` begins, when that userinfo holds a
+/// colon. Only ASCII userinfo characters are consumed, so the index is a char
+/// boundary.
+fn userinfo_start(before: &str) -> Option<usize> {
+    let bytes = before.as_bytes();
+    let mut start = bytes.len();
+    while start > 0 && is_userinfo_byte(bytes[start - 1]) {
+        start -= 1;
     }
-    let colon = userinfo.find(':')?;
-    let user = &userinfo[..colon];
-    let password = &userinfo[colon + 1..];
-    if user.is_empty()
-        || password.is_empty()
-        || user.contains('/')
-        || password.contains('/')
-        || matches!(user, "http" | "https" | "ssh")
-    {
-        return None;
+    let userinfo = &before[start..];
+    if userinfo.contains(':') && userinfo != ":" {
+        Some(start)
+    } else {
+        None
     }
-    Some("***".to_string())
+}
+
+fn is_userinfo_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'%'
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::redact_userinfo;
+    use super::{detail, redact_userinfo, split_remote_ref};
 
     #[test]
     fn redacts_userinfo_in_urls() {
@@ -621,6 +782,46 @@ mod tests {
         assert_eq!(
             redact_userinfo("see https://user:token@host/a and ok"),
             "see https://***@host/a and ok"
+        );
+        assert_eq!(
+            redact_userinfo("git@github.com:org/repo.git"),
+            "git@github.com:org/repo.git"
+        );
+    }
+
+    #[test]
+    fn redacts_authority_passwords_with_punctuation() {
+        for password in ["sec;ret", "sec,ret", "sec'ret", "sec(ret)", "sec)ret"] {
+            let url = format!("https://user:{password}@host/repo");
+            let redacted = redact_userinfo(&url);
+            assert_eq!(redacted, "https://***@host/repo", "{url} -> {redacted}");
+            assert!(!redacted.contains(password), "{redacted}");
+        }
+    }
+
+    #[test]
+    fn detail_truncates_on_a_utf8_boundary() {
+        let url = "é".repeat(2500);
+        let text = detail(false, &[("origin".to_string(), url)], None, &[]);
+        assert!(text.len() <= 4000, "{}", text.len());
+        assert!(text.is_char_boundary(text.len()));
+    }
+
+    #[test]
+    fn split_remote_ref_prefers_configured_remote_names() {
+        let remotes = vec!["team/upstream".to_string(), "team".to_string()];
+        assert_eq!(
+            split_remote_ref("refs/remotes/team/upstream/feature", &remotes).expect("split"),
+            ("team/upstream".to_string(), "feature".to_string())
+        );
+        assert_eq!(
+            split_remote_ref("refs/remotes/origin/main", &remotes).expect("stale"),
+            ("origin".to_string(), "main".to_string())
+        );
+        assert_eq!(
+            split_remote_ref("refs/remotes/team/upstream/feature", &["team".to_string()])
+                .expect("shorter"),
+            ("team".to_string(), "upstream/feature".to_string())
         );
     }
 }

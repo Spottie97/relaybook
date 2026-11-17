@@ -2,8 +2,8 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -2969,6 +2969,74 @@ fn remote_check_finds_commit_pushed_under_another_name() {
 }
 
 #[test]
+fn remote_check_refuses_when_release_range_fails_on_a_published_interior_commit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    seed_graph_task(dir.path());
+    git(dir.path(), &["checkout", "-b", "feature"]);
+    fs::write(dir.path().join("earlier.txt"), "earlier\n").expect("write");
+    git(dir.path(), &["add", "earlier.txt"]);
+    commit_index(dir.path(), "earlier");
+    let interior = git(dir.path(), &["rev-parse", "HEAD"]);
+    let head = finish_task(dir.path(), &fake, "auth", "work.txt");
+    assert_ne!(interior, head);
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["review", "start", "auth", "--json"],
+    );
+    let origin = bare_remote(dir.path(), "origin");
+    let spec = format!("{interior}:refs/heads/other");
+    git(dir.path(), &["push", "origin", &spec]);
+    assert_eq!(
+        git(origin.path(), &["rev-parse", "refs/heads/other"]),
+        interior
+    );
+    delete_ref_if_present(dir.path(), "refs/remotes/origin/other");
+    delete_ref_if_present(dir.path(), "refs/remotes/origin/HEAD");
+    git(dir.path(), &["update-ref", "-d", "refs/heads/main"]);
+    assert!(rev_missing(dir.path(), "refs/heads/main"));
+    let output = record_review(dir.path(), "codex", &head, "approved", false);
+    assert_failure(&output, "remote check failed");
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+    assert_eq!(latest_remote_status(dir.path()), "unknown");
+}
+
+#[test]
+fn slash_remote_tracking_ref_at_older_sha_refuses_in_local_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    seed_graph_task(dir.path());
+    git(dir.path(), &["checkout", "-b", "feature"]);
+    let head = finish_task(dir.path(), &fake, "auth", "work.txt");
+    fake_data(
+        dir.path(),
+        &fake,
+        "graph",
+        ["review", "start", "auth", "--json"],
+    );
+    let older = git(dir.path(), &["rev-parse", "HEAD~1"]);
+    assert_ne!(older, head);
+    let _upstream = bare_remote(dir.path(), "team/upstream");
+    git(
+        dir.path(),
+        &["update-ref", "refs/remotes/team/upstream/feature", &older],
+    );
+    let switched = answer_prompts(
+        dir.path(),
+        &["config", "set", "remote_check", "local"],
+        &["y\n"],
+    );
+    assert!(switched.success, "{}", switched.output);
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "refs/remotes/team/upstream/feature exists",
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+}
+
+#[test]
 fn remote_check_checks_every_remote() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = GraphifyFake::install();
@@ -3103,6 +3171,91 @@ fn remote_check_times_out_and_never_hangs() {
 }
 
 #[test]
+fn remote_check_timeout_returns_while_descendant_holds_stderr() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let _origin = bare_remote(dir.path(), "origin");
+    let gate = tempfile::tempdir().expect("gate");
+    let pid_dir = tempfile::tempdir().expect("pid");
+    let pid_file = pid_dir.path().join("holder.pid");
+    let _holder = HolderGuard::watch(&pid_file);
+    let started = Instant::now();
+    let output = command_with_git_shim(dir.path(), gate.path(), "ls-remote")
+        .env("RELAYBOOK_REMOTE_TIMEOUT_SECS", "2")
+        .env("RELAYBOOK_GIT_HOLD_STDERR", &pid_file)
+        .args([
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ])
+        .output()
+        .expect("output");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "elapsed {:?}",
+        started.elapsed()
+    );
+    assert_failure(&output, "timed out");
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+    let pid = held_pid(&pid_file);
+    assert!(
+        pid_is_alive(pid),
+        "descendant {pid} was not still holding stderr"
+    );
+}
+
+#[test]
+fn remote_check_bounds_drain_when_descendant_holds_stderr_after_exit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let _origin = bare_remote(dir.path(), "origin");
+    let gate = tempfile::tempdir().expect("gate");
+    let pid_dir = tempfile::tempdir().expect("pid");
+    let pid_file = pid_dir.path().join("holder.pid");
+    let _holder = HolderGuard::watch(&pid_file);
+    let started = Instant::now();
+    let output = command_with_git_shim(dir.path(), gate.path(), "not-a-git-command")
+        .env("RELAYBOOK_REMOTE_TIMEOUT_SECS", "2")
+        .env("RELAYBOOK_GIT_HOLD_STDERR", &pid_file)
+        .args([
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ])
+        .output()
+        .expect("output");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "elapsed {:?}",
+        started.elapsed()
+    );
+    assert!(output.status.success(), "{}", summarize(&output));
+    let pid = held_pid(&pid_file);
+    assert!(
+        pid_is_alive(pid),
+        "descendant {pid} was not still holding stderr"
+    );
+}
+
+#[test]
 fn remote_check_passes_no_prompt_env_and_null_stdin() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = GraphifyFake::install();
@@ -3130,11 +3283,17 @@ fn remote_check_passes_no_prompt_env_and_null_stdin() {
         .expect("output");
     assert!(output.status.success(), "{}", summarize(&output));
     let text = fs::read_to_string(&log).expect("env log");
+    let stdin_mark = if cfg!(windows) {
+        "stdin=not-a-tty"
+    } else {
+        "stdin=/dev/null"
+    };
     assert!(
         text.lines().any(|line| {
             line.contains("ls-remote")
                 && line.contains("GIT_TERMINAL_PROMPT=0")
-                && line.contains("stdin=/dev/null")
+                && line.contains(stdin_mark)
+                && !line.contains("stdin=tty")
         }),
         "{text}"
     );
@@ -3181,7 +3340,7 @@ fn remote_urls_are_redacted() {
             "remote",
             "add",
             "origin",
-            "https://user:super-secret-token@127.0.0.1:1/repo.git",
+            "https://user:super-secret-token;a,b'c(d)@127.0.0.1:1/repo.git",
         ],
     );
     let output = relay_output(
@@ -3263,6 +3422,41 @@ fn release_authorize_offline_needs_second_confirmation() {
     let status = data_of(dir.path(), &["release", "status", "--json"]);
     assert_eq!(status["remote"]["override"], json!(true));
     assert_eq!(status["remote"]["status"], json!("unknown"));
+}
+
+#[test]
+fn release_authorize_override_stays_on_the_confirmed_check() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "/nonexistent/relaybook-r7-override-race",
+        ],
+    );
+    let accepted = authorize_and_insert_during_second_prompt(dir.path(), &head);
+    assert!(
+        accepted.success,
+        "code {} {}",
+        accepted.code, accepted.output
+    );
+    assert_eq!(authorizations(dir.path()), vec![head]);
+    let rows = remote_check_rows(dir.path());
+    let concurrent = rows
+        .iter()
+        .find(|row| row.remote.as_deref() == Some("concurrent"))
+        .expect("concurrent row");
+    assert_eq!(concurrent.override_flag, 0, "{rows:?}");
+    let overridden: Vec<_> = rows
+        .iter()
+        .filter(|row| row.context == "authorize" && row.override_flag == 1)
+        .collect();
+    assert_eq!(overridden.len(), 1, "{rows:?}");
+    assert!(overridden[0].id < concurrent.id, "{rows:?}");
 }
 
 #[test]
@@ -4715,6 +4909,159 @@ fn latest_remote_override(dir: &Path) -> i64 {
     .expect("override")
 }
 
+fn latest_remote_status(dir: &Path) -> String {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(db).expect("open");
+    conn.query_row(
+        "SELECT status FROM remote_checks ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .expect("status")
+}
+
+struct RemoteCheckRow {
+    id: i64,
+    context: String,
+    remote: Option<String>,
+    override_flag: i64,
+}
+
+impl std::fmt::Debug for RemoteCheckRow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteCheckRow")
+            .field("id", &self.id)
+            .field("context", &self.context)
+            .field("remote", &self.remote)
+            .field("override", &self.override_flag)
+            .finish()
+    }
+}
+
+fn remote_check_rows(dir: &Path) -> Vec<RemoteCheckRow> {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(db).expect("open");
+    let mut statement = conn
+        .prepare("SELECT id, context, remote, override FROM remote_checks ORDER BY id")
+        .expect("prepare");
+    let rows = statement
+        .query_map([], |row| {
+            Ok(RemoteCheckRow {
+                id: row.get(0)?,
+                context: row.get(1)?,
+                remote: row.get(2)?,
+                override_flag: row.get(3)?,
+            })
+        })
+        .expect("rows");
+    rows.map(|row| row.expect("row")).collect()
+}
+
+fn insert_concurrent_remote_check(dir: &Path) -> i64 {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let mut conn = rusqlite::Connection::open(db).expect("open");
+    conn.busy_timeout(Duration::from_secs(5)).expect("busy");
+    let tx = conn.transaction().expect("transaction");
+    tx.execute(
+        "INSERT INTO remote_checks
+            (context, branch, head_sha, remote, status, detail, override, created_at)
+         VALUES ('review', 'feature', 'concurrent-sha', 'concurrent', 'absent',
+                 'inserted during confirmation', 0, '2099-01-01T00:00:00Z')",
+        [],
+    )
+    .expect("insert concurrent remote check");
+    let id = tx.last_insert_rowid();
+    tx.commit().expect("commit concurrent remote check");
+    id
+}
+
+struct HolderGuard {
+    pid_file: PathBuf,
+    cancel: Arc<AtomicBool>,
+    watchdog: Option<thread::JoinHandle<()>>,
+}
+
+impl HolderGuard {
+    fn watch(pid_file: &Path) -> Self {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_watch = Arc::clone(&cancel);
+        let watched = pid_file.to_path_buf();
+        let watchdog = thread::spawn(move || {
+            for _ in 0..150 {
+                if cancel_watch.load(Ordering::Relaxed) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            kill_pid_file(&watched);
+        });
+        Self {
+            pid_file: pid_file.to_path_buf(),
+            cancel,
+            watchdog: Some(watchdog),
+        }
+    }
+}
+
+impl Drop for HolderGuard {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.watchdog.take() {
+            let _ = handle.join();
+        }
+        kill_pid_file(&self.pid_file);
+    }
+}
+
+fn held_pid(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .expect("holder pid")
+        .trim()
+        .parse()
+        .expect("holder pid number")
+}
+
+fn kill_pid_file(path: &Path) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return;
+    };
+    kill_pid(pid);
+}
+
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+    }
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(not(unix))]
+    {
+        Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+    }
+}
+
 fn install_gh(fake: &GraphifyFake) {
     let bin = std::env::split_paths(&fake.path).next().expect("fake bin");
     let dest = bin.join(if cfg!(windows) { "gh.exe" } else { "gh" });
@@ -4913,6 +5260,92 @@ fn answer_prompts(dir: &Path, args: &[&str], answers: &[&str]) -> PtyOutput {
     let buf = recv
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
+    PtyOutput {
+        success: status.success(),
+        code: status.exit_code(),
+        output: String::from_utf8_lossy(&buf).into_owned(),
+    }
+}
+
+fn authorize_and_insert_during_second_prompt(dir: &Path, sha: &str) -> PtyOutput {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    use portable_pty::{
+        Child as PtyChild, ChildKiller, CommandBuilder, PtySize, native_pty_system,
+    };
+
+    let system = native_pty_system();
+    let pair = system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("pty");
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_relaybook"));
+    cmd.arg("release");
+    cmd.arg("authorize");
+    cmd.arg("--sha");
+    cmd.arg(sha);
+    cmd.cwd(dir);
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("reader");
+    let mut writer = pair.master.take_writer().expect("writer");
+    let (send, recv) = mpsc::channel();
+    let (inserted_tx, inserted_rx) = mpsc::channel();
+    let ledger_dir = dir.to_path_buf();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 1024];
+        let mut stage = 0usize;
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(count) => {
+                    buf.extend_from_slice(&tmp[..count]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if stage == 0 && text.contains("Authorize this release?") {
+                        let _ = writer.write_all(b"y\n");
+                        let _ = writer.flush();
+                        stage = 1;
+                    } else if stage == 1 && text.contains("Proceed without remote verification?") {
+                        let id = insert_concurrent_remote_check(&ledger_dir);
+                        let _ = inserted_tx.send(id);
+                        let _ = writer.write_all(b"y\n");
+                        let _ = writer.flush();
+                        stage = 2;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = send.send(buf);
+    });
+    let started = Instant::now();
+    let status = loop {
+        match PtyChild::try_wait(child.as_mut()) {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(20) => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = ChildKiller::kill(child.as_mut());
+                panic!("timed out waiting for release authorize");
+            }
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    };
+    let buf = recv
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    inserted_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("concurrent remote check was not inserted during confirmation");
     PtyOutput {
         success: status.success(),
         code: status.exit_code(),

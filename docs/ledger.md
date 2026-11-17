@@ -42,7 +42,7 @@ Schema version is `PRAGMA user_version` 8. A new ledger is created at that versi
 | `reviews` | Task and release reviews. `verdict` is null until recorded. Scope is `task` or `release` |
 | `graph_builds` | One graph refresh: step, commit, and status `built`, `skipped`, or `failed` |
 | `release_authorizations` | Maintainer sign-off for one commit. `run_id` is null in manual mode. Nullable `method` and `evidence` |
-| `remote_checks` | One gated publish check. `status` is `absent`, `present`, `unknown`, or `local`. `override` is 1 when release authorization proceeded without a successful remote query. `review record` and `release authorize` write a row. `release status` reads the latest row |
+| `remote_checks` | One gated publish check. `status` is `absent`, `present`, `unknown`, or `local`. `override` is 1 on the authorization check that proceeded without a successful remote query. `review record` and `release authorize` write a row. `release status` reads the latest row |
 
 Event kinds are `task_created`, `claimed`, `progress`, `decision`, `status_changed`, `dependency_changed`, `task_renamed`, and `run_linked`. A progress event is unique per task and commit. A null commit, from a directory that is not a git checkout, is not covered, so those reports append.
 
