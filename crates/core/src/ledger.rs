@@ -640,7 +640,8 @@ impl Ledger {
     /// `terminal_confirmed` allows `workflow` to change from `gated` to
     /// `classic`, `remote_check` to change to `local`, and `signoff` to
     /// change. The stored value is the trimmed one `settings::set` keeps,
-    /// and that comparison runs inside the write transaction.
+    /// and that comparison runs inside the write transaction. A live gated
+    /// run refuses a `workflow` write in that same transaction.
     pub fn set_setting_with(
         &mut self,
         key: &str,
@@ -648,6 +649,9 @@ impl Ledger {
         terminal_confirmed: bool,
     ) -> Result<crate::settings::Snapshot, Error> {
         self.transaction(|conn| {
+            if key == "workflow" {
+                refuse_live_gated_run(conn)?;
+            }
             authorize_workflow_change(conn, key, value, terminal_confirmed)?;
             authorize_remote_check_change(conn, key, value, terminal_confirmed)?;
             authorize_signoff_change(conn, key, value, terminal_confirmed)?;
@@ -822,7 +826,7 @@ impl Ledger {
         })
     }
 
-    pub fn save_run(&mut self, run: &crate::runs::Run) -> Result<(), Error> {
+    pub fn save_run(&mut self, run: &mut crate::runs::Run) -> Result<(), Error> {
         self.transaction(|conn| crate::runs::save(conn, run))
     }
 
@@ -850,7 +854,7 @@ impl Ledger {
                 return Err(Error::InvalidSetting("no active run".to_string()));
             };
             run.complete_requested = true;
-            crate::runs::save(conn, &run)
+            crate::runs::save(conn, &mut run)
         })
     }
 
@@ -872,6 +876,7 @@ impl Ledger {
         let slug = checked_slug(slug)?;
         let head = required_text("head", head)?;
         self.transaction(|conn| {
+            refuse_live_gated_task(conn, &slug)?;
             let task = load_task(conn, &slug)?;
             if !approved_task_review_at(conn, task.id, &head)? {
                 return Err(Error::InvalidSetting(
@@ -936,6 +941,7 @@ impl Ledger {
         let commit_sha = required_text("commit_sha", commit_sha)?;
         let task = checked_task_slug(scope, task)?;
         self.transaction(|conn| {
+            refuse_live_ownership(conn, scope, task.as_deref())?;
             let task_id = scoped_task_id(conn, scope, task.as_deref())?;
             let report_id = match task_id {
                 Some(id) => latest_task_report_id(conn, id)?,
@@ -1036,6 +1042,7 @@ impl Ledger {
             return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
         }
         self.transaction(|conn| {
+            refuse_live_ownership(conn, scope, task.as_deref())?;
             let task_id = scoped_task_id(conn, scope, task.as_deref())?;
             let id = pending_review_id(conn, scope, task_id)?;
             let review = load_review(conn, id)?;
@@ -1703,6 +1710,44 @@ impl Ledger {
     }
 }
 
+const LIVE_RUN_OWNS: &str = "a gated run owns this; use relaybook approve / run --resume";
+
+fn refuse_live_gated_run(conn: &Connection) -> Result<(), Error> {
+    match crate::runs::active(conn)? {
+        Some(run) if run.workflow.as_deref() == Some("gated") => {
+            Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn refuse_live_gated_task(conn: &Connection, slug: &str) -> Result<(), Error> {
+    let Some(run) = crate::runs::active(conn)? else {
+        return Ok(());
+    };
+    if run.workflow.as_deref() != Some("gated") {
+        return Ok(());
+    }
+    let owned = crate::runs::task_slugs(conn, run.id)?
+        .iter()
+        .any(|item| item == slug);
+    if owned {
+        Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
+    } else {
+        Ok(())
+    }
+}
+
+fn refuse_live_ownership(conn: &Connection, scope: &str, task: Option<&str>) -> Result<(), Error> {
+    if scope == "release" {
+        refuse_live_gated_run(conn)
+    } else if let Some(slug) = task {
+        refuse_live_gated_task(conn, slug)
+    } else {
+        Ok(())
+    }
+}
+
 fn authorize_workflow_change(
     conn: &Connection,
     key: &str,
@@ -2143,6 +2188,7 @@ fn into_event(row: EventRow) -> Result<Event, Error> {
 }
 
 fn accept_unreviewed(conn: &Connection, slug: &str) -> Result<usize, Error> {
+    refuse_live_gated_task(conn, slug)?;
     let task = load_task(conn, slug)?;
     let changed = reports::accept_task(conn, task.id, &now(conn)?)?;
     if changed == 0 {

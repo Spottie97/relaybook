@@ -42,6 +42,28 @@ impl Repo {
 }
 
 fn gated_repo() -> Repo {
+    let repo = origin_repo();
+    let dir = repo.path();
+    relaybook(dir)
+        .args(["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    relaybook(dir)
+        .args(["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+    relaybook(dir)
+        .args(["config", "set", "gates", "plan,review"])
+        .assert()
+        .success();
+    relaybook(dir)
+        .args(["config", "set", "max_cycles", "9"])
+        .assert()
+        .success();
+    repo
+}
+
+fn origin_repo() -> Repo {
     let dir = tempfile::tempdir().expect("temp");
     let origin = tempfile::tempdir().expect("origin");
     git(dir.path(), &["init", "-b", "main"]);
@@ -75,22 +97,6 @@ fn gated_repo() -> Repo {
     relaybook(dir.path()).arg("init").assert().success();
     relaybook(dir.path())
         .args(["mode", "auto"])
-        .assert()
-        .success();
-    relaybook(dir.path())
-        .args(["config", "set", "reviewer", "codex"])
-        .assert()
-        .success();
-    relaybook(dir.path())
-        .args(["config", "set", "workflow", "gated"])
-        .assert()
-        .success();
-    relaybook(dir.path())
-        .args(["config", "set", "gates", "plan,review"])
-        .assert()
-        .success();
-    relaybook(dir.path())
-        .args(["config", "set", "max_cycles", "9"])
         .assert()
         .success();
     Repo {
@@ -199,6 +205,19 @@ fn write_trace_wrapper(path: &Path, name: &str, target: &Path) {
     fs::set_permissions(path, permissions).expect("chmod");
 }
 
+#[cfg(unix)]
+fn write_push_gate_wrapper(path: &Path, target: &Path) {
+    let target = target.display();
+    let script = format!(
+        "#!/bin/sh\nif [ -z \"$RELAYBOOK_TRACE_LOG\" ]; then echo \"RELAYBOOK_TRACE_LOG is unset\" >&2; exit 99; fi\nprintf '%s\\n' \"git $*\" >> \"$RELAYBOOK_TRACE_LOG\"\nif [ -n \"$RELAYBOOK_PUSH_GATE\" ]; then\n  for arg in \"$@\"; do\n    if [ \"$arg\" = \"push\" ]; then\n      i=0\n      while [ ! -f \"$RELAYBOOK_PUSH_GATE\" ]; do\n        i=$((i + 1))\n        if [ \"$i\" -gt 400 ]; then echo \"push gate timed out\" >&2; exit 98; fi\n        sleep 0.05\n      done\n      break\n    fi\n  done\nfi\nexec '{target}' \"$@\"\n"
+    );
+    fs::write(path, script).expect("wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).expect("meta").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod");
+}
+
 fn apply_probes(cmd: &mut Command, probes: &Probes) {
     let mut path = std::ffi::OsString::from(&probes.bin);
     if let Some(rest) = std::env::var_os("PATH") {
@@ -285,8 +304,18 @@ fn seed_run(dir: &Path, branch: &str, stage: &str, status: &str) -> i64 {
         .expect("start run");
     run.stage = stage.to_string();
     run.status = status.to_string();
-    ledger.save_run(&run).expect("save run");
+    ledger.save_run(&mut run).expect("save run");
     run.id
+}
+
+fn seed_stopped(dir: &Path, branch: &str, workflow: Option<&str>) {
+    let mut ledger =
+        relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
+    let mut run = ledger
+        .start_run("prd.md", "abc", branch, workflow)
+        .expect("start run");
+    run.status = "stopped".to_string();
+    ledger.save_run(&mut run).expect("save run");
 }
 
 fn assign_run(dir: &Path, slug: &str, run_id: i64) {
@@ -303,7 +332,7 @@ fn set_run_stage(dir: &Path, stage: &str) {
         relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
     let mut run = ledger.active_run().expect("active").expect("run");
     run.stage = stage.to_string();
-    ledger.save_run(&run).expect("save");
+    ledger.save_run(&mut run).expect("save");
 }
 
 fn authorization_run_id(dir: &Path) -> Option<i64> {
@@ -810,6 +839,214 @@ fn manual_review_and_accept_refuse_on_live_gated_run_tasks() {
         .assert()
         .success();
     assert!(bare_relaybook_refs(&repo.bare).is_empty());
+}
+
+fn unpublished_branch(dir: &Path) {
+    git(dir, &["checkout", "-b", "relaybook/prd"]);
+    fs::write(dir.join("ship.txt"), "ship\n").expect("ship");
+    git(dir, &["add", "ship.txt"]);
+    git(dir, &["commit", "-m", "ship"]);
+}
+
+#[test]
+fn resume_stops_classic_or_unset_workflow_without_pushing() {
+    for workflow in [Some("classic"), None] {
+        let repo = origin_repo();
+        unpublished_branch(repo.path());
+        seed_stopped(repo.path(), "relaybook/prd", workflow);
+        relaybook(repo.path())
+            .args(["config", "set", "reviewer", "codex"])
+            .assert()
+            .success();
+        relaybook(repo.path())
+            .args(["config", "set", "workflow", "gated"])
+            .assert()
+            .success();
+        let probes = install_probes();
+        let output = run_probed(repo.path(), &probes, &["run", "--resume"]);
+        let text = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{workflow:?}\n{text}{err}");
+        assert!(
+            text.contains("workflow changed during run"),
+            "{workflow:?}\nstdout={text}\nstderr={err}"
+        );
+        assert!(!probes.log.join("gh.args").exists(), "{workflow:?}");
+        assert!(
+            bare_rev(&repo.bare, "refs/heads/relaybook/prd").is_none(),
+            "{workflow:?} pushed the run branch"
+        );
+        let row = run_row(repo.path());
+        assert_eq!(row.status, "stopped");
+        assert_eq!(row.workflow.as_deref(), workflow);
+        assert!(
+            row.stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("workflow changed during run")),
+            "{row:?}"
+        );
+        #[cfg(unix)]
+        {
+            let trace = fs::read_to_string(probes.log.join("invocations")).unwrap_or_default();
+            assert!(
+                !trace.lines().any(|line| line.starts_with("git push ")),
+                "{workflow:?}\n{trace}"
+            );
+        }
+    }
+}
+
+#[test]
+fn gated_publish_does_not_follow_annotated_tags() {
+    let repo = gated_repo();
+    let (head, _) = reviewed_release(&repo);
+    git(repo.path(), &["tag", "-a", "signoff", "-m", "signoff"]);
+    git(repo.path(), &["config", "push.followTags", "true"]);
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    let probes = install_probes();
+    let output = run_probed(repo.path(), &probes, &["approve"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    assert_eq!(
+        bare_rev(&repo.bare, "refs/heads/relaybook/prd").as_deref(),
+        Some(head.as_str())
+    );
+    assert!(
+        bare_rev(&repo.bare, "refs/tags/signoff").is_none(),
+        "annotated tag was published"
+    );
+    let tags = Command::new("git")
+        .args([
+            "--git-dir",
+            repo.bare.to_str().expect("utf8"),
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/tags",
+        ])
+        .output()
+        .expect("for-each-ref");
+    assert!(tags.status.success());
+    assert!(
+        String::from_utf8_lossy(&tags.stdout).trim().is_empty(),
+        "tags on bare: {}",
+        String::from_utf8_lossy(&tags.stdout)
+    );
+    #[cfg(unix)]
+    {
+        let trace = fs::read_to_string(probes.log.join("invocations")).expect("trace");
+        assert!(
+            trace
+                .lines()
+                .any(|line| line.starts_with("git push ") && line.contains("--no-follow-tags")),
+            "{trace}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_approve_pushes_once_and_keeps_complete() {
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let repo = gated_repo();
+    let (head, _) = reviewed_release(&repo);
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    let probes = install_probes();
+    write_push_gate_wrapper(&probes.bin.join("git"), &program_on_path("git"));
+    let gate = probes.log.join("allow-push");
+    struct ReleasePush(PathBuf);
+    impl Drop for ReleasePush {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "go\n");
+        }
+    }
+    let _release = ReleasePush(gate.clone());
+
+    let spawn = |dir: &Path, probes: &Probes, gate: &Path| {
+        let mut cmd = relaybook(dir);
+        apply_probes(&mut cmd, probes);
+        cmd.env("RELAYBOOK_PUSH_GATE", gate);
+        cmd.arg("approve");
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.spawn().expect("spawn approve")
+    };
+    let mut children = vec![
+        spawn(repo.path(), &probes, &gate),
+        spawn(repo.path(), &probes, &gate),
+    ];
+    let trace_path = probes.log.join("invocations");
+    let pushes = |text: &str| {
+        text.lines()
+            .filter(|line| line.starts_with("git push "))
+            .count()
+    };
+    let started = Instant::now();
+    loop {
+        let text = fs::read_to_string(&trace_path).unwrap_or_default();
+        let seen = pushes(&text);
+        let mut exited = 0;
+        for child in &mut children {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                exited += 1;
+            }
+        }
+        if seen >= 2 || (seen == 1 && exited >= 1) || started.elapsed() > Duration::from_secs(20) {
+            thread::sleep(Duration::from_millis(300));
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let blocked = fs::read_to_string(&trace_path).unwrap_or_default();
+    assert_eq!(
+        pushes(&blocked),
+        1,
+        "both approves reached push before either finished:\n{blocked}"
+    );
+    fs::write(&gate, "go\n").expect("release push");
+    let mut outputs = Vec::new();
+    for child in children {
+        let output = child.wait_with_output().expect("wait");
+        outputs.push(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let trace = fs::read_to_string(&trace_path).unwrap_or_default();
+    assert_eq!(pushes(&trace), 1, "{trace}");
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.starts_with("gh pr create"))
+            .count(),
+        1,
+        "{trace}"
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|text| text.contains("run changed concurrently")),
+        "{outputs:?}"
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|text| text.contains("opened https://example.test/pr/1")),
+        "{outputs:?}"
+    );
+    let row = run_row(repo.path());
+    assert_eq!(row.status, "complete", "{row:?}");
+    assert_eq!(row.stage, "done", "{row:?}");
+    assert_eq!(
+        bare_rev(&repo.bare, "refs/heads/relaybook/prd").as_deref(),
+        Some(head.as_str())
+    );
 }
 
 struct PtyOutput {

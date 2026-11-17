@@ -89,7 +89,7 @@ fn stop_requested(db: &Path) -> RunOutput {
     {
         run.status = "stopped".to_string();
         run.stop_reason = Some("stopped by request".to_string());
-        if let Err(err) = ledger.save_run(&run) {
+        if let Err(err) = ledger.save_run(&mut run) {
             return fail(&err.to_string());
         }
         return fail("stopped: stopped by request; relaybook run --resume");
@@ -178,7 +178,7 @@ fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Resul
                 if let Ok(Some(mut run)) = ledger.active_run() {
                     run.status = "stopped".to_string();
                     run.stop_reason = Some(err.clone());
-                    let _ = ledger.save_run(&run);
+                    let _ = ledger.save_run(&mut run);
                 }
                 return Err(err);
             }
@@ -322,31 +322,48 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<(), String> {
     }
     let settings = ledger.settings().map_err(|err| err.to_string())?;
     if workflow_changed(&run, &settings) {
-        let output = halt(cwd, &mut ledger, &mut run, "workflow changed during run");
+        let output = stop_workflow_mismatch(&mut ledger, &mut run);
         return Err(output.text.trim_end().to_string());
     }
     if run.stage == "gate_release" {
-        git(cwd, &["checkout", &run.branch])?;
-        if !release_authorized(&ledger, cwd, &run)? {
+        let tip = git(
+            cwd,
+            &["rev-parse", "--verify", "--end-of-options", &run.branch],
+        )?;
+        if !authorized_at(&ledger, &run, &tip)? {
+            git(cwd, &["checkout", &run.branch])?;
             return Err(signoff_wait(cwd));
+        }
+        // One approve owns publication. The loser keeps the waiting row and
+        // does not check out, screen, or push.
+        run.stage = "publish".to_string();
+        run.status = "active".to_string();
+        if !approve {
+            run.stop_reason = None;
+        }
+        ledger.save_run(&mut run).map_err(|err| err.to_string())?;
+        if let Err(err) = git(cwd, &["checkout", &run.branch]) {
+            let output = halt(cwd, &mut ledger, &mut run, &err);
+            return Err(output.text.trim_end().to_string());
         }
         let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
         if let Err(err) = crate::gate::require_unpublished(&mut ledger, &root, "gate_release") {
             let output = halt(cwd, &mut ledger, &mut run, &err.to_string());
             return Err(output.text.trim_end().to_string());
         }
-        run.stage = "publish".to_string();
-    } else if approve && run.stage.starts_with("gate_review") {
-        run.stage = "after_review".to_string();
-    } else if approve && run.stage == "gate_plan" {
-        run.stage = "execute".to_string();
+    } else {
+        if approve && run.stage.starts_with("gate_review") {
+            run.stage = "after_review".to_string();
+        } else if approve && run.stage == "gate_plan" {
+            run.stage = "execute".to_string();
+        }
+        run.status = "active".to_string();
+        if !approve {
+            run.stop_reason = None;
+        }
+        ledger.save_run(&mut run).map_err(|err| err.to_string())?;
+        git(cwd, &["checkout", &run.branch])?;
     }
-    run.status = "active".to_string();
-    if !approve {
-        run.stop_reason = None;
-    }
-    ledger.save_run(&run).map_err(|err| err.to_string())?;
-    git(cwd, &["checkout", &run.branch])?;
     println!("{}", agents::account_line(&accounts));
     Ok(())
 }
@@ -370,7 +387,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             return fail("no active run");
         };
         if workflow_changed(&run, &settings) {
-            return halt(cwd, &mut ledger, &mut run, "workflow changed during run");
+            return stop_workflow_mismatch(&mut ledger, &mut run);
         }
         if settings.mode != "auto" {
             return halt(cwd, &mut ledger, &mut run, "mode is manual");
@@ -415,7 +432,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             let run_id = run.id;
             let gated = is_gated(&run);
             run.agent_calls += 1;
-            if let Err(err) = ledger.save_run(&run) {
+            if let Err(err) = ledger.save_run(&mut run) {
                 return fail(&err.to_string());
             }
             drop(ledger);
@@ -487,12 +504,12 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             println!("{}", plan_line(&run));
             if run.stage == "gate_plan" {
                 run.status = "waiting".to_string();
-                if let Err(err) = ledger.save_run(&run) {
+                if let Err(err) = ledger.save_run(&mut run) {
                     return fail(&err.to_string());
                 }
                 return ok("waiting for approval: relaybook approve");
             }
-            if let Err(err) = ledger.save_run(&run) {
+            if let Err(err) = ledger.save_run(&mut run) {
                 return fail(&err.to_string());
             }
             continue;
@@ -503,7 +520,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             }
             let Some(slug) = run.current_slug.clone() else {
                 run.stage = "execute".to_string();
-                if let Err(err) = ledger.save_run(&run) {
+                if let Err(err) = ledger.save_run(&mut run) {
                     return fail(&err.to_string());
                 }
                 continue;
@@ -513,7 +530,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             let run_id = run.id;
             let branch = run.branch.clone();
             run.agent_calls += 1;
-            if let Err(err) = ledger.save_run(&run) {
+            if let Err(err) = ledger.save_run(&mut run) {
                 return fail(&err.to_string());
             }
             drop(ledger);
@@ -576,7 +593,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             let verdict = match ledger.latest_report_meta(&slug) {
                 Ok(Some((_, Some(verdict)))) => verdict,
                 _ => {
-                    if let Err(err) = ledger.save_run(&run) {
+                    if let Err(err) = ledger.save_run(&mut run) {
                         return fail(&err.to_string());
                     }
                     close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "failed");
@@ -596,13 +613,13 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
             run.stage = format!("gate_review:{verdict}");
             if gates == "plan,review" {
                 run.status = "waiting".to_string();
-                if let Err(err) = ledger.save_run(&run) {
+                if let Err(err) = ledger.save_run(&mut run) {
                     return fail(&err.to_string());
                 }
                 return ok("waiting for approval: relaybook approve");
             }
             run.stage = "after_review".to_string();
-            if let Err(err) = ledger.save_run(&run) {
+            if let Err(err) = ledger.save_run(&mut run) {
                 return fail(&err.to_string());
             }
             continue;
@@ -685,7 +702,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
         let run_id = run.id;
         let branch = run.branch.clone();
         let gated = is_gated(&run);
-        if let Err(err) = ledger.save_run(&run) {
+        if let Err(err) = ledger.save_run(&mut run) {
             return fail(&err.to_string());
         }
         drop(ledger);
@@ -761,7 +778,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
         if !done || report_bytes.is_none() {
             close_live(&mut session, cwd, run_id, quiet, elapsed, &result, "failed");
             run.failure_streak += 1;
-            if let Err(err) = ledger.save_run(&run) {
+            if let Err(err) = ledger.save_run(&mut run) {
                 return fail(&err.to_string());
             }
             if run.failure_streak >= 2 {
@@ -782,7 +799,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
                 &settings.est_cost_cap_usd
             )
         );
-        if let Err(err) = ledger.save_run(&run) {
+        if let Err(err) = ledger.save_run(&mut run) {
             return fail(&err.to_string());
         }
     }
@@ -877,6 +894,17 @@ fn halt(cwd: &Path, ledger: &mut Ledger, run: &mut Run, reason: &str) -> RunOutp
     if !is_gated(run) {
         let _ = push_branch(cwd, &run.branch);
     }
+    stop_run(ledger, run, reason)
+}
+
+/// A workflow mismatch stops the run and does not push. `halt` would push
+/// when the stored workflow is classic or unset, which would publish a run
+/// after the ledger had switched to gated.
+fn stop_workflow_mismatch(ledger: &mut Ledger, run: &mut Run) -> RunOutput {
+    stop_run(ledger, run, "workflow changed during run")
+}
+
+fn stop_run(ledger: &mut Ledger, run: &mut Run, reason: &str) -> RunOutput {
     run.status = "stopped".to_string();
     run.stop_reason = Some(reason.to_string());
     if let Err(err) = ledger.save_run(run) {
@@ -906,12 +934,12 @@ fn bump_failure(db: &Path, cwd: &Path, quiet: bool) -> RunOutput {
     if run.failure_streak >= 2 {
         run.status = "stopped".to_string();
         run.stop_reason = Some("two consecutive agent failures".to_string());
-        if let Err(err) = ledger.save_run(&run) {
+        if let Err(err) = ledger.save_run(&mut run) {
             return fail(&err.to_string());
         }
         return fail("stopped: two consecutive agent failures; relaybook run --resume");
     }
-    if let Err(err) = ledger.save_run(&run) {
+    if let Err(err) = ledger.save_run(&mut run) {
         return fail(&err.to_string());
     }
     drive(db, cwd, quiet)
@@ -932,7 +960,7 @@ fn take_agent(db: &Path, cwd: &Path, result: &AgentResult, cli: &str) -> Option<
                 Some(time) => format!("{cli}|{time}"),
                 None => cli.to_string(),
             });
-            if let Err(err) = ledger.save_run(&run) {
+            if let Err(err) = ledger.save_run(&mut run) {
                 return Some(fail(&err.to_string()));
             }
             let line = match reset_at {
@@ -1148,13 +1176,12 @@ fn signoff_wait(cwd: &Path) -> String {
     format!("waiting for sign-off: relaybook release authorize --sha {head}")
 }
 
-fn release_authorized(ledger: &Ledger, cwd: &Path, run: &Run) -> Result<bool, String> {
-    let head = git(cwd, &["rev-parse", "HEAD"])?;
+fn authorized_at(ledger: &Ledger, run: &Run, sha: &str) -> Result<bool, String> {
     match ledger
-        .authorization_at(&head)
+        .authorization_at(sha)
         .map_err(|err| err.to_string())?
     {
-        Some(auth) if auth.branch == run.branch && auth.commit_sha == head => Ok(true),
+        Some(auth) if auth.branch == run.branch && auth.commit_sha == sha => Ok(true),
         _ => Ok(false),
     }
 }
@@ -1196,14 +1223,20 @@ fn enter_release_review(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOu
 }
 
 fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
+    // Take the run before any publish screen. A stale snapshot fails here
+    // and must not push or save over the owner.
+    run.stage = "publish".to_string();
+    run.status = "active".to_string();
+    if let Err(err) = ledger.save_run(run) {
+        return fail(&err.to_string());
+    }
     let head = match git(cwd, &["rev-parse", "HEAD"]) {
         Ok(head) => head,
         Err(err) => return halt(cwd, ledger, run, &err),
     };
-    let authorized = match ledger.authorization_at(&head) {
-        Ok(Some(auth)) if auth.branch == run.branch && auth.commit_sha == head => true,
-        Ok(_) => false,
-        Err(err) => return halt(cwd, ledger, run, &err.to_string()),
+    let authorized = match authorized_at(ledger, run, &head) {
+        Ok(authorized) => authorized,
+        Err(err) => return halt(cwd, ledger, run, &err),
     };
     if !authorized {
         return halt(cwd, ledger, run, "HEAD moved after authorization");
@@ -1223,7 +1256,7 @@ fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
         return halt(cwd, ledger, run, "origin is missing");
     }
     let spec = format!("{head}:refs/heads/{}", run.branch);
-    if let Err(err) = git(cwd, &["push", "-u", "origin", &spec]) {
+    if let Err(err) = git(cwd, &["push", "--no-follow-tags", "-u", "origin", &spec]) {
         return halt(cwd, ledger, run, &err);
     }
     let body = report_body(ledger, run.id);
@@ -1369,5 +1402,100 @@ fn fail(text: &str) -> RunOutput {
     RunOutput {
         text: format!("{text}\n"),
         code: 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::drive;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn bare_has(bare: &Path, rev: &str) -> bool {
+        Command::new("git")
+            .args([
+                "--git-dir",
+                bare.to_str().expect("utf8"),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                rev,
+            ])
+            .status()
+            .expect("rev-parse")
+            .success()
+    }
+
+    #[test]
+    fn drive_stops_classic_or_unset_workflow_without_pushing() {
+        for workflow in [Some("classic"), None] {
+            let root = tempfile::tempdir().expect("temp");
+            let bare = root.path().join("origin.git");
+            let work = root.path().join("work");
+            fs::create_dir(&work).expect("work");
+            git(
+                root.path(),
+                &["init", "--bare", "-b", "main", bare.to_str().unwrap()],
+            );
+            git(&work, &["init", "-b", "main"]);
+            git(&work, &["config", "user.email", "relaybook@example.com"]);
+            git(&work, &["config", "user.name", "Relaybook"]);
+            git(&work, &["config", "commit.gpgsign", "false"]);
+            fs::write(work.join("README.md"), "seed\n").expect("write");
+            git(&work, &["add", "README.md"]);
+            git(&work, &["commit", "-m", "seed"]);
+            git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+            git(&work, &["push", "-u", "origin", "main"]);
+            fs::write(work.join("ship.txt"), "ship\n").expect("ship");
+            git(&work, &["add", "ship.txt"]);
+            git(&work, &["commit", "-m", "ship"]);
+            let db = work.join(".relaybook").join("ledger.db");
+            let mut ledger = relaybook_core::Ledger::initialize(&db).expect("init");
+            ledger.set_setting("mode", "auto").expect("mode");
+            let run = ledger
+                .start_run("prd.md", "abc", "relaybook/prd", workflow)
+                .expect("run");
+            assert_eq!(run.status, "active");
+            assert_eq!(run.workflow.as_deref(), workflow);
+            ledger.set_setting("reviewer", "codex").expect("reviewer");
+            ledger.set_setting("workflow", "gated").expect("gated");
+            drop(ledger);
+
+            let output = drive(&db, &work, true);
+            assert_eq!(output.code, 1, "{}", output.text);
+            assert!(
+                output.text.contains("workflow changed during run"),
+                "{}",
+                output.text
+            );
+            assert!(
+                !bare_has(&bare, "refs/heads/relaybook/prd"),
+                "workflow {workflow:?} was pushed"
+            );
+            let ledger = relaybook_core::Ledger::open(&db).expect("open");
+            let stored = ledger.latest_run().expect("latest").expect("row");
+            assert_eq!(stored.status, "stopped");
+            assert_eq!(stored.workflow.as_deref(), workflow);
+            assert_eq!(
+                stored.stop_reason.as_deref(),
+                Some("workflow changed during run")
+            );
+        }
     }
 }

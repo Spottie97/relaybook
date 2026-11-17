@@ -773,3 +773,253 @@ fn spawn_claim(
         ledger.claim_task("auth", by)
     })
 }
+
+const OWNED: &str = "a gated run owns this; use relaybook approve / run --resume";
+const TASK_REVIEW: &str =
+    r#"{"findings":"none","security":"ok","tests_checked":"cargo test","not_checked":"none"}"#;
+const RELEASE_REVIEW: &str = r#"{"findings":"none","security":"ok","tests_checked":"cargo test","not_checked":"none","prd_covered":true,"gaps":"none"}"#;
+
+fn report_verdict(path: &std::path::Path, slug: &str) -> Option<String> {
+    let conn = rusqlite::Connection::open(path).expect("open");
+    conn.query_row(
+        "SELECT r.verdict FROM reports AS r
+         JOIN tasks AS t ON t.id = r.task_id
+         WHERE t.slug = ?1
+         ORDER BY r.id DESC
+         LIMIT 1",
+        [slug],
+        |row| row.get(0),
+    )
+    .expect("verdict")
+}
+
+#[test]
+fn stale_run_save_does_not_overwrite_a_newer_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.set_setting("reviewer", "codex").expect("reviewer");
+    ledger.set_setting("workflow", "gated").expect("gated");
+    let mut run = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("run");
+    let mut stale = run.clone();
+    run.status = "complete".to_string();
+    run.stage = "done".to_string();
+    run.stop_reason = Some("https://example.test/pr/1".to_string());
+    ledger.save_run(&mut run).expect("complete");
+    stale.status = "stopped".to_string();
+    stale.stop_reason = Some("lost".to_string());
+    let err = ledger.save_run(&mut stale).expect_err("stale");
+    assert_eq!(err.to_string(), "run changed concurrently");
+    let stored = ledger.latest_run().expect("latest").expect("row");
+    assert_eq!(stored.status, "complete");
+    assert_eq!(stored.stage, "done");
+    assert_eq!(
+        stored.stop_reason.as_deref(),
+        Some("https://example.test/pr/1")
+    );
+}
+
+#[test]
+fn ownership_writes_see_a_gated_run_that_appeared_before_the_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.set_setting("reviewer", "codex").expect("reviewer");
+    ledger.set_setting("workflow", "gated").expect("gated");
+    for slug in ["owned", "fresh", "acceptme", "accepttoo", "free"] {
+        ledger.create_task(slug, slug).expect("task");
+    }
+    for slug in ["acceptme", "accepttoo"] {
+        ledger
+            .claim_task_anchored(slug, "cursor", None, || Ok(Some("base".to_string())))
+            .expect("claim");
+        ledger
+            .finish_task(slug, None, Some("abc123"))
+            .expect("done");
+        ledger
+            .start_review(
+                "task",
+                Some(slug),
+                None,
+                "feature",
+                "codex",
+                None,
+                "abc123",
+                None,
+                "fp",
+            )
+            .expect("start");
+        ledger
+            .record_review(
+                "task",
+                Some(slug),
+                "codex",
+                "abc123",
+                "abc123",
+                "fp",
+                "approved",
+                TASK_REVIEW,
+                false,
+            )
+            .expect("record");
+    }
+    ledger
+        .start_review(
+            "task",
+            Some("owned"),
+            None,
+            "feature",
+            "codex",
+            None,
+            "abc123",
+            None,
+            "fp",
+        )
+        .expect("pending task");
+    ledger
+        .start_review(
+            "release", None, None, "feature", "codex", None, "abc123", None, "fp",
+        )
+        .expect("pending release");
+    assert!(ledger.active_run().expect("active").is_none());
+
+    let barrier = Arc::new(Barrier::new(2));
+    let worker_path = path.clone();
+    let worker_barrier = Arc::clone(&barrier);
+    let worker = thread::spawn(move || {
+        worker_barrier.wait();
+        let mut other = Ledger::open(&worker_path).expect("open");
+        let mut run = other
+            .start_run("prd.md", "digest", "feature", Some("gated"))
+            .expect("run");
+        run.stage = "gate_plan".to_string();
+        run.status = "waiting".to_string();
+        other.save_run(&mut run).expect("wait");
+        let conn = rusqlite::Connection::open(&worker_path).expect("open");
+        for slug in ["owned", "fresh", "acceptme", "accepttoo"] {
+            conn.execute(
+                "UPDATE tasks SET run_id = ?1 WHERE slug = ?2",
+                rusqlite::params![run.id, slug],
+            )
+            .expect("link");
+        }
+        worker_barrier.wait();
+    });
+    barrier.wait();
+    barrier.wait();
+    worker.join().expect("worker");
+
+    let err = ledger
+        .set_setting_with("workflow", "classic", true)
+        .expect_err("leave");
+    assert_eq!(err.to_string(), OWNED);
+    assert_eq!(ledger.settings().expect("settings").workflow, "gated");
+    ledger.set_setting("mode", "auto").expect("other settings");
+
+    let err = ledger
+        .start_review(
+            "task",
+            Some("fresh"),
+            None,
+            "feature",
+            "codex",
+            None,
+            "abc123",
+            None,
+            "fp",
+        )
+        .expect_err("fresh");
+    assert_eq!(err.to_string(), OWNED);
+    assert!(
+        ledger
+            .latest_review("task", Some("fresh"))
+            .expect("review")
+            .is_none()
+    );
+
+    let release_id = ledger
+        .latest_review("release", None)
+        .expect("release")
+        .expect("pending")
+        .id;
+    let err = ledger
+        .record_review(
+            "release",
+            None,
+            "codex",
+            "abc123",
+            "abc123",
+            "fp",
+            "approved",
+            RELEASE_REVIEW,
+            false,
+        )
+        .expect_err("record release");
+    assert_eq!(err.to_string(), OWNED);
+    let release = ledger
+        .latest_review("release", None)
+        .expect("release")
+        .expect("row");
+    assert_eq!(release.id, release_id);
+    assert_eq!(release.verdict, None);
+
+    let err = ledger
+        .start_review(
+            "release", None, None, "feature", "codex", None, "abc123", None, "fp",
+        )
+        .expect_err("start release");
+    assert_eq!(err.to_string(), OWNED);
+    assert_eq!(
+        ledger
+            .latest_review("release", None)
+            .expect("release")
+            .expect("row")
+            .id,
+        release_id
+    );
+
+    let err = ledger
+        .record_review(
+            "task",
+            Some("owned"),
+            "codex",
+            "abc123",
+            "abc123",
+            "fp",
+            "approved",
+            TASK_REVIEW,
+            false,
+        )
+        .expect_err("record owned");
+    assert_eq!(err.to_string(), OWNED);
+    let owned = ledger
+        .latest_review("task", Some("owned"))
+        .expect("review")
+        .expect("row");
+    assert_eq!(owned.verdict, None);
+
+    let err = ledger
+        .accept_gated_report("acceptme", "abc123", || Ok(()))
+        .expect_err("accept gated");
+    assert_eq!(err.to_string(), OWNED);
+    let err = ledger.accept_report("accepttoo").expect_err("accept");
+    assert_eq!(err.to_string(), OWNED);
+    assert_eq!(report_verdict(&path, "acceptme"), None);
+    assert_eq!(report_verdict(&path, "accepttoo"), None);
+
+    ledger
+        .start_review(
+            "task",
+            Some("free"),
+            None,
+            "feature",
+            "codex",
+            None,
+            "abc123",
+            None,
+            "fp",
+        )
+        .expect("free task is not owned");
+}

@@ -724,7 +724,7 @@ fn v033_statements_are_refused_on_gated_v8() {
         let mut ledger = Ledger::open(&path).expect("open");
         let mut saved = ledger.active_run().expect("active").expect("row");
         saved.stage = "execute".to_string();
-        ledger.save_run(&saved).expect("save");
+        ledger.save_run(&mut saved).expect("save");
     }
     let conn = Connection::open(&path).expect("open");
     let bumped: (String, i64) = conn
@@ -837,7 +837,7 @@ fn v033_statements_still_work_on_classic_v8() {
             .expect("start");
         let mut saved = run;
         saved.stage = "execute".to_string();
-        ledger.save_run(&saved).expect("save");
+        ledger.save_run(&mut saved).expect("save");
     }
     let conn = Connection::open(&path).expect("open");
     let stamp: i64 = conn
@@ -858,12 +858,18 @@ fn classic_setting_still_refuses_unstamped_update_of_gated_run() {
         ledger.set_setting("reviewer", "codex").expect("reviewer");
         ledger.set_setting("workflow", "gated").expect("gated");
         ledger.create_task("auth", "Add auth").expect("task");
-        let run = ledger
+        let mut run = ledger
             .start_run("prd.md", "digest", "feature", Some("gated"))
             .expect("run");
+        // Leaving gated is refused while this run is live. Stop it, change
+        // the setting, then make the same gated row active again.
+        run.status = "stopped".to_string();
+        ledger.save_run(&mut run).expect("stop");
         ledger
             .set_setting_with("workflow", "classic", true)
             .expect("classic");
+        run.status = "active".to_string();
+        ledger.save_run(&mut run).expect("reactivate");
         run.id
     };
     let mut conn = Connection::open(&path).expect("open");
@@ -943,7 +949,7 @@ fn classic_setting_still_refuses_unstamped_update_of_gated_run() {
         let mut ledger = Ledger::open(&path).expect("open");
         let mut saved = ledger.active_run().expect("active").expect("row");
         saved.stage = "execute".to_string();
-        ledger.save_run(&saved).expect("stamped save");
+        ledger.save_run(&mut saved).expect("stamped save");
     }
     let conn = Connection::open(&path).expect("open");
     let stored: (String, i64, String) = conn
@@ -954,7 +960,8 @@ fn classic_setting_still_refuses_unstamped_update_of_gated_run() {
         )
         .expect("saved");
     assert_eq!(stored.0, "execute");
-    assert_eq!(stored.1, 1);
+    // insert 0, stop 1, reactivate 2, this save 3.
+    assert_eq!(stored.1, 3);
     assert_eq!(stored.2, "gated");
 }
 
@@ -983,7 +990,7 @@ fn gated_core_flow_passes_the_guards() {
         .start_run("prd.md", "digest", "feature", Some("gated"))
         .expect("run");
     run.stage = "execute".to_string();
-    ledger.save_run(&run).expect("save");
+    ledger.save_run(&mut run).expect("save");
     drop(ledger);
     let conn = Connection::open(&path).expect("open");
     let stored: (String, i64) = conn

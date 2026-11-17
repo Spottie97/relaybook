@@ -22,6 +22,9 @@ pub struct Run {
     /// Frozen when the run starts. `None` is a row from before that column was
     /// stored; the runner treats it as classic.
     pub workflow: Option<String>,
+    /// Advances on every successful save. A save whose stamp does not match
+    /// the row is stale and does not write.
+    pub write_stamp: i64,
 }
 
 pub fn latest(conn: &Connection) -> Result<Option<Run>, Error> {
@@ -73,13 +76,13 @@ pub fn insert(
     load(conn, conn.last_insert_rowid())
 }
 
-pub fn save(conn: &Connection, run: &Run) -> Result<(), Error> {
-    conn.execute(
+pub fn save(conn: &Connection, run: &mut Run) -> Result<(), Error> {
+    let changed = conn.execute(
         "UPDATE runs SET
             stage = ?1, cycle = ?2, agent_calls = ?3, est_cost_usd = ?4, status = ?5,
             stop_reason = ?6, failure_streak = ?7, current_slug = ?8, complete_requested = ?9,
             write_stamp = write_stamp + 1
-         WHERE id = ?10",
+         WHERE id = ?10 AND write_stamp = ?11",
         params![
             run.stage,
             run.cycle,
@@ -91,8 +94,15 @@ pub fn save(conn: &Connection, run: &Run) -> Result<(), Error> {
             run.current_slug,
             i64::from(run.complete_requested),
             run.id,
+            run.write_stamp,
         ],
     )?;
+    if changed != 1 {
+        return Err(Error::InvalidSetting(
+            "run changed concurrently".to_string(),
+        ));
+    }
+    run.write_stamp += 1;
     Ok(())
 }
 
@@ -152,7 +162,7 @@ fn select_run(tail: &str) -> String {
     format!(
         "SELECT id, prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd,
                 status, stop_reason, started_at, failure_streak, current_slug, complete_requested,
-                workflow
+                workflow, write_stamp
          FROM runs {tail}"
     )
 }
@@ -175,6 +185,7 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         current_slug: row.get(12)?,
         complete_requested: complete != 0,
         workflow: row.get(14)?,
+        write_stamp: row.get(15)?,
     })
 }
 
