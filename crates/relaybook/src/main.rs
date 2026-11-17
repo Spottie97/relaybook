@@ -19,6 +19,7 @@ mod managed;
 mod manifest;
 mod paths;
 mod picker;
+mod remote;
 mod render;
 mod runloop;
 mod setup;

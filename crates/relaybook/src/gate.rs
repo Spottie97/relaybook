@@ -272,12 +272,13 @@ pub(crate) fn review_record_task(
     };
     require_gated_clean_tree(cwd, ledger)?;
     let root = repository_root(cwd)?;
-    // Confirmation can sit at a TTY for a long time. Origin, HEAD, cleanliness,
-    // and the fingerprint are read again after it returns, and once more inside
-    // the write transaction immediately before commit.
+    // Confirmation can sit at a TTY for a long time. The publish check, HEAD,
+    // cleanliness, and the fingerprint are read again after it returns.
+    // Inside the write transaction only the local half runs, immediately
+    // before commit.
     let reviewer_override = reviewer_override(&configured, by)?;
     require_gated_clean_tree(cwd, ledger)?;
-    published_origin(&root)?;
+    require_unpublished(ledger, &root, "review")?;
     let head = gitinfo::verified_head(&root).ok_or_else(|| {
         Error::InvalidSetting("review record requires a commit at HEAD".to_string())
     })?;
@@ -372,7 +373,7 @@ pub(crate) fn review_record_release(
         settings.reviewer
     };
     let checkout = release_checkout(ledger, cwd, "review record")?;
-    published_origin(&checkout.root)?;
+    require_unpublished(ledger, &checkout.root, "release-review")?;
     let sha = sha.trim();
     if sha != checkout.range.head {
         return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
@@ -380,7 +381,7 @@ pub(crate) fn review_record_release(
     ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
     let reviewer_override = reviewer_override(&configured, by)?;
     let checkout = release_checkout(ledger, cwd, "review record")?;
-    published_origin(&checkout.root)?;
+    require_unpublished(ledger, &checkout.root, "release-review")?;
     if sha != checkout.range.head {
         return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
     }
@@ -433,7 +434,6 @@ pub(crate) fn prepare_authorize(
         ));
     }
     let checkout = release_checkout(ledger, cwd, "release authorize")?;
-    published_origin(&checkout.root)?;
     if sha != checkout.range.head {
         return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
     }
@@ -451,7 +451,7 @@ pub(crate) fn prepare_authorize(
 
 pub(crate) fn recheck_release_authorize(root: &Path, sha: &str) -> Result<(), Error> {
     ensure_gated_clean(root)?;
-    published_origin(root)?;
+    crate::remote::refuse_local(root)?;
     let head = gitinfo::verified_head(root).ok_or_else(|| {
         Error::InvalidSetting("release authorize requires a commit at HEAD".to_string())
     })?;
@@ -461,7 +461,7 @@ pub(crate) fn recheck_release_authorize(root: &Path, sha: &str) -> Result<(), Er
     Ok(())
 }
 
-/// Cleanliness, HEAD, fingerprint, and origin-ref absence for one record
+/// Cleanliness, HEAD, fingerprint, and local publish absence for one record
 /// attempt. `sha` and `fingerprint` were captured for this attempt; they must
 /// still describe the worktree when the verdict commits.
 pub(crate) fn recheck_review_record(
@@ -470,7 +470,7 @@ pub(crate) fn recheck_review_record(
     fingerprint: &str,
 ) -> Result<(), Error> {
     ensure_gated_clean(root)?;
-    published_origin(root)?;
+    crate::remote::refuse_local(root)?;
     let head = gitinfo::verified_head(root).ok_or_else(|| {
         Error::InvalidSetting("review record requires a commit at HEAD".to_string())
     })?;
@@ -486,14 +486,51 @@ pub(crate) fn recheck_review_record(
     Ok(())
 }
 
-pub(crate) fn published_origin(root: &Path) -> Result<(), Error> {
-    let branch = gitinfo::branch(root)
-        .ok_or_else(|| Error::InvalidSetting("a branch is required".to_string()))?;
-    let origin = format!("refs/remotes/origin/{branch}");
-    if gitinfo::rev_exists(root, &origin).map_err(Error::InvalidSetting)? {
-        return Err(Error::InvalidSetting(format!("{origin} exists")));
+pub(crate) enum PublishScreen {
+    Clear,
+    Present(String),
+    Unknown(String),
+}
+
+pub(crate) fn screen_publish(
+    ledger: &mut Ledger,
+    root: &Path,
+    context: &str,
+) -> Result<PublishScreen, Error> {
+    let mode = ledger.settings()?.remote_check;
+    let view = crate::remote::screen(root, &mode)?;
+    ledger.record_remote_check(&relaybook_core::RemoteCheckDraft {
+        context: context.to_string(),
+        branch: view.branch.clone(),
+        head_sha: view.head_sha.clone(),
+        remote: view.remote.clone(),
+        status: view.status.to_string(),
+        detail: view.detail.clone(),
+        overridden: false,
+    })?;
+    match view.status {
+        "present" => Ok(PublishScreen::Present(
+            view.message.unwrap_or_else(|| "published".to_string()),
+        )),
+        "unknown" => Ok(PublishScreen::Unknown(
+            view.message
+                .unwrap_or_else(|| "remote check failed".to_string()),
+        )),
+        _ => Ok(PublishScreen::Clear),
     }
-    Ok(())
+}
+
+pub(crate) fn require_unpublished(
+    ledger: &mut Ledger,
+    root: &Path,
+    context: &str,
+) -> Result<(), Error> {
+    match screen_publish(ledger, root, context)? {
+        PublishScreen::Clear => Ok(()),
+        PublishScreen::Present(message) | PublishScreen::Unknown(message) => {
+            Err(Error::InvalidSetting(message))
+        }
+    }
 }
 
 pub(crate) fn repository_root(cwd: &Path) -> Result<PathBuf, Error> {

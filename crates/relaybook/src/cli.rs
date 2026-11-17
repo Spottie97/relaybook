@@ -1128,9 +1128,22 @@ fn range_text(range: &gitinfo::ReleaseRange) -> String {
 fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
     let sha = sha.trim();
     let mut ledger = open_ledger(cwd)?;
-    gate::prepare_authorize(&ledger, cwd, sha)?;
+    let first = gate::prepare_authorize(&ledger, cwd, sha)?;
+    if let gate::PublishScreen::Present(message) =
+        gate::screen_publish(&mut ledger, &first.root, "authorize")?
+    {
+        return Err(invalid_setting(message));
+    }
     confirm_release()?;
     let checkout = gate::prepare_authorize(&ledger, cwd, sha)?;
+    match gate::screen_publish(&mut ledger, &checkout.root, "authorize")? {
+        gate::PublishScreen::Present(message) => return Err(invalid_setting(message)),
+        gate::PublishScreen::Unknown(_) => {
+            confirm_without_remote()?;
+            ledger.set_latest_remote_override()?;
+        }
+        gate::PublishScreen::Clear => {}
+    }
     let root = checkout.root.clone();
     let sha_owned = sha.to_string();
     let commits = checkout.range.commits.clone();
@@ -1144,6 +1157,21 @@ fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
         move || gate::recheck_release_authorize(&root, &sha_owned),
     )?;
     json_outcome(authorization, render::line(&format!("authorized {sha}")))
+}
+
+fn confirm_without_remote() -> Result<(), Fail> {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(invalid_setting(
+            "proceeding without remote verification requires confirmation at a TTY",
+        ));
+    }
+    match uninstall::confirm("Proceed without remote verification?") {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(invalid_setting(
+            "proceeding without remote verification was not confirmed",
+        )),
+        Err(message) => Err(invalid_setting(message)),
+    }
 }
 
 fn confirm_release() -> Result<(), Fail> {
@@ -1185,6 +1213,7 @@ fn release_status(cwd: &Path) -> Result<Outcome, Fail> {
         .collect();
     let review = ledger.release_review_at(&range.head)?;
     let authorization = ledger.authorization_at(&range.head)?;
+    let remote = remote_status(&ledger)?;
     let label = release.unwrap_or("unsigned");
     let data = serde_json::json!({
         "branch": branch,
@@ -1195,11 +1224,43 @@ fn release_status(cwd: &Path) -> Result<Outcome, Fail> {
         "tasks": tasks,
         "review": review,
         "authorization": authorization,
+        "remote": remote,
     });
+    let remote_line = match remote.get("status").and_then(serde_json::Value::as_str) {
+        Some(status) => format!(
+            "remote {} {status}",
+            remote["remote_check"].as_str().unwrap_or("online")
+        ),
+        None => format!(
+            "remote {}",
+            remote["remote_check"].as_str().unwrap_or("online")
+        ),
+    };
     json_outcome(
         data,
-        render::line(&format!("release {label} {}", range.head)),
+        format!(
+            "{}{}",
+            render::line(&format!("release {label} {}", range.head)),
+            render::line(&remote_line)
+        ),
     )
+}
+
+fn remote_status(ledger: &Ledger) -> Result<serde_json::Value, Fail> {
+    let settings = ledger.settings()?;
+    let latest = ledger.latest_remote_check()?;
+    let detail = latest.as_ref().and_then(|row| row.detail.clone());
+    let push_url_differs = detail
+        .as_deref()
+        .is_some_and(|text| text.lines().any(|line| line == "push_url_differs=true"));
+    Ok(serde_json::json!({
+        "remote_check": settings.remote_check,
+        "status": latest.as_ref().map(|row| row.status.clone()),
+        "remote": latest.as_ref().and_then(|row| row.remote.clone()),
+        "push_url_differs": push_url_differs,
+        "override": latest.as_ref().is_some_and(|row| row.overridden),
+        "detail": detail,
+    }))
 }
 
 fn implement_anchor(ledger: &Ledger, slug: &str) -> Result<(Option<String>, Option<String>), Fail> {
@@ -1467,10 +1528,30 @@ fn workflow_leave_confirmed(ledger: &Ledger, key: &str, value: &str) -> Result<b
     Ok(true)
 }
 
+fn remote_local_confirmed(ledger: &Ledger, key: &str, value: &str) -> Result<bool, Fail> {
+    if key != "remote_check"
+        || value.trim() != "local"
+        || ledger.settings()?.remote_check == "local"
+    {
+        return Ok(false);
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Err(invalid_setting(
+            "remote_check=local requires confirmation at a TTY",
+        ));
+    }
+    match uninstall::confirm("Set remote_check=local?") {
+        Ok(true) => Ok(true),
+        Ok(false) => Err(invalid_setting("remote_check=local was not confirmed")),
+        Err(message) => Err(invalid_setting(message)),
+    }
+}
+
 fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     let leave_confirmed = workflow_leave_confirmed(&ledger, key, value)?;
-    let settings = ledger.set_setting_with(key, value, leave_confirmed)?;
+    let remote_confirmed = remote_local_confirmed(&ledger, key, value)?;
+    let settings = ledger.set_setting_with(key, value, leave_confirmed || remote_confirmed)?;
     let shown = match key {
         "est_cost_cap_usd" => settings
             .est_cost_cap_usd
@@ -1480,6 +1561,7 @@ fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
         "gates" => settings.gates.clone(),
         "reviewer" => settings.reviewer.clone(),
         "workflow" => settings.workflow.clone(),
+        "remote_check" => settings.remote_check.clone(),
         "max_cycles" => settings.max_cycles.to_string(),
         "max_reopens_per_task" => settings.max_reopens_per_task.to_string(),
         "max_agent_calls" => settings.max_agent_calls.to_string(),

@@ -70,6 +70,7 @@ relaybook config set workflow gated
 | `gates` | `plan` | `none`, `plan`, or `plan,review` |
 | `reviewer` | `claude` | `claude` or `codex` |
 | `workflow` | `classic` | `classic` or `gated` |
+| `remote_check` | `online` | `online` or `local` |
 | `max_cycles` | 20 | integer, at least 1 |
 | `max_reopens_per_task` | 2 | integer, at least 1 |
 | `max_agent_calls` | 60 | integer, at least 1 |
@@ -77,6 +78,8 @@ relaybook config set workflow gated
 | `est_cost_cap_usd` | unset | a number greater than 0, or `unset` to clear it |
 
 `workflow=gated` requires `reviewer=codex`. Set `reviewer` first. `relaybook config set workflow gated` fails with `workflow=gated requires reviewer=codex` while the reviewer is `claude`. Setting `workflow=gated` does not ask for a terminal. Leaving it does: `relaybook config set workflow classic` prompts `Leave gated workflow?` and requires a terminal. A value that trims to `classic` is the same change. The write checks the current workflow again, so a concurrent change to `gated` cannot skip that prompt. Without a terminal it fails with `leaving workflow=gated requires confirmation at a TTY` and the setting stays `gated`. The gated commands are in [orca-workflow.md](orca-workflow.md). `relaybook run` is refused while the workflow is `gated`. See [auto-mode.md](auto-mode.md#gated-workflow).
+
+`remote_check` defaults to `online`. Gated review and release authorization then query every remote. `relaybook config set remote_check local` prompts `Set remote_check=local?` and requires a terminal. Without one it fails with `remote_check=local requires confirmation at a TTY` and the setting stays `online`. A value that trims to `local` is the same change. Setting `remote_check=online`, and setting `local` when it is already `local`, does not ask. The publish check is in [Nothing is published before sign-off](orca-workflow.md#nothing-is-published-before-sign-off).
 
 `relaybook mode` prints the current mode. `relaybook mode auto` sets it. `relaybook gates` prints the current checkpoints. `relaybook gates plan` sets them. The same words work from `/relaybook` in Claude Code and Cursor. `/relaybook` with no arguments shows status and a menu.
 

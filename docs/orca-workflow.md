@@ -43,7 +43,7 @@ relaybook config set workflow gated
 
 ## Nothing is published before sign-off
 
-`relaybook review record` and `relaybook release authorize` refuse when `refs/remotes/origin/<branch>` exists. That check misses other remote names and other clones. Manual commands still never push. A person or an agent can run `git push` outside Relaybook.
+`relaybook review record` and `relaybook release authorize` refuse when the branch, `HEAD`, or any commit in `merge-base(main, HEAD)..HEAD` is already on a configured remote. The online check is `git ls-remote` of every remote, before the ledger write. Inside the write, only local `refs/remotes` are read. A commit pushed under another name, a tag, or `refs/pull/*` still counts. A stale `refs/remotes/<remote>/<branch>` still refuses after that remote branch is deleted. An unreachable remote, unreadable output, or a timeout fails closed (`remote <name>: timed out` or `remote <name>: ls-remote failed`). The default limit is 20 seconds; `RELAYBOOK_REMOTE_TIMEOUT_SECS` overrides it. The `ls-remote` child sets `GIT_TERMINAL_PROMPT=0` and reads no stdin. `relaybook config set remote_check local` skips the network check and requires a terminal; tracking refs still refuse. When authorize cannot verify the remotes it asks `Proceed without remote verification?` and records `override` 1. `relaybook release status` includes `remote`. A URL containing `user:token@` is stored and printed as `***@`. The check does not see a repository that is not a configured remote, a push that went to a different push URL, or a push from another clone. Manual commands still never push. A person or an agent can run `git push` outside Relaybook.
 
 **Auto mode today:**
 

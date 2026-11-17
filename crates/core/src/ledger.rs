@@ -138,6 +138,31 @@ pub struct ReleaseAuthorization {
     pub created_at: String,
 }
 
+/// One `remote_checks` insert. `status` is `absent`, `present`, `unknown`, or `local`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCheckDraft {
+    pub context: String,
+    pub branch: String,
+    pub head_sha: String,
+    pub remote: Option<String>,
+    pub status: String,
+    pub detail: String,
+    pub overridden: bool,
+}
+
+/// Latest gated publish check stored in `remote_checks`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RemoteCheck {
+    pub context: String,
+    pub branch: String,
+    pub head_sha: String,
+    pub remote: Option<String>,
+    pub status: String,
+    pub detail: Option<String>,
+    pub overridden: bool,
+    pub created_at: String,
+}
+
 impl Ledger {
     pub fn initialize(path: &std::path::Path) -> Result<Self, Error> {
         if let Some(parent) = path.parent() {
@@ -609,18 +634,88 @@ impl Ledger {
 
     /// Writes a setting in one immediate transaction.
     ///
-    /// `leave_gated_confirmed` allows `workflow` to change from `gated` to
-    /// `classic`. The stored value is the trimmed one `settings::set` keeps,
-    /// and that comparison runs inside the write transaction.
+    /// `terminal_confirmed` allows `workflow` to change from `gated` to
+    /// `classic`, and `remote_check` to change to `local`. The stored value
+    /// is the trimmed one `settings::set` keeps, and that comparison runs
+    /// inside the write transaction.
     pub fn set_setting_with(
         &mut self,
         key: &str,
         value: &str,
-        leave_gated_confirmed: bool,
+        terminal_confirmed: bool,
     ) -> Result<crate::settings::Snapshot, Error> {
         self.transaction(|conn| {
-            authorize_workflow_change(conn, key, value, leave_gated_confirmed)?;
+            authorize_workflow_change(conn, key, value, terminal_confirmed)?;
+            authorize_remote_check_change(conn, key, value, terminal_confirmed)?;
             crate::settings::set(conn, key, value)
+        })
+    }
+
+    pub fn record_remote_check(&mut self, draft: &RemoteCheckDraft) -> Result<(), Error> {
+        match draft.status.as_str() {
+            "absent" | "present" | "unknown" | "local" => {}
+            _ => {
+                return Err(Error::InvalidSetting(format!(
+                    "invalid remote status: {}",
+                    draft.status
+                )));
+            }
+        }
+        self.transaction(|conn| {
+            let ts = now(conn)?;
+            conn.execute(
+                "INSERT INTO remote_checks
+                    (context, branch, head_sha, remote, status, detail, override, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    draft.context,
+                    draft.branch,
+                    draft.head_sha,
+                    draft.remote,
+                    draft.status,
+                    draft.detail,
+                    i64::from(draft.overridden),
+                    ts
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn latest_remote_check(&self) -> Result<Option<RemoteCheck>, Error> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT context, branch, head_sha, remote, status, detail, override, created_at
+                 FROM remote_checks
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(RemoteCheck {
+                        context: row.get(0)?,
+                        branch: row.get(1)?,
+                        head_sha: row.get(2)?,
+                        remote: row.get(3)?,
+                        status: row.get(4)?,
+                        detail: row.get(5)?,
+                        overridden: row.get::<_, i64>(6)? != 0,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn set_latest_remote_override(&mut self) -> Result<(), Error> {
+        self.transaction(|conn| {
+            conn.execute(
+                "UPDATE remote_checks SET override = 1
+                 WHERE id = (SELECT MAX(id) FROM remote_checks)",
+                [],
+            )?;
+            Ok(())
         })
     }
 
@@ -1565,14 +1660,31 @@ fn authorize_workflow_change(
     conn: &Connection,
     key: &str,
     value: &str,
-    leave_gated_confirmed: bool,
+    terminal_confirmed: bool,
 ) -> Result<(), Error> {
-    if key != "workflow" || leave_gated_confirmed || value.trim() != "classic" {
+    if key != "workflow" || terminal_confirmed || value.trim() != "classic" {
         return Ok(());
     }
     if crate::settings::load(conn)?.workflow == "gated" {
         return Err(Error::InvalidSetting(
             "leaving workflow=gated requires confirmation at a TTY".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn authorize_remote_check_change(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+    terminal_confirmed: bool,
+) -> Result<(), Error> {
+    if key != "remote_check" || terminal_confirmed || value.trim() != "local" {
+        return Ok(());
+    }
+    if crate::settings::load(conn)?.remote_check != "local" {
+        return Err(Error::InvalidSetting(
+            "remote_check=local requires confirmation at a TTY".to_string(),
         ));
     }
     Ok(())

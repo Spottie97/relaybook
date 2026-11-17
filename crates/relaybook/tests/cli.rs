@@ -2888,30 +2888,17 @@ fn gated_accept_requires_valid_review() {
 #[test]
 fn gated_refuses_when_origin_branch_exists() {
     let fake = GraphifyFake::install();
-    let allowed = tempfile::tempdir().expect("tempdir");
-    let head = prepare_gated_review(allowed.path(), &fake);
+    let other = tempfile::tempdir().expect("tempdir");
+    let head = prepare_gated_review(other.path(), &fake);
     git(
-        allowed.path(),
+        other.path(),
         &["update-ref", "refs/remotes/origin/other", &head],
     );
-    let recorded = data_of(
-        allowed.path(),
-        &[
-            "review",
-            "record",
-            "auth",
-            "--by",
-            "codex",
-            "--sha",
-            &head,
-            "--verdict",
-            "approved",
-            "--text",
-            TASK_REVIEW_TEXT,
-            "--json",
-        ],
+    assert_failure(
+        &record_review(other.path(), "codex", &head, "approved", false),
+        "refs/remotes/origin/other",
     );
-    assert_eq!(recorded["verdict"], json!("approved"));
+    assert_eq!(task_reviews(other.path())[0].1, None);
 
     let blocked = tempfile::tempdir().expect("tempdir");
     let head = prepare_gated_review(blocked.path(), &fake);
@@ -2947,6 +2934,429 @@ fn gated_refuses_when_origin_branch_exists() {
     );
     assert_eq!(recorded["verdict"], json!("approved"));
     assert_eq!(recorded["commit_sha"], json!(head));
+}
+
+#[test]
+fn remote_check_finds_branch_on_a_remote_not_named_origin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let _upstream = bare_remote(dir.path(), "upstream");
+    git(dir.path(), &["push", "upstream", "HEAD:refs/heads/main"]);
+    delete_ref_if_present(dir.path(), "refs/remotes/upstream/main");
+    delete_ref_if_present(dir.path(), "refs/remotes/upstream/HEAD");
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "refs/heads/main exists on upstream",
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+}
+
+#[test]
+fn remote_check_finds_commit_pushed_under_another_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let _origin = bare_remote(dir.path(), "origin");
+    git(dir.path(), &["push", "origin", "HEAD:refs/heads/other"]);
+    delete_ref_if_present(dir.path(), "refs/remotes/origin/other");
+    delete_ref_if_present(dir.path(), "refs/remotes/origin/HEAD");
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "refs/heads/other",
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+}
+
+#[test]
+fn remote_check_checks_every_remote() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let _origin = bare_remote(dir.path(), "origin");
+    let _backup = bare_remote(dir.path(), "backup");
+    git(dir.path(), &["push", "backup", "HEAD:refs/heads/main"]);
+    delete_ref_if_present(dir.path(), "refs/remotes/backup/main");
+    delete_ref_if_present(dir.path(), "refs/remotes/backup/HEAD");
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "backup",
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+}
+
+#[test]
+fn remote_check_finds_tag_or_pull_ref_into_range() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let _origin = bare_remote(dir.path(), "origin");
+    git(dir.path(), &["push", "origin", "HEAD:refs/tags/x"]);
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "refs/tags/x",
+    );
+    git(dir.path(), &["push", "origin", ":refs/tags/x"]);
+    git(dir.path(), &["push", "origin", "HEAD:refs/pull/1/head"]);
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "refs/pull/1/head",
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+}
+
+#[test]
+fn stale_tracking_ref_of_deleted_branch_still_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let origin = bare_remote(dir.path(), "origin");
+    git(dir.path(), &["push", "origin", "HEAD:refs/heads/main"]);
+    git(dir.path(), &["fetch", "origin"]);
+    assert!(
+        !rev_missing(dir.path(), "refs/remotes/origin/main"),
+        "fetch did not leave a tracking ref"
+    );
+    let bare = origin.path().to_str().expect("utf8");
+    git(
+        dir.path(),
+        &["--git-dir", bare, "update-ref", "-d", "refs/heads/main"],
+    );
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "published earlier; deleting the remote branch does not unpublish it",
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+}
+
+#[test]
+fn unreachable_remote_fails_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "/nonexistent/relaybook-r7-missing",
+        ],
+    );
+    let output = relay_output(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_json_failure(&output, "origin");
+    assert_json_failure(&output, "ls-remote failed");
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+    let status = data_of(dir.path(), &["release", "status", "--json"]);
+    assert_eq!(status["remote"]["remote"], json!("origin"));
+    assert_eq!(status["remote"]["status"], json!("unknown"));
+}
+
+#[test]
+fn remote_check_times_out_and_never_hangs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let _origin = bare_remote(dir.path(), "origin");
+    let gate = tempfile::tempdir().expect("gate");
+    let started = Instant::now();
+    let output = command_with_git_shim(dir.path(), gate.path(), "ls-remote")
+        .env("RELAYBOOK_REMOTE_TIMEOUT_SECS", "2")
+        .args([
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ])
+        .output()
+        .expect("output");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "elapsed {:?}",
+        started.elapsed()
+    );
+    assert_failure(&output, "timed out");
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+}
+
+#[test]
+fn remote_check_passes_no_prompt_env_and_null_stdin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let _origin = bare_remote(dir.path(), "origin");
+    let gate = tempfile::tempdir().expect("gate");
+    let log_dir = tempfile::tempdir().expect("log");
+    let log = log_dir.path().join("git-env.log");
+    let output = command_with_git_shim(dir.path(), gate.path(), "not-a-git-command")
+        .env("RELAYBOOK_GIT_ENV_LOG", &log)
+        .args([
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ])
+        .output()
+        .expect("output");
+    assert!(output.status.success(), "{}", summarize(&output));
+    let text = fs::read_to_string(&log).expect("env log");
+    assert!(
+        text.lines().any(|line| {
+            line.contains("ls-remote")
+                && line.contains("GIT_TERMINAL_PROMPT=0")
+                && line.contains("stdin=/dev/null")
+        }),
+        "{text}"
+    );
+}
+
+#[test]
+fn remote_check_ignores_push_url_rewrite_and_reports_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let _origin = bare_remote(dir.path(), "origin");
+    git(dir.path(), &["push", "origin", "HEAD:refs/heads/main"]);
+    delete_ref_if_present(dir.path(), "refs/remotes/origin/main");
+    delete_ref_if_present(dir.path(), "refs/remotes/origin/HEAD");
+    git(
+        dir.path(),
+        &[
+            "config",
+            "remote.origin.pushurl",
+            "/nonexistent/push-disabled",
+        ],
+    );
+    let fetch = git(dir.path(), &["remote", "get-url", "origin"]);
+    git(
+        dir.path(),
+        &["config", "url./nonexistent/rewritten.pushInsteadOf", &fetch],
+    );
+    assert_failure(
+        &record_review(dir.path(), "codex", &head, "approved", false),
+        "refs/heads/main exists on origin",
+    );
+    let status = data_of(dir.path(), &["release", "status", "--json"]);
+    assert_eq!(status["remote"]["push_url_differs"], json!(true));
+}
+
+#[test]
+fn remote_urls_are_redacted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://user:super-secret-token@127.0.0.1:1/repo.git",
+        ],
+    );
+    let output = relay_output(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert!(!output.status.success(), "{}", summarize(&output));
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!shown.contains("super-secret-token"), "{shown}");
+    assert!(!shown.contains("user:super-secret-token"), "{shown}");
+    let detail = remote_detail(dir.path());
+    assert!(!detail.contains("super-secret-token"), "{detail}");
+    assert!(detail.contains("***@"), "{detail}");
+}
+
+#[test]
+fn release_authorize_offline_needs_second_confirmation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "/nonexistent/relaybook-r7-offline",
+        ],
+    );
+    let declined = answer_prompts(
+        dir.path(),
+        &["release", "authorize", "--sha", &head],
+        &["y\n", "n\n"],
+    );
+    assert!(
+        !declined.success,
+        "code {} {}",
+        declined.code, declined.output
+    );
+    assert!(
+        declined
+            .output
+            .contains("Proceed without remote verification?"),
+        "{}",
+        declined.output
+    );
+    assert!(authorizations(dir.path()).is_empty());
+    assert_eq!(latest_remote_override(dir.path()), 0);
+
+    let accepted = answer_prompts(
+        dir.path(),
+        &["release", "authorize", "--sha", &head],
+        &["y\n", "y\n"],
+    );
+    assert!(
+        accepted.success,
+        "code {} {}",
+        accepted.code, accepted.output
+    );
+    assert_eq!(authorizations(dir.path()), vec![head]);
+    assert_eq!(latest_remote_override(dir.path()), 1);
+    let status = data_of(dir.path(), &["release", "status", "--json"]);
+    assert_eq!(status["remote"]["override"], json!(true));
+    assert_eq!(status["remote"]["status"], json!("unknown"));
+}
+
+#[test]
+fn remote_check_local_requires_terminal() {
+    let plain = tempfile::tempdir().expect("tempdir");
+    run(plain.path(), ["init"]).assert().success();
+    let denied = command(plain.path())
+        .stdin(Stdio::null())
+        .args(["config", "set", "remote_check", "local"])
+        .output()
+        .expect("output");
+    assert_failure(&denied, "remote_check=local requires confirmation at a TTY");
+    let shown = run(plain.path(), ["config"]).output().expect("config");
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("remote_check online"), "{shown}");
+
+    let declined = answer_prompts(
+        plain.path(),
+        &["config", "set", "remote_check", "local"],
+        &["n\n"],
+    );
+    assert!(!declined.success, "{}", declined.output);
+    assert!(
+        declined.output.contains("Set remote_check=local?"),
+        "{}",
+        declined.output
+    );
+
+    let accepted = answer_prompts(
+        plain.path(),
+        &["config", "set", "remote_check", " local "],
+        &["y\n"],
+    );
+    assert!(accepted.success, "{}", accepted.output);
+    run(plain.path(), ["config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("remote_check local"));
+    command(plain.path())
+        .stdin(Stdio::null())
+        .args(["config", "set", "remote_check", "local"])
+        .assert()
+        .success()
+        .stdout("remote_check local\n");
+    command(plain.path())
+        .stdin(Stdio::null())
+        .args(["config", "set", "remote_check", "online"])
+        .assert()
+        .success()
+        .stdout("remote_check online\n");
+    run(plain.path(), ["config", "set", "remote_check", "sometimes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid remote_check: sometimes"));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    git(
+        dir.path(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "/nonexistent/relaybook-r7-local-only",
+        ],
+    );
+    let switched = answer_prompts(
+        dir.path(),
+        &["config", "set", "remote_check", "local"],
+        &["y\n"],
+    );
+    assert!(switched.success, "{}", switched.output);
+    let recorded = data_of(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "codex",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+            "--json",
+        ],
+    );
+    assert_eq!(recorded["verdict"], json!("approved"));
+    let status = data_of(dir.path(), &["release", "status", "--json"]);
+    assert_eq!(status["remote"]["remote_check"], json!("local"));
+    assert_eq!(status["remote"]["status"], json!("local"));
 }
 
 const RELEASE_REVIEW_TEXT: &str = r#"{"findings":"none","security":"ok","tests_checked":"cargo test","not_checked":"none","prd_covered":true,"gaps":"none"}"#;
@@ -3396,6 +3806,19 @@ fn assert_failure(output: &Output, message: &str) {
         "missing {message} in {}",
         summarize(output)
     );
+}
+
+fn assert_json_failure(output: &Output, message: &str) {
+    assert!(!output.status.success(), "{}", summarize(output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: Value = serde_json::from_str(&stdout).expect("json");
+    let error = envelope["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains(message),
+        "missing {message} in {error}; {}",
+        summarize(output)
+    );
+    assert_eq!(envelope["ok"], json!(false), "{envelope}");
 }
 
 fn task_reviews(dir: &Path) -> Vec<(String, Option<String>, i64, String)> {
@@ -4255,6 +4678,43 @@ fn add_origin(dir: &Path) -> tempfile::TempDir {
     origin
 }
 
+fn bare_remote(dir: &Path, name: &str) -> tempfile::TempDir {
+    let origin = tempfile::tempdir().expect("remote");
+    let path = origin.path().to_str().expect("utf8 remote");
+    git(dir, &["init", "--bare", "-b", "main", path]);
+    git(dir, &["remote", "add", name, path]);
+    origin
+}
+
+fn delete_ref_if_present(dir: &Path, rev: &str) {
+    if !rev_missing(dir, rev) {
+        git(dir, &["update-ref", "-d", rev]);
+    }
+}
+
+fn remote_detail(dir: &Path) -> String {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(db).expect("open");
+    conn.query_row(
+        "SELECT detail FROM remote_checks ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .expect("detail")
+    .unwrap_or_default()
+}
+
+fn latest_remote_override(dir: &Path) -> i64 {
+    let db = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(db).expect("open");
+    conn.query_row(
+        "SELECT override FROM remote_checks ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .expect("override")
+}
+
 fn install_gh(fake: &GraphifyFake) {
     let bin = std::env::split_paths(&fake.path).next().expect("fake bin");
     let dest = bin.join(if cfg!(windows) { "gh.exe" } else { "gh" });
@@ -4371,6 +4831,81 @@ fn authorize_at_tty(dir: &Path, fake: &GraphifyFake, log: Option<&Path>, sha: &s
             Ok(None) => {
                 let _ = ChildKiller::kill(child.as_mut());
                 panic!("timed out waiting for release authorize");
+            }
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    };
+    let buf = recv
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    PtyOutput {
+        success: status.success(),
+        code: status.exit_code(),
+        output: String::from_utf8_lossy(&buf).into_owned(),
+    }
+}
+
+fn answer_prompts(dir: &Path, args: &[&str], answers: &[&str]) -> PtyOutput {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    use portable_pty::{
+        Child as PtyChild, ChildKiller, CommandBuilder, PtySize, native_pty_system,
+    };
+
+    let system = native_pty_system();
+    let pair = system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("pty");
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_relaybook"));
+    for arg in args {
+        cmd.arg(*arg);
+    }
+    cmd.cwd(dir);
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("reader");
+    let mut writer = pair.master.take_writer().expect("writer");
+    let (send, recv) = mpsc::channel();
+    let answers: Vec<String> = answers.iter().map(|answer| (*answer).to_string()).collect();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 1024];
+        let mut sent = 0usize;
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(count) => {
+                    buf.extend_from_slice(&tmp[..count]);
+                    let prompts = buf.windows(5).filter(|window| *window == b"[y/N]").count();
+                    while sent < answers.len() && prompts > sent {
+                        let _ = writer.write_all(answers[sent].as_bytes());
+                        let _ = writer.flush();
+                        sent += 1;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = send.send(buf);
+    });
+    let started = Instant::now();
+    let status = loop {
+        match PtyChild::try_wait(child.as_mut()) {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(20) => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = ChildKiller::kill(child.as_mut());
+                panic!("timed out waiting for prompts");
             }
             Err(err) => panic!("wait failed: {err}"),
         }

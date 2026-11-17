@@ -5,7 +5,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::process::{self, Command};
 use std::thread;
@@ -16,6 +16,7 @@ fn main() {
     let real = env_var("RELAYBOOK_REAL_GIT");
     let real_path = env::var_os("RELAYBOOK_REAL_PATH");
     let args: Vec<OsString> = env::args_os().skip(1).collect();
+    log_env(&args);
     let gate_cmd = env::var("RELAYBOOK_GIT_GATE_CMD").unwrap_or_else(|_| "status".to_string());
     if args.iter().any(|arg| arg == gate_cmd.as_str()) {
         let n = claim_index(&gate);
@@ -43,11 +44,47 @@ fn main() {
     command.env_remove("RELAYBOOK_GIT_GATE_CMD");
     command.env_remove("RELAYBOOK_REAL_GIT");
     command.env_remove("RELAYBOOK_REAL_PATH");
+    command.env_remove("RELAYBOOK_GIT_ENV_LOG");
     match command.status() {
         Ok(status) => process::exit(status.code().unwrap_or(1)),
         Err(err) => {
             eprintln!("git shim: {err}");
             process::exit(2);
+        }
+    }
+}
+
+fn log_env(args: &[OsString]) {
+    let Some(path) = env::var_os("RELAYBOOK_GIT_ENV_LOG") else {
+        return;
+    };
+    let prompt = env::var("GIT_TERMINAL_PROMPT").unwrap_or_else(|_| "unset".to_string());
+    let stdin = stdin_target();
+    let argv = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let line = format!("GIT_TERMINAL_PROMPT={prompt} stdin={stdin} argv={argv}\n");
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn stdin_target() -> String {
+    #[cfg(unix)]
+    {
+        return match fs::read_link("/proc/self/fd/0") {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => "unlinked".to_string(),
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            "tty".to_string()
+        } else {
+            "not-a-tty".to_string()
         }
     }
 }

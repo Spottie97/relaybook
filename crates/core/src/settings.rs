@@ -9,6 +9,7 @@ pub struct Snapshot {
     pub gates: String,
     pub reviewer: String,
     pub workflow: String,
+    pub remote_check: String,
     pub max_cycles: i64,
     pub max_reopens_per_task: i64,
     pub max_agent_calls: i64,
@@ -61,6 +62,7 @@ pub fn load(conn: &Connection) -> Result<Snapshot, Error> {
         gates: value_or(conn, "gates", "plan")?,
         reviewer: value_or(conn, "reviewer", "claude")?,
         workflow: value_or(conn, "workflow", "classic")?,
+        remote_check: value_or(conn, "remote_check", "online")?,
         max_cycles: number_or(conn, "max_cycles", 20)?,
         max_reopens_per_task: number_or(conn, "max_reopens_per_task", 2)?,
         max_agent_calls: number_or(conn, "max_agent_calls", 60)?,
@@ -134,11 +136,12 @@ pub fn hook_wait_line(conn: &Connection) -> Result<Option<String>, Error> {
 
 pub fn format_config(settings: &Snapshot) -> String {
     format!(
-        "mode {}\ngates {}\nreviewer {}\nworkflow {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
+        "mode {}\ngates {}\nreviewer {}\nworkflow {}\nremote_check {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
         settings.mode,
         settings.gates,
         settings.reviewer,
         settings.workflow,
+        settings.remote_check,
         settings.max_cycles,
         settings.max_reopens_per_task,
         settings.max_agent_calls,
@@ -271,6 +274,7 @@ fn validate(conn: &Connection, key: &str, value: &str) -> Result<String, Error> 
         "gates" => one_of(key, value, &["none", "plan", "plan,review"])?,
         "reviewer" => one_of(key, value, &["claude", "codex"])?,
         "workflow" => one_of(key, value, &["classic", "gated"])?,
+        "remote_check" => one_of(key, value, &["online", "local"])?,
         "max_cycles" | "max_reopens_per_task" | "max_agent_calls" | "cursor_timeout_min" => {
             let parsed = value
                 .parse::<i64>()
