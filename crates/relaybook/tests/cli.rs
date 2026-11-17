@@ -1946,6 +1946,56 @@ fn graphify_hiding_helper_drops_cmd_and_bat_shims() {
 }
 
 #[test]
+fn graphify_hiding_helper_does_not_add_a_which_dev_dependency() {
+    enum Section {
+        Dependencies,
+        DevDependencies,
+        Other,
+    }
+
+    let manifest = include_str!("../Cargo.toml");
+    let mut section = Section::Other;
+    let mut normal_which = false;
+    let mut dev_which = false;
+    for raw in manifest.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            section = match header {
+                "dependencies" => Section::Dependencies,
+                "dev-dependencies" => Section::DevDependencies,
+                _ => Section::Other,
+            };
+            continue;
+        }
+        let Some(key) = line.split_once('=').map(|(key, _)| key.trim()) else {
+            continue;
+        };
+        if key != "which" {
+            continue;
+        }
+        match section {
+            Section::Dependencies => normal_which = true,
+            Section::DevDependencies => dev_which = true,
+            Section::Other => {}
+        }
+    }
+    assert!(
+        !dev_which,
+        "which is already a normal dependency; a dev-dependency duplicates it"
+    );
+    assert!(
+        normal_which,
+        "the hiding helper must use the normal which dependency"
+    );
+}
+
+#[test]
 fn flow_never_runs_graphify_extract() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_graph_task(dir.path());
