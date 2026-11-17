@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -15,6 +15,7 @@ fn main() {
         "gh" => gh(&args),
         "claude" => claude(&args),
         "cursor-agent" | "agent" => cursor(&args),
+        "codex" => codex(&args),
         other => {
             eprintln!("unknown fake role {other}");
             std::process::exit(1);
@@ -239,6 +240,10 @@ fn cursor(args: &[String]) {
     relay(&["task", "claim", "work", "--by", "cursor"]);
     let _ = append_file("work.txt", "hello\n");
     git(&["add", "work.txt"]);
+    if kind() == "huge" {
+        let _ = fs::write("huge.txt", "x".repeat(80_000));
+        git(&["add", "huge.txt"]);
+    }
     git(&["commit", "-m", "do the work"]);
     relay(&[
         "task",
@@ -257,6 +262,107 @@ fn cursor(args: &[String]) {
         git(&["push", "origin", "HEAD:main"]);
     }
     emit_stream(r#"{"type":"result","subtype":"success","ok":true}"#);
+}
+
+fn codex(args: &[String]) {
+    if args.first().map(String::as_str) == Some("login") {
+        if env::var("RELAYBOOK_FAKE_CODEX_AUTH").ok().as_deref() == Some("missing") {
+            eprintln!("Not logged in");
+            std::process::exit(1);
+        }
+        println!("Logged in using ChatGPT");
+        return;
+    }
+    if let Ok(log) = env::var("LOG") {
+        append(
+            &PathBuf::from(log).join("codex.args").display().to_string(),
+            &args.join(" "),
+        );
+    }
+    let mut packet = String::new();
+    let _ = std::io::stdin().read_to_string(&mut packet);
+    let _ = packet;
+    let out = flag_value(args, "-o").or_else(|| flag_value(args, "--output-last-message"));
+    match kind().as_str() {
+        "edit" => {
+            let _ = fs::write("reviewer-edit.txt", "edited\n");
+        }
+        "branch" => {
+            git(&["commit", "--allow-empty", "-m", "reviewer moved HEAD"]);
+        }
+        "tag" => {
+            git(&["tag", "reviewer-tag"]);
+        }
+        "config" => {
+            git(&["config", "reviewer.probe", "1"]);
+        }
+        "hook" => {
+            let _ = fs::create_dir_all(".git/hooks");
+            let _ = fs::write(".git/hooks/pre-commit", "#!/bin/sh\n");
+        }
+        "ledger" => {
+            relay(&[
+                "decision",
+                "log",
+                "work",
+                "--why",
+                "reviewer wrote",
+                "--by",
+                "codex",
+            ]);
+        }
+        "garbage" => {
+            write_out(out.as_deref(), "not json\n");
+            return;
+        }
+        "empty" | "fail" => {
+            write_out(out.as_deref(), "");
+            std::process::exit(1);
+        }
+        "changes" => {
+            let marker = PathBuf::from(".git/codex-asked-changes");
+            if marker.is_file() {
+                write_out(out.as_deref(), &verdict_json(args, "approved"));
+            } else {
+                let _ = fs::create_dir_all(".git");
+                let _ = fs::write(&marker, "1\n");
+                write_out(out.as_deref(), &verdict_json(args, "changes-requested"));
+            }
+            return;
+        }
+        _ => {}
+    }
+    write_out(out.as_deref(), &verdict_json(args, "approved"));
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+fn verdict_json(args: &[String], verdict: &str) -> String {
+    let release = args.iter().any(|arg| arg.contains("Release review"));
+    if release {
+        format!(
+            "{{\"verdict\":\"{verdict}\",\"body\":{{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"prd_covered\":true,\"gaps\":[]}}}}\n"
+        )
+    } else {
+        format!(
+            "{{\"verdict\":\"{verdict}\",\"body\":{{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}}}\n"
+        )
+    }
+}
+
+fn write_out(path: Option<&str>, text: &str) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Some(parent) = PathBuf::from(path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, text);
 }
 
 fn emit_stream(result: &str) {

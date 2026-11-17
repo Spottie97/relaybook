@@ -8,6 +8,8 @@ pub struct Snapshot {
     pub mode: String,
     pub gates: String,
     pub reviewer: String,
+    /// `read-only` or `isolated`. Only gated Codex reviews read this.
+    pub codex_sandbox: String,
     pub workflow: String,
     pub remote_check: String,
     pub signoff: String,
@@ -62,6 +64,7 @@ pub fn load(conn: &Connection) -> Result<Snapshot, Error> {
         mode: value_or(conn, "mode", "manual")?,
         gates: value_or(conn, "gates", "plan")?,
         reviewer: value_or(conn, "reviewer", "claude")?,
+        codex_sandbox: value_or(conn, "codex_sandbox", "read-only")?,
         workflow: value_or(conn, "workflow", "classic")?,
         remote_check: value_or(conn, "remote_check", "online")?,
         signoff: value_or(conn, "signoff", "typed")?,
@@ -138,10 +141,11 @@ pub fn hook_wait_line(conn: &Connection) -> Result<Option<String>, Error> {
 
 pub fn format_config(settings: &Snapshot) -> String {
     format!(
-        "mode {}\ngates {}\nreviewer {}\nworkflow {}\nremote_check {}\nsignoff {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
+        "mode {}\ngates {}\nreviewer {}\ncodex_sandbox {}\nworkflow {}\nremote_check {}\nsignoff {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
         settings.mode,
         settings.gates,
         settings.reviewer,
+        settings.codex_sandbox,
         settings.workflow,
         settings.remote_check,
         settings.signoff,
@@ -276,6 +280,7 @@ fn validate(conn: &Connection, key: &str, value: &str) -> Result<String, Error> 
         "mode" => one_of(key, value, &["manual", "auto"])?,
         "gates" => one_of(key, value, &["none", "plan", "plan,review"])?,
         "reviewer" => one_of(key, value, &["claude", "codex"])?,
+        "codex_sandbox" => one_of(key, value, &["read-only", "isolated"])?,
         "workflow" => one_of(key, value, &["classic", "gated"])?,
         "remote_check" => one_of(key, value, &["online", "local"])?,
         "signoff" => one_of(key, value, &["typed", "signed-tag"])?,

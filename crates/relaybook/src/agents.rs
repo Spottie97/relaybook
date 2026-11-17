@@ -1,4 +1,4 @@
-use std::io::{BufReader, Write as _};
+use std::io::{BufReader, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -54,6 +54,10 @@ pub(crate) enum AgentResult {
     Failed {
         output: String,
     },
+    /// The CLI cannot be started. The run stops immediately, with no failure streak.
+    Unavailable {
+        cli: String,
+    },
     TimedOut,
 }
 
@@ -92,6 +96,37 @@ pub(crate) fn preflight() -> Result<Accounts, String> {
     let claude = claude_account()?;
     let cursor = cursor_account()?;
     Ok(Accounts { claude, cursor })
+}
+
+/// Classic preflight, plus `codex` on PATH and `codex login status` exiting 0.
+/// Any non-zero status is not signed in. A usage-limit exit code is not special.
+pub(crate) fn preflight_gated() -> Result<Accounts, String> {
+    let accounts = preflight()?;
+    require_codex()?;
+    Ok(accounts)
+}
+
+pub(crate) fn require_codex() -> Result<(), String> {
+    let Some(program) = crate::exe::Program::resolve("codex") else {
+        return Err("codex: not on PATH".to_string());
+    };
+    let output = program
+        .command()
+        .args(["login", "status"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                "codex: not on PATH".to_string()
+            } else {
+                format!("codex: {err}")
+            }
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err("codex: not signed in; run codex login".to_string())
+    }
 }
 
 pub(crate) fn account_line(accounts: &Accounts) -> String {
@@ -183,6 +218,274 @@ pub(crate) fn call_cursor(
         }
     };
     drive(child, Some(timeout), "cursor", live)
+}
+
+/// Bytes of the review packet (guide, handoff, and diff). Inside Codex's cap.
+pub(crate) const REVIEW_PACKET_LIMIT: usize = 64 * 1024;
+
+/// Prompt plus stdin, in characters. Verified on codex-cli 0.169.0.
+pub(crate) const CODEX_INPUT_CHAR_LIMIT: usize = 1_048_576;
+
+const TASK_CODEX_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "body"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["approved", "changes-requested"] },
+    "body": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["findings", "security", "tests_checked", "not_checked"],
+      "properties": {
+        "findings": {},
+        "security": {},
+        "tests_checked": {},
+        "not_checked": {}
+      }
+    }
+  }
+}
+"#;
+
+const RELEASE_CODEX_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "body"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["approved", "changes-requested"] },
+    "body": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["findings", "security", "tests_checked", "not_checked", "prd_covered", "gaps"],
+      "properties": {
+        "findings": {},
+        "security": {},
+        "tests_checked": {},
+        "not_checked": {},
+        "prd_covered": {},
+        "gaps": {}
+      }
+    }
+  }
+}
+"#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexSandbox {
+    ReadOnly,
+    Isolated,
+}
+
+pub(crate) fn review_input_too_large(prompt: &str, packet: &str) -> bool {
+    packet.len() > REVIEW_PACKET_LIMIT
+        || prompt
+            .chars()
+            .count()
+            .saturating_add(packet.chars().count())
+            > CODEX_INPUT_CHAR_LIMIT
+}
+
+pub(crate) fn codex_args(
+    root: &Path,
+    schema: &Path,
+    out: &Path,
+    prompt: &str,
+    sandbox: CodexSandbox,
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(12);
+    args.push("exec".to_string());
+    if sandbox == CodexSandbox::ReadOnly {
+        args.push("-s".to_string());
+        args.push("read-only".to_string());
+    }
+    args.push("--ephemeral".to_string());
+    args.push("--color".to_string());
+    args.push("never".to_string());
+    args.push("-C".to_string());
+    args.push(root.display().to_string());
+    args.push("--output-schema".to_string());
+    args.push(schema.display().to_string());
+    args.push("-o".to_string());
+    args.push(out.display().to_string());
+    args.push(prompt.to_string());
+    args
+}
+
+/// One JSON object `{"verdict":"approved"|"changes-requested","body":{...}}`.
+/// Trailing values are rejected. The body text is what `review_body` checks.
+pub(crate) fn parse_codex_verdict(text: &str) -> Result<(String, String), String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("codex output is empty".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| "codex output is not one JSON object".to_string())?;
+    let Some(object) = value.as_object() else {
+        return Err("codex output is not one JSON object".to_string());
+    };
+    let verdict = object
+        .get("verdict")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "codex output is missing verdict".to_string())?;
+    if verdict != "approved" && verdict != "changes-requested" {
+        return Err("codex output has an invalid verdict".to_string());
+    }
+    let body = object
+        .get("body")
+        .filter(|item| item.is_object())
+        .ok_or_else(|| "codex output is missing body".to_string())?;
+    let body =
+        serde_json::to_string(body).map_err(|_| "codex output body is not JSON".to_string())?;
+    Ok((verdict.to_string(), body))
+}
+
+/// Run Codex and return the `-o` file only when the process exits 0 and that
+/// file is non-empty. A non-zero exit, or a missing or empty file, is
+/// [`AgentResult::Failed`]. A missing binary is [`AgentResult::Unavailable`].
+#[allow(clippy::too_many_arguments)] // cwd, prompt, packet, paths, run id, and the sandbox are distinct
+pub(crate) fn call_codex(
+    cwd: &Path,
+    prompt: &str,
+    packet: &str,
+    out: &Path,
+    run_id: i64,
+    live: &mut Session,
+    sandbox: CodexSandbox,
+    release: bool,
+) -> AgentResult {
+    let Some(program) = crate::exe::Program::resolve("codex") else {
+        return AgentResult::Unavailable {
+            cli: "codex".to_string(),
+        };
+    };
+    let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    if let Some(parent) = out.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        return AgentResult::Failed {
+            output: err.to_string(),
+        };
+    }
+    let schema = out.with_file_name("codex-schema.json");
+    let schema_text = if release {
+        RELEASE_CODEX_SCHEMA
+    } else {
+        TASK_CODEX_SCHEMA
+    };
+    if let Err(err) = std::fs::write(&schema, schema_text) {
+        return AgentResult::Failed {
+            output: err.to_string(),
+        };
+    }
+    let _ = std::fs::remove_file(out);
+    let args = codex_args(&root, &schema, out, prompt, sandbox);
+    if let Some(flag) = forbidden_codex_arg(&args) {
+        return AgentResult::Failed {
+            output: format!("refusing codex flag {flag}"),
+        };
+    }
+    let mut command = program.command();
+    command
+        .current_dir(cwd)
+        .args(&args)
+        .env("RELAYBOOK_RUN_ID", run_id.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return AgentResult::Unavailable {
+                cli: "codex".to_string(),
+            };
+        }
+        Err(err) => {
+            return AgentResult::Failed {
+                output: err.to_string(),
+            };
+        }
+    };
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let packet = packet.to_string();
+    let stdin_thread = std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(packet.as_bytes());
+        }
+    });
+    let stdout_thread = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stdout) = stdout {
+            let _ = stdout.read_to_string(&mut text);
+        }
+        text
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        text
+    });
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(err) => {
+            return AgentResult::Failed {
+                output: err.to_string(),
+            };
+        }
+    };
+    let _ = stdin_thread.join();
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if let Some(line) = stdout.lines().find(|line| !line.trim().is_empty()) {
+        live.observe(&crate::stream::Piece::Text(line.to_string()));
+    }
+    if !status.success() {
+        return AgentResult::Failed {
+            output: format!(
+                "codex exited {}\n{stdout}\n{stderr}",
+                status.code().unwrap_or(-1)
+            ),
+        };
+    }
+    match std::fs::read_to_string(out) {
+        Ok(text) if !text.trim().is_empty() => AgentResult::Finished {
+            session_id: None,
+            est_cost_usd: 0.0,
+            output: text,
+        },
+        Ok(_) => AgentResult::Failed {
+            output: format!("codex output is empty\n{stderr}"),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => AgentResult::Failed {
+            output: format!("codex output is missing\n{stderr}"),
+        },
+        Err(err) => AgentResult::Failed {
+            output: err.to_string(),
+        },
+    }
+}
+
+fn forbidden_codex_arg(args: &[String]) -> Option<&str> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--add-dir"
+            || arg == "--approve-for-me"
+            || arg == "--trust"
+            || arg == "--worktree"
+            || arg == "apply"
+            || arg == "danger-full-access"
+            || arg == "workspace-write"
+            || arg.starts_with("--dangerously")
+        {
+            return Some(arg.as_str());
+        }
+        if arg == "-s" && args.get(index + 1).map(String::as_str) != Some("read-only") {
+            return Some(arg.as_str());
+        }
+    }
+    None
 }
 
 fn drive(
@@ -427,7 +730,12 @@ fn cursor_account() -> Result<AccountKind, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountKind, Accounts, AgentResult, account_line, classify, claude_account};
+    use std::path::Path;
+
+    use super::{
+        AccountKind, Accounts, AgentResult, CodexSandbox, account_line, classify, claude_account,
+        codex_args, forbidden_codex_arg, parse_codex_verdict, review_input_too_large,
+    };
 
     #[test]
     fn usage_limit_is_not_a_failure_and_keeps_the_reset_time() {
@@ -488,5 +796,76 @@ mod tests {
         assert_eq!(line, "claude: api key, cursor: plan account");
         assert!(!line.contains(sentinel));
         assert!(!line.contains('@'));
+    }
+
+    #[test]
+    fn codex_read_only_argv_uses_only_verified_flags() {
+        let args = codex_args(
+            Path::new("/repo"),
+            Path::new("/tmp/codex-schema.json"),
+            Path::new("/tmp/codex-last.md"),
+            "Review task work. Use only the packet on stdin.",
+            CodexSandbox::ReadOnly,
+        );
+        let joined = args.join(" ");
+        assert!(joined.starts_with("exec -s read-only --ephemeral --color never -C /repo "));
+        assert!(joined.contains("--output-schema /tmp/codex-schema.json"));
+        assert!(joined.contains("-o /tmp/codex-last.md"));
+        assert!(forbidden_codex_arg(&args).is_none(), "{joined}");
+        for flag in [
+            "--add-dir",
+            "--dangerously",
+            "--approve-for-me",
+            "--trust",
+            "--worktree",
+            "apply",
+            "danger-full-access",
+        ] {
+            assert!(!joined.contains(flag), "{joined}");
+        }
+    }
+
+    #[test]
+    fn isolated_codex_argv_omits_the_sandbox_flag() {
+        let args = codex_args(
+            Path::new("/repo"),
+            Path::new("/tmp/codex-schema.json"),
+            Path::new("/tmp/codex-last.md"),
+            "Release review. Use only the packet on stdin.",
+            CodexSandbox::Isolated,
+        );
+        assert!(!args.iter().any(|arg| arg == "-s"));
+        assert!(!args.iter().any(|arg| arg == "read-only"));
+        assert!(args.contains(&"--ephemeral".to_string()));
+        assert!(args.contains(&"--output-schema".to_string()));
+        assert!(forbidden_codex_arg(&args).is_none());
+    }
+
+    #[test]
+    fn codex_verdict_must_be_one_json_object() {
+        let (verdict, body) = parse_codex_verdict(
+            "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[]}}\n",
+        )
+        .expect("object");
+        assert_eq!(verdict, "approved");
+        assert!(body.contains("findings"));
+        assert!(parse_codex_verdict("").is_err());
+        assert!(parse_codex_verdict("   ").is_err());
+        assert!(parse_codex_verdict("not json").is_err());
+        assert!(parse_codex_verdict("[]").is_err());
+        assert!(
+            parse_codex_verdict("{\"verdict\":\"approved\"}{\"verdict\":\"approved\"}").is_err()
+        );
+        assert!(parse_codex_verdict("{\"verdict\":\"approved\",\"body\":[]}").is_err());
+        assert!(parse_codex_verdict("{\"verdict\":\"yes\",\"body\":{}}").is_err());
+    }
+
+    #[test]
+    fn review_packet_limit_fails_closed_before_the_cli_cap() {
+        let prompt = "Review task work.";
+        assert!(!review_input_too_large(prompt, &"a".repeat(64 * 1024)));
+        assert!(review_input_too_large(prompt, &"a".repeat(64 * 1024 + 1)));
+        let packet = "a".repeat(1_048_576);
+        assert!(review_input_too_large(prompt, &packet));
     }
 }

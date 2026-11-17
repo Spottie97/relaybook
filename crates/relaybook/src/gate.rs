@@ -410,6 +410,228 @@ pub(crate) fn review_record_release(
     )
 }
 
+/// Packet fields for one auto review. The runner records this review itself.
+pub(crate) struct PreparedReview {
+    pub slug: Option<String>,
+    pub base_sha: Option<String>,
+    pub commit_sha: String,
+    pub handoff: serde_json::Value,
+}
+
+/// Start the owning run's task review without refreshing the graph.
+/// Manual `review start` still refuses a live run and still refreshes.
+pub(crate) fn start_task_review(
+    ledger: &mut Ledger,
+    cwd: &Path,
+    run_id: i64,
+    slug: &str,
+) -> Result<PreparedReview, Error> {
+    if ledger.settings()?.workflow != "gated" {
+        return Err(Error::InvalidSetting(
+            "review start requires workflow=gated".to_string(),
+        ));
+    }
+    require_gated_clean_tree(cwd, ledger)?;
+    let report = ledger.latest_task_report(slug)?.ok_or(Error::NotDone)?;
+    if !task_is_done(ledger, slug)? {
+        return Err(Error::NotDone);
+    }
+    let Some(commit_sha) = report.commit_sha.clone() else {
+        return Err(Error::InvalidSetting(
+            "task report has no commit".to_string(),
+        ));
+    };
+    let root = repository_root(cwd)?;
+    match gitinfo::verified_head(&root).as_deref() {
+        Some(head) if head == commit_sha => {}
+        Some(_) => {
+            return Err(Error::InvalidSetting(
+                "HEAD does not match the reported commit".to_string(),
+            ));
+        }
+        None => {
+            return Err(Error::InvalidSetting(
+                "review start requires a commit at HEAD".to_string(),
+            ));
+        }
+    }
+    ensure_gated_clean(&root)?;
+    let fingerprint = crate::git::worktree_fingerprint(&root).map_err(Error::InvalidSetting)?;
+    let branch = gitinfo::branch(&root)
+        .ok_or_else(|| Error::InvalidSetting("review start requires a branch".to_string()))?;
+    let base_sha = report.base_sha.clone();
+    ledger.start_owned_review(
+        "task",
+        Some(slug),
+        Some(run_id),
+        &branch,
+        "codex",
+        base_sha.as_deref(),
+        &commit_sha,
+        None,
+        &fingerprint,
+    )?;
+    let report_body =
+        serde_json::from_str::<serde_json::Value>(&report.body).unwrap_or(serde_json::Value::Null);
+    let range = base_sha
+        .as_ref()
+        .map(|base| format!("{base}..{commit_sha}"));
+    let handoff = serde_json::json!({
+        "slug": slug,
+        "base_sha": base_sha,
+        "commit_sha": commit_sha,
+        "range": range,
+        "graph_sha": serde_json::Value::Null,
+        "graph_status": "skipped",
+        "detail": crate::graphify::NO_GRAPH,
+        "report": report_body,
+        "graph_context": crate::graphify::NO_GRAPH,
+    });
+    Ok(PreparedReview {
+        slug: Some(slug.to_string()),
+        base_sha,
+        commit_sha,
+        handoff,
+    })
+}
+
+/// Start the owning run's release review without refreshing the graph.
+pub(crate) fn start_release_review(
+    ledger: &mut Ledger,
+    cwd: &Path,
+    run_id: i64,
+) -> Result<PreparedReview, Error> {
+    if ledger.settings()?.workflow != "gated" {
+        return Err(Error::InvalidSetting(
+            "review start requires workflow=gated".to_string(),
+        ));
+    }
+    let checkout = release_checkout(ledger, cwd, "review start")?;
+    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    ensure_gated_clean(&checkout.root)?;
+    if gitinfo::verified_head(&checkout.root).as_deref() != Some(checkout.range.head.as_str()) {
+        return Err(Error::InvalidSetting(
+            "HEAD changed during review start".to_string(),
+        ));
+    }
+    let fingerprint =
+        crate::git::worktree_fingerprint(&checkout.root).map_err(Error::InvalidSetting)?;
+    let accepted = ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    let base_sha = checkout.range.base.clone();
+    let commit_sha = checkout.range.head.clone();
+    ledger.start_owned_review(
+        "release",
+        None,
+        Some(run_id),
+        &checkout.branch,
+        "codex",
+        Some(base_sha.as_str()),
+        &commit_sha,
+        None,
+        &fingerprint,
+    )?;
+    let range = format!("{base_sha}..{commit_sha}");
+    let handoff = serde_json::json!({
+        "slug": serde_json::Value::Null,
+        "base_sha": base_sha,
+        "commit_sha": commit_sha,
+        "range": range,
+        "graph_sha": serde_json::Value::Null,
+        "graph_status": "skipped",
+        "detail": crate::graphify::NO_GRAPH,
+        "tasks": accepted,
+        "graph_context": crate::graphify::NO_GRAPH,
+    });
+    Ok(PreparedReview {
+        slug: None,
+        base_sha: Some(base_sha),
+        commit_sha,
+        handoff,
+    })
+}
+
+pub(crate) fn record_owned_task_review(
+    ledger: &mut Ledger,
+    cwd: &Path,
+    slug: &str,
+    sha: &str,
+    verdict: &str,
+    text: &str,
+) -> Result<Review, Error> {
+    if ledger.settings()?.workflow != "gated" {
+        return Err(Error::InvalidSetting(
+            "review record requires workflow=gated".to_string(),
+        ));
+    }
+    require_gated_clean_tree(cwd, ledger)?;
+    let root = repository_root(cwd)?;
+    require_unpublished(ledger, &root, "review")?;
+    let head = gitinfo::verified_head(&root).ok_or_else(|| {
+        Error::InvalidSetting("review record requires a commit at HEAD".to_string())
+    })?;
+    let fingerprint = crate::git::worktree_fingerprint(&root).map_err(Error::InvalidSetting)?;
+    let sha_owned = sha.trim().to_string();
+    let fingerprint_now = fingerprint.clone();
+    ledger.record_owned_review(
+        "task",
+        Some(slug),
+        "codex",
+        sha,
+        &head,
+        &fingerprint,
+        verdict,
+        text,
+        false,
+        None,
+        move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
+    )
+}
+
+pub(crate) fn record_owned_release_review(
+    ledger: &mut Ledger,
+    cwd: &Path,
+    sha: &str,
+    verdict: &str,
+    text: &str,
+) -> Result<Review, Error> {
+    if ledger.settings()?.workflow != "gated" {
+        return Err(Error::InvalidSetting(
+            "review record requires workflow=gated".to_string(),
+        ));
+    }
+    let checkout = release_checkout(ledger, cwd, "review record")?;
+    require_unpublished(ledger, &checkout.root, "release-review")?;
+    let sha = sha.trim();
+    if sha != checkout.range.head {
+        return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
+    }
+    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    let checkout = release_checkout(ledger, cwd, "review record")?;
+    require_unpublished(ledger, &checkout.root, "release-review")?;
+    if sha != checkout.range.head {
+        return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
+    }
+    let fingerprint =
+        crate::git::worktree_fingerprint(&checkout.root).map_err(Error::InvalidSetting)?;
+    let sha_owned = sha.to_string();
+    let fingerprint_now = fingerprint.clone();
+    let root = checkout.root.clone();
+    let commits = checkout.range.commits.clone();
+    ledger.record_owned_review(
+        "release",
+        None,
+        "codex",
+        sha,
+        &checkout.range.head,
+        &fingerprint,
+        verdict,
+        text,
+        false,
+        Some(&commits),
+        move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
+    )
+}
+
 pub(crate) fn release_checkout(
     ledger: &Ledger,
     cwd: &Path,

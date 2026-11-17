@@ -139,20 +139,20 @@ fn install_probes() -> Probes {
     fs::create_dir_all(&log).expect("log");
     fs::create_dir_all(&fakes).expect("fakes");
     fs::create_dir_all(&bin).expect("bin");
-    for name in ["claude", "cursor-agent", "gh"] {
+    for name in ["claude", "cursor-agent", "gh", "codex"] {
         copy_fake(&fakes, name);
     }
     #[cfg(unix)]
     {
         let git_bin = program_on_path("git");
         write_trace_wrapper(&bin.join("git"), "git", &git_bin);
-        for name in ["claude", "cursor-agent", "gh"] {
+        for name in ["claude", "cursor-agent", "gh", "codex"] {
             write_trace_wrapper(&bin.join(name), name, &fakes.join(name));
         }
     }
     #[cfg(not(unix))]
     {
-        for name in ["claude", "cursor-agent", "gh"] {
+        for name in ["claude", "cursor-agent", "gh", "codex"] {
             copy_fake(&bin, name);
         }
     }
@@ -258,8 +258,13 @@ fn apply_probes(cmd: &mut Command, probes: &Probes) {
 }
 
 fn run_probed(dir: &Path, probes: &Probes, args: &[&str]) -> std::process::Output {
+    run_probed_kind(dir, probes, args, "happy")
+}
+
+fn run_probed_kind(dir: &Path, probes: &Probes, args: &[&str], kind: &str) -> std::process::Output {
     let mut cmd = relaybook(dir);
     apply_probes(&mut cmd, probes);
+    cmd.env("RELAYBOOK_FAKE_KIND", kind);
     cmd.args(args);
     cmd.output().expect("run")
 }
@@ -480,18 +485,24 @@ fn setting(dir: &Path, key: &str) -> Value {
 }
 
 fn assert_review_halt_never_pushes(dir: &Path, bare: &Path) {
+    // R10 replaces the "codex routing not built" halt. The run reviews with
+    // Codex and waits at gate_release. It still does not push or open a PR.
     let probes = install_probes();
     let output = run_probed(dir, &probes, &["run", "--prd", "prd.md", "--gates", "none"]);
     let text = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(output.status.success(), "{text}{err}");
     assert!(
-        text.contains("codex routing not built"),
+        text.contains("waiting for sign-off: relaybook release authorize --sha "),
+        "stdout={text}\nstderr={err}"
+    );
+    assert!(
+        !text.contains("codex routing not built"),
         "stdout={text}\nstderr={err}"
     );
     assert!(
         !text.contains(GATED_RUN_REFUSAL),
-        "the skeleton must run, not refuse up front:\n{text}"
+        "the runner must review, not refuse up front:\n{text}"
     );
     assert!(!probes.log.join("gh.args").exists(), "gh was invoked");
     assert!(ref_missing(bare, "refs/heads/relaybook/prd"));
@@ -501,14 +512,8 @@ fn assert_review_halt_never_pushes(dir: &Path, bare: &Path) {
     );
     let row = run_row(dir);
     assert_eq!(row.workflow.as_deref(), Some("gated"));
-    assert_eq!(row.stage, "review");
-    assert_eq!(row.status, "stopped");
-    assert!(
-        row.stop_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("codex routing not built")),
-        "{row:?}"
-    );
+    assert_eq!(row.stage, "gate_release");
+    assert_eq!(row.status, "waiting");
 }
 
 #[test]
@@ -1949,4 +1954,351 @@ fn complete_and_stop_during_a_failed_publish_let_the_failure_save_land() {
     assert!(!text.contains("run changed concurrently"), "{text}");
     assert_eq!(status, "stopped", "{text}");
     assert_eq!(stage, "publish", "{text}");
+}
+
+#[cfg(unix)]
+fn write_vanishing_codex(path: &Path, fake: &Path) {
+    let fake = fake.display();
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"login\" ]; then\n  '{fake}' \"$@\"\n  status=$?\n  rm -f \"$0\"\n  exit \"$status\"\nfi\nexec '{fake}' \"$@\"\n"
+    );
+    fs::write(path, script).expect("wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).expect("meta").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod");
+}
+
+fn codex_lines(log: &Path) -> String {
+    fs::read_to_string(log.join("codex.args")).unwrap_or_default()
+}
+
+#[derive(Debug)]
+struct StoredReview {
+    scope: String,
+    reviewer: String,
+    run_id: Option<i64>,
+    commit_sha: String,
+    verdict: Option<String>,
+}
+
+fn stored_reviews(dir: &Path) -> Vec<StoredReview> {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    let mut stmt = conn
+        .prepare("SELECT scope, reviewer, run_id, commit_sha, verdict FROM reviews ORDER BY id")
+        .expect("prepare");
+    stmt.query_map([], |row| {
+        Ok(StoredReview {
+            scope: row.get(0)?,
+            reviewer: row.get(1)?,
+            run_id: row.get(2)?,
+            commit_sha: row.get(3)?,
+            verdict: row.get(4)?,
+        })
+    })
+    .expect("query")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("reviews")
+}
+
+fn report_verdicts(dir: &Path) -> Vec<Option<String>> {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    let mut stmt = conn
+        .prepare("SELECT verdict FROM reports ORDER BY id")
+        .expect("prepare");
+    stmt.query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("reports")
+}
+
+fn assert_codex_argv(line: &str, read_only: bool) {
+    let args: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(args.first().copied(), Some("exec"), "{line}");
+    assert!(args.contains(&"--ephemeral"), "{line}");
+    assert!(args.contains(&"--color"), "{line}");
+    assert!(args.contains(&"never"), "{line}");
+    assert!(args.contains(&"-C"), "{line}");
+    assert!(args.contains(&"--output-schema"), "{line}");
+    assert!(args.contains(&"-o"), "{line}");
+    let sandbox = args.windows(2).any(|pair| pair == ["-s", "read-only"]);
+    assert_eq!(sandbox, read_only, "{line}");
+    if !read_only {
+        assert!(!args.contains(&"-s"), "{line}");
+    }
+    for flag in [
+        "--add-dir",
+        "--approve-for-me",
+        "--trust",
+        "--worktree",
+        "apply",
+        "danger-full-access",
+        "workspace-write",
+    ] {
+        assert!(!args.contains(&flag), "{line}");
+    }
+    assert!(
+        args.iter().all(|arg| !arg.starts_with("--dangerously")),
+        "{line}"
+    );
+}
+
+#[test]
+fn missing_codex_fails_preflight() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    fs::remove_file(probes.bin.join("codex")).expect("remove codex");
+    let mut cmd = relaybook(repo.path());
+    apply_probes(&mut cmd, &probes);
+    cmd.env("PATH", &probes.bin);
+    cmd.args(["run", "--prd", "prd.md", "--gates", "none"]);
+    let output = cmd.output().expect("run");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(text.contains("codex: not on PATH"), "{text}{err}");
+    let trace = fs::read_to_string(probes.log.join("invocations")).unwrap_or_default();
+    assert!(
+        trace.lines().all(|line| !line.starts_with("git ")),
+        "git ran before preflight failed:\n{trace}"
+    );
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+}
+
+#[cfg(unix)]
+fn path_without_real_codex(bin: &Path) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::from(bin);
+    if let Some(rest) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&rest) {
+            if dir.join("codex").is_file() || dir.join("codex.exe").is_file() {
+                continue;
+            }
+            path.push(":");
+            path.push(&dir);
+        }
+    }
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_vanishing_mid_run_halts_without_retry() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    write_vanishing_codex(
+        &probes.bin.join("codex"),
+        &probes._root.path().join("fakes").join("codex"),
+    );
+    let mut cmd = relaybook(repo.path());
+    apply_probes(&mut cmd, &probes);
+    cmd.env("PATH", path_without_real_codex(&probes.bin));
+    cmd.args(["run", "--prd", "prd.md", "--gates", "none"]);
+    let output = cmd.output().expect("run");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(text.contains("unavailable"), "{text}{err}");
+    assert!(!text.contains("two consecutive"), "{text}{err}");
+    assert!(
+        codex_lines(&probes.log).is_empty(),
+        "{}",
+        codex_lines(&probes.log)
+    );
+    let claude = fs::read_to_string(probes.log.join("claude.args")).unwrap_or_default();
+    assert!(!claude.contains("Use relaybook inbox"), "{claude}");
+    assert!(!probes.log.join("gh.args").exists());
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+    let row = run_row(repo.path());
+    assert_eq!(row.stage, "review");
+    assert_eq!(row.status, "stopped");
+}
+
+#[test]
+fn codex_argv_is_read_only() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let output = run_probed(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    let args = codex_lines(&probes.log);
+    assert!(!args.is_empty(), "codex was not invoked");
+    for line in args.lines().filter(|line| !line.is_empty()) {
+        assert_codex_argv(line, true);
+    }
+}
+
+#[test]
+fn codex_isolated_argv_omits_the_sandbox_flag() {
+    let repo = gated_repo();
+    relaybook(repo.path())
+        .args(["config", "set", "codex_sandbox", "isolated"])
+        .assert()
+        .success()
+        .stdout("codex_sandbox isolated\n");
+    let probes = install_probes();
+    let output = run_probed(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    let args = codex_lines(&probes.log);
+    assert!(!args.is_empty(), "codex was not invoked");
+    for line in args.lines().filter(|line| !line.is_empty()) {
+        assert_codex_argv(line, false);
+    }
+}
+
+#[test]
+fn codex_verdict_is_recorded_by_relaybook() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let output = run_probed(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    let head = head_sha(repo.path());
+    let reviews = stored_reviews(repo.path());
+    let task = reviews
+        .iter()
+        .find(|review| review.scope == "task")
+        .expect("task review");
+    assert_eq!(task.reviewer, "codex");
+    assert!(task.run_id.is_some(), "{:?}", task.run_id);
+    assert_eq!(task.commit_sha, head);
+    assert_eq!(task.verdict.as_deref(), Some("approved"));
+    let release = reviews
+        .iter()
+        .find(|review| review.scope == "release")
+        .expect("release review");
+    assert_eq!(release.reviewer, "codex");
+    assert_eq!(release.run_id, task.run_id);
+    assert_eq!(release.verdict.as_deref(), Some("approved"));
+}
+
+#[test]
+fn codex_changes_requested_reopens_and_cursor_fixes() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let output = run_probed_kind(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "changes",
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    let cursor = fs::read_to_string(probes.log.join("cursor.args")).unwrap_or_default();
+    assert!(
+        cursor.lines().filter(|line| !line.is_empty()).count() >= 2,
+        "{cursor}"
+    );
+    let reviews = stored_reviews(repo.path());
+    assert!(
+        reviews
+            .iter()
+            .any(|review| review.verdict.as_deref() == Some("changes_requested")),
+        "{reviews:?}"
+    );
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+    assert!(!probes.log.join("gh.args").exists());
+    let row = run_row(repo.path());
+    assert_eq!(row.stage, "gate_release");
+    assert_eq!(row.status, "waiting");
+}
+
+#[test]
+fn codex_unparsable_output_never_accepts() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let output = run_probed_kind(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "garbage",
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(
+        text.contains("two consecutive agent failures"),
+        "{text}{err}"
+    );
+    assert!(
+        report_verdicts(repo.path())
+            .iter()
+            .all(|verdict| verdict.is_none()),
+        "{:?}",
+        report_verdicts(repo.path())
+    );
+    assert!(!probes.log.join("gh.args").exists());
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+}
+
+#[test]
+fn codex_oversized_packet_halts_before_exec() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let output = run_probed_kind(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "huge",
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(
+        text.contains("diff too large for auto review; review manually"),
+        "{text}{err}"
+    );
+    assert!(
+        codex_lines(&probes.log).is_empty(),
+        "codex ran before the size halt:\n{}",
+        codex_lines(&probes.log)
+    );
+    assert!(!probes.log.join("gh.args").exists());
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+    let row = run_row(repo.path());
+    assert_eq!(row.stage, "review");
+    assert_eq!(row.status, "stopped");
+}
+
+#[test]
+fn gated_run_waits_at_release_and_never_pushes_or_opens_pr_first() {
+    let repo = gated_repo();
+    assert_review_halt_never_pushes(repo.path(), &repo.bare);
+}
+
+#[test]
+fn classic_run_never_calls_codex() {
+    let repo = origin_repo();
+    let probes = install_probes();
+    let output = run_probed(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    assert!(text.contains("opened https://example.test/pr/1"), "{text}");
+    let trace = fs::read_to_string(probes.log.join("invocations")).unwrap_or_default();
+    assert!(
+        trace.lines().all(|line| !line.starts_with("codex")),
+        "{trace}"
+    );
+    assert!(!probes.log.join("codex.args").exists());
 }

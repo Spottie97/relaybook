@@ -915,7 +915,7 @@ impl Ledger {
 
     pub fn accept_report(&mut self, slug: &str) -> Result<usize, Error> {
         let slug = checked_slug(slug)?;
-        self.transaction(|conn| accept_unreviewed(conn, &slug))
+        self.transaction(|conn| accept_unreviewed(conn, &slug, None))
     }
 
     /// Gated accept. The latest task review must be `approved` at `head`, and
@@ -928,10 +928,35 @@ impl Ledger {
         head: &str,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<usize, Error> {
+        self.accept_gated_inner(slug, head, None, revalidate)
+    }
+
+    /// Same as [`Self::accept_gated_report`] for the live gated run that owns
+    /// `slug`. Manual callers keep [`Self::accept_gated_report`], which still
+    /// refuses that run.
+    pub fn accept_owned_gated_report(
+        &mut self,
+        slug: &str,
+        head: &str,
+        run_id: i64,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<usize, Error> {
+        self.accept_gated_inner(slug, head, Some(run_id), revalidate)
+    }
+
+    fn accept_gated_inner(
+        &mut self,
+        slug: &str,
+        head: &str,
+        owner: Option<i64>,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<usize, Error> {
         let slug = checked_slug(slug)?;
         let head = required_text("head", head)?;
         self.transaction(|conn| {
-            refuse_live_gated_task(conn, &slug)?;
+            if !owner_matches(conn, "task", Some(&slug), owner)? {
+                refuse_live_gated_task(conn, &slug)?;
+            }
             let task = load_task(conn, &slug)?;
             if !approved_task_review_at(conn, task.id, &head)? {
                 return Err(Error::InvalidSetting(
@@ -941,7 +966,7 @@ impl Ledger {
             if task.status != Status::Done {
                 return Err(Error::NotDone);
             }
-            let changed = accept_unreviewed(conn, &slug)?;
+            let changed = accept_unreviewed(conn, &slug, owner)?;
             revalidate()?;
             Ok(changed)
         })
@@ -1001,13 +1026,73 @@ impl Ledger {
         graph_sha: Option<&str>,
         fingerprint: &str,
     ) -> Result<Review, Error> {
+        self.start_review_inner(
+            scope,
+            task,
+            run_id,
+            branch,
+            reviewer,
+            base_sha,
+            commit_sha,
+            graph_sha,
+            fingerprint,
+            false,
+        )
+    }
+
+    /// Same as [`Self::start_review`] for the live gated run that owns the scope.
+    /// Manual callers keep [`Self::start_review`], which still refuses that run.
+    #[allow(clippy::too_many_arguments)] // same columns as start_review, plus the owner gate
+    pub fn start_owned_review(
+        &mut self,
+        scope: &str,
+        task: Option<&str>,
+        run_id: Option<i64>,
+        branch: &str,
+        reviewer: &str,
+        base_sha: Option<&str>,
+        commit_sha: &str,
+        graph_sha: Option<&str>,
+        fingerprint: &str,
+    ) -> Result<Review, Error> {
+        self.start_review_inner(
+            scope,
+            task,
+            run_id,
+            branch,
+            reviewer,
+            base_sha,
+            commit_sha,
+            graph_sha,
+            fingerprint,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // start_review's columns, plus whether the owner may pass
+    fn start_review_inner(
+        &mut self,
+        scope: &str,
+        task: Option<&str>,
+        run_id: Option<i64>,
+        branch: &str,
+        reviewer: &str,
+        base_sha: Option<&str>,
+        commit_sha: &str,
+        graph_sha: Option<&str>,
+        fingerprint: &str,
+        allow_owner: bool,
+    ) -> Result<Review, Error> {
         let scope = review_scope(scope)?;
         let branch = required_text("branch", branch)?;
         let reviewer = required_text("reviewer", reviewer)?;
         let commit_sha = required_text("commit_sha", commit_sha)?;
         let task = checked_task_slug(scope, task)?;
+        let owner_run = run_id;
         self.transaction(|conn| {
-            refuse_live_ownership(conn, scope, task.as_deref())?;
+            if !(allow_owner && owner_matches(conn, scope, task.as_deref(), owner_run)?) {
+                refuse_live_ownership(conn, scope, task.as_deref())?;
+            }
             let task_id = scoped_task_id(conn, scope, task.as_deref())?;
             let report_id = match task_id {
                 Some(id) => latest_task_report_id(conn, id)?,
@@ -1097,6 +1182,72 @@ impl Ledger {
         release_commits: Option<&[String]>,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Review, Error> {
+        self.record_review_inner(
+            scope,
+            task,
+            reviewer,
+            sha,
+            head,
+            fingerprint,
+            verdict,
+            body,
+            reviewer_override,
+            release_commits,
+            false,
+            revalidate,
+        )
+    }
+
+    /// Same as [`Self::record_review_with`] when the pending review belongs to
+    /// the live gated run that owns the scope. Manual callers stay on
+    /// [`Self::record_review_with`], which still refuses that run.
+    #[allow(clippy::too_many_arguments)] // record_review_with, plus the owner gate
+    pub fn record_owned_review(
+        &mut self,
+        scope: &str,
+        task: Option<&str>,
+        reviewer: &str,
+        sha: &str,
+        head: &str,
+        fingerprint: &str,
+        verdict: &str,
+        body: &str,
+        reviewer_override: bool,
+        release_commits: Option<&[String]>,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<Review, Error> {
+        self.record_review_inner(
+            scope,
+            task,
+            reviewer,
+            sha,
+            head,
+            fingerprint,
+            verdict,
+            body,
+            reviewer_override,
+            release_commits,
+            true,
+            revalidate,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // record_review_with, plus whether the owner may pass
+    fn record_review_inner(
+        &mut self,
+        scope: &str,
+        task: Option<&str>,
+        reviewer: &str,
+        sha: &str,
+        head: &str,
+        fingerprint: &str,
+        verdict: &str,
+        body: &str,
+        reviewer_override: bool,
+        release_commits: Option<&[String]>,
+        allow_owner: bool,
+        revalidate: impl FnOnce() -> Result<(), Error>,
+    ) -> Result<Review, Error> {
         let scope = review_scope(scope)?;
         let reviewer = required_text("reviewer", reviewer)?;
         let sha = required_text("sha", sha)?;
@@ -1108,7 +1259,16 @@ impl Ledger {
             return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
         }
         self.transaction(|conn| {
-            refuse_live_ownership(conn, scope, task.as_deref())?;
+            if allow_owner {
+                let task_id_now = scoped_task_id(conn, scope, task.as_deref())?;
+                let pending_id = pending_review_id(conn, scope, task_id_now)?;
+                let pending = load_review(conn, pending_id)?;
+                if !owner_matches(conn, scope, task.as_deref(), pending.run_id)? {
+                    refuse_live_ownership(conn, scope, task.as_deref())?;
+                }
+            } else {
+                refuse_live_ownership(conn, scope, task.as_deref())?;
+            }
             let task_id = scoped_task_id(conn, scope, task.as_deref())?;
             let id = pending_review_id(conn, scope, task_id)?;
             let review = load_review(conn, id)?;
@@ -1842,6 +2002,37 @@ fn refuse_live_gated_task(conn: &Connection, slug: &str) -> Result<(), Error> {
     }
 }
 
+/// True when `run_id` is a live gated run and it owns this scope.
+fn owner_matches(
+    conn: &Connection,
+    scope: &str,
+    task: Option<&str>,
+    run_id: Option<i64>,
+) -> Result<bool, Error> {
+    let Some(run_id) = run_id else {
+        return Ok(false);
+    };
+    let live = crate::runs::live_gated(conn)?;
+    if !live.iter().any(|run| run.id == run_id) {
+        return Ok(false);
+    }
+    if scope == "release" {
+        return Ok(live.iter().all(|run| run.id == run_id));
+    }
+    let Some(slug) = task else {
+        return Ok(false);
+    };
+    let owner: Option<i64> = conn
+        .query_row(
+            "SELECT run_id FROM tasks WHERE slug = ?1",
+            params![slug],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(owner == Some(run_id))
+}
+
 fn refuse_live_ownership(conn: &Connection, scope: &str, task: Option<&str>) -> Result<(), Error> {
     if scope == "release" {
         refuse_live_gated_run(conn)
@@ -2291,8 +2482,10 @@ fn into_event(row: EventRow) -> Result<Event, Error> {
     })
 }
 
-fn accept_unreviewed(conn: &Connection, slug: &str) -> Result<usize, Error> {
-    refuse_live_gated_task(conn, slug)?;
+fn accept_unreviewed(conn: &Connection, slug: &str, owner: Option<i64>) -> Result<usize, Error> {
+    if !owner_matches(conn, "task", Some(slug), owner)? {
+        refuse_live_gated_task(conn, slug)?;
+    }
     let task = load_task(conn, slug)?;
     let changed = reports::accept_task(conn, task.id, &now(conn)?)?;
     if changed == 0 {

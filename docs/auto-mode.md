@@ -81,7 +81,7 @@ When no run task is unfinished, the run pushes and runs `gh pr create --base mai
 
 ## Gated workflow
 
-With `workflow=gated`, `relaybook run` starts a run and stores `gated` on that row. Later changes to the setting do not change the row. The run plans with Claude and implements with Cursor. The review step stops with "codex routing not built" and does not call a reviewer. A halt does not push. When no task is unfinished, the run goes to release review and stops the same way, instead of opening a pull request.
+With `workflow=gated`, `relaybook run` starts a run and stores `gated` on that row. Later changes to the setting do not change the row. The run plans with Claude and implements with Cursor. Review and release review call Codex. A halt does not push. An approved release review waits at `gate_release`. It does not push or open a pull request. `relaybook approve` publishes only after authorization, as below.
 
 `relaybook approve` at `gate_release` checks that `relaybook release authorize` recorded this branch at the current HEAD. It then pushes that exact commit (`git push --no-follow-tags -u origin <sha>:refs/heads/<branch>`) and runs `gh pr create` once. Annotated tags reachable from that commit, including a sign-off tag, stay unpushed. A second approve that overlaps the first does not push or replace the completed run. A ledger has at most one live gated run: status `active`, `waiting`, or `paused`, or stage `publishing` after the push has started. Starting or resuming another gated run while one is live fails with `a gated run is already live` and does not push. Classic runs are outside that limit. Once the push has started, `relaybook run stop`, `relaybook run complete`, and `relaybook run add` leave the row and its `write_stamp` unchanged. `relaybook run --resume` does not release the claim or push or open a pull request. The publishing process still writes the completed run, or stops that run if publish fails. A save from any other process is refused while the stage is `publishing` and does not change `write_stamp`. If that process dies after the push has started, the row stays at `publishing` and keeps the one live gated slot. See [Known limits](#known-limits). Resuming a different run while one is publishing does not push or open a pull request. Without the authorization, `relaybook approve` and `relaybook run --resume` exit 1 with "waiting for sign-off: relaybook release authorize --sha <HEAD>" and push nothing. If HEAD moves after authorization, publish stops with "HEAD moved after authorization" and does not push. If `origin` is missing, publish stops without a pull request. Before the run starts, a `relaybook/<stem>` branch that already exists on a remote is refused. The same local tracking refs are compared around each agent call.
 
@@ -91,7 +91,21 @@ While the run is active, waiting, or paused, or while its stage is `publishing`,
 
 `relaybook config set workflow classic` asks `Leave gated workflow?` at a terminal and requires the typed challenge in [Sign-off](orca-workflow.md#sign-off). The line starts with `classic`. `y` does not confirm. A value that trims to `classic` is the same change. Without a terminal the command fails with `leaving workflow=gated requires confirmation at a TTY` and the setting stays `gated`. The same failure happens if `workflow` becomes `gated` after the command reads it and before the write commits, unless the terminal confirmation already happened. Declining fails with `leaving workflow=gated was not confirmed`. Setting `workflow=gated`, and setting `workflow=classic` when it is already `classic`, does not ask. `relaybook mode` does not ask either.
 
-The manual gated workflow is in [orca-workflow.md](orca-workflow.md). Classic auto mode still pushes as described above. Routing the auto reviewer to Codex is not built. The review step stops until that exists.
+The manual gated workflow is in [orca-workflow.md](orca-workflow.md). Classic auto mode still pushes as described above. A classic run does not call Codex.
+
+### Codex review
+
+Preflight checks `claude`, `cursor-agent` (or `agent`), and `codex`. `codex login status` must exit 0. A missing `codex` stops with `codex: not on PATH` before any git command. Any other status stops with `codex: not signed in; run codex login`.
+
+The default sandbox is `read-only`. The argv is `codex exec -s read-only --ephemeral --color never -C <root> --output-schema <schema> -o <file>`, and the packet is stdin. `relaybook config set codex_sandbox isolated` omits `-s read-only`. Use that only when the operator already runs Codex as its own OS user on a read-only mount. Relaybook does not pass `--add-dir`, `--dangerously-*`, `--approve-for-me`, `--trust`, `--worktree`, or `codex apply`, and it does not check that the mount or the OS user exists.
+
+The packet is the reviewer guide, the handoff JSON, and `git diff` for the reviewed range. The handoff's graph fields are `skipped` and `no graph`; the auto runner does not refresh the graph. A packet over 64 KiB, or a prompt plus packet over 1,048,576 characters, stops with `diff too large for auto review; review manually` and does not call Codex.
+
+Codex must exit 0 and leave one JSON object in the `-o` file: `{"verdict":"approved"|"changes-requested","body":{...}}`. The body uses the review keys, at most 1,500 bytes. Relaybook records it with reviewer `codex`. An approved task review accepts that task's report. `changes-requested` reopens the task and Cursor runs again. An approved release review moves the run to `gate_release` with status `waiting`. A release review of `changes-requested` stops with `release review requested changes` and does not push. A non-zero exit, or a missing, empty, or unparsable `-o` file, is a failure. It is never an approval. Two consecutive failures stop the run. A vanished `codex` binary stops immediately and does not retry. Relaybook does not treat any Codex exit code as a usage limit.
+
+### Security notes
+
+V2 verification: PASS. In read-only mode the packet is the whole review: this container's `codex exec -s read-only` cannot run shell commands, so do not assume Codex read the worktree. Isolated mode is the operator's setup. Relaybook cannot verify it.
 
 ## Known limits
 

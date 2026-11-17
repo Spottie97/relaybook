@@ -147,6 +147,9 @@ fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Resul
     {
         return Err("a run is already active".to_string());
     }
+    if settings.workflow == "gated" {
+        agents::preflight_gated()?;
+    }
     if dirty(cwd)? {
         let status = git(cwd, &["status", "--porcelain"]).unwrap_or_default();
         return Err(format!("working tree is not clean: {status}"));
@@ -341,6 +344,9 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<i64, String> {
         let output = stop_workflow_mismatch(&mut ledger, &mut run);
         return Err(output.text.trim_end().to_string());
     }
+    if is_gated(&run) {
+        agents::require_codex()?;
+    }
     if run.stage == "gate_release" {
         let tip = git(
             cwd,
@@ -528,7 +534,22 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
         }
         if run.stage == "review" {
             if is_gated(&run) {
-                return halt(cwd, &mut ledger, &mut run, "codex routing not built");
+                let Some(slug) = run.current_slug.clone() else {
+                    return halt(cwd, &mut ledger, &mut run, "no task to review");
+                };
+                drop(ledger);
+                match review_with_codex(
+                    db,
+                    cwd,
+                    quiet,
+                    run_id,
+                    &mut session,
+                    &mut transcript,
+                    CodexScope::Task(slug),
+                ) {
+                    Control::Stay => continue,
+                    Control::Return(output) => return output,
+                }
             }
             let Some(slug) = run.current_slug.clone() else {
                 run.stage = "execute".to_string();
@@ -635,13 +656,32 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
             continue;
         }
         if run.stage == "release_review" {
-            return halt(cwd, &mut ledger, &mut run, "codex routing not built");
+            if !is_gated(&run) {
+                return halt(cwd, &mut ledger, &mut run, "release review is unavailable");
+            }
+            drop(ledger);
+            match review_with_codex(
+                db,
+                cwd,
+                quiet,
+                run_id,
+                &mut session,
+                &mut transcript,
+                CodexScope::Release,
+            ) {
+                Control::Stay => continue,
+                Control::Return(output) => return output,
+            }
         }
         if run.stage == "publish" && is_gated(&run) {
             return publish(cwd, &mut ledger, &mut run);
         }
         if run.stage == "gate_release" && is_gated(&run) {
-            return halt(cwd, &mut ledger, &mut run, &signoff_wait(cwd));
+            run.status = "waiting".to_string();
+            if let Err(err) = ledger.save_run(&mut run) {
+                return fail(&err.to_string());
+            }
+            return ok(&signoff_wait(cwd));
         }
         // execute, or a gate that was already approved into execute
         let tasks = match ledger.run_tasks(run.id) {
@@ -650,7 +690,10 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
         };
         if run.complete_requested && !relaybook_core::unfinished_run(&tasks) {
             if is_gated(&run) {
-                return enter_release_review(cwd, &mut ledger, &mut run);
+                if let Err(err) = queue_release_review(&mut ledger, &mut run) {
+                    return fail(&err);
+                }
+                continue;
             }
             return finish(cwd, &mut ledger, &mut run);
         }
@@ -679,7 +722,10 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
             }
             if !relaybook_core::unfinished_run(&tasks) {
                 if is_gated(&run) {
-                    return enter_release_review(cwd, &mut ledger, &mut run);
+                    if let Err(err) = queue_release_review(&mut ledger, &mut run) {
+                        return fail(&err);
+                    }
+                    continue;
                 }
                 return finish(cwd, &mut ledger, &mut run);
             }
@@ -869,7 +915,10 @@ fn after_review(
     let tasks = ledger.run_tasks(run.id).unwrap_or_default();
     if run.complete_requested && !relaybook_core::unfinished_run(&tasks) {
         if is_gated(run) {
-            return Control::Return(enter_release_review(cwd, ledger, run));
+            if let Err(err) = queue_release_review(ledger, run) {
+                return Control::Return(fail(&err));
+            }
+            return Control::Stay;
         }
         return Control::Return(finish(cwd, ledger, run));
     }
@@ -1012,6 +1061,9 @@ fn take_agent(
             Some(ok(&line))
         }
         AgentResult::TimedOut => Some(halt_db(db, cwd, run_id, "timeout")),
+        AgentResult::Unavailable { cli } => {
+            Some(halt_db(db, cwd, run_id, &format!("{cli} unavailable")))
+        }
         AgentResult::Failed { .. } => None,
         AgentResult::Finished { .. } => None,
     }
@@ -1029,6 +1081,7 @@ fn result_text(result: &AgentResult) -> String {
         | AgentResult::UsageLimit { output, .. }
         | AgentResult::Failed { output } => output.clone(),
         AgentResult::TimedOut => "timeout".to_string(),
+        AgentResult::Unavailable { cli } => format!("{cli} unavailable"),
     }
 }
 
@@ -1060,6 +1113,7 @@ fn agent_outcome(result: &AgentResult) -> &'static str {
     match result {
         AgentResult::UsageLimit { .. } => "paused",
         AgentResult::TimedOut => "timed out",
+        AgentResult::Unavailable { .. } => "unavailable",
         AgentResult::Failed { .. } => "failed",
         AgentResult::Finished { .. } => "done",
     }
@@ -1278,12 +1332,237 @@ fn refuse_existing_run_branch(
     Ok(())
 }
 
-fn enter_release_review(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
-    run.stage = "release_review".to_string();
-    if let Err(err) = ledger.save_run(run) {
-        return fail(&err.to_string());
+enum CodexScope {
+    Task(String),
+    Release,
+}
+
+#[allow(clippy::too_many_arguments)] // the drive loop's session and transcript stay with the caller
+fn review_with_codex(
+    db: &Path,
+    cwd: &Path,
+    quiet: bool,
+    run_id: i64,
+    session: &mut Option<crate::live::Session>,
+    transcript: &mut u32,
+    scope: CodexScope,
+) -> Control {
+    let mut ledger = match Ledger::open(db) {
+        Ok(ledger) => ledger,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let mut run = match load_live(&ledger, run_id) {
+        Ok(run) => run,
+        Err(err) => return Control::Return(fail(&err)),
+    };
+    let settings = match ledger.settings() {
+        Ok(settings) => settings,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let sandbox = if settings.codex_sandbox == "isolated" {
+        agents::CodexSandbox::Isolated
+    } else {
+        agents::CodexSandbox::ReadOnly
+    };
+    let gates = settings.gates.clone();
+    let prepared = match &scope {
+        CodexScope::Task(slug) => crate::gate::start_task_review(&mut ledger, cwd, run_id, slug),
+        CodexScope::Release => crate::gate::start_release_review(&mut ledger, cwd, run_id),
+    };
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            return Control::Return(halt(cwd, &mut ledger, &mut run, &err.to_string()));
+        }
+    };
+    let packet = match review_packet(cwd, &prepared) {
+        Ok(packet) => packet,
+        Err(err) => return Control::Return(halt(cwd, &mut ledger, &mut run, &err)),
+    };
+    let prompt = match &scope {
+        CodexScope::Task(slug) => {
+            format!("Review task {slug}. Use only the packet on stdin. Return the JSON verdict.")
+        }
+        CodexScope::Release => {
+            "Release review. Use only the packet on stdin. Return the JSON verdict.".to_string()
+        }
+    };
+    if agents::review_input_too_large(&prompt, &packet) {
+        return Control::Return(halt(
+            cwd,
+            &mut ledger,
+            &mut run,
+            "diff too large for auto review; review manually",
+        ));
     }
-    halt(cwd, ledger, run, "codex routing not built")
+    let release = matches!(scope, CodexScope::Release);
+    let label = prepared
+        .slug
+        .clone()
+        .unwrap_or_else(|| "release".to_string());
+    let commit_sha = prepared.commit_sha.clone();
+    let out = cwd
+        .join(".relaybook")
+        .join("runs")
+        .join(run_id.to_string())
+        .join("codex-last.md");
+    run.agent_calls += 1;
+    if let Err(err) = ledger.save_run(&mut run) {
+        return Control::Return(fail(&err.to_string()));
+    }
+    drop(ledger);
+    let live = live_session(session, cwd, run_id, quiet);
+    live.begin(&format!("● Reviewing {label} (codex)"));
+    let started = Instant::now();
+    let result = agents::call_codex(cwd, &prompt, &packet, &out, run_id, live, sandbox, release);
+    let elapsed = started.elapsed();
+    let _ = agents::write_transcript(
+        cwd,
+        run_id,
+        *transcript,
+        Role::Reviewer,
+        &result_text(&result),
+    );
+    *transcript += 1;
+    if let Some(output) = take_agent(db, cwd, run_id, &result, "codex") {
+        close_live(
+            session,
+            cwd,
+            run_id,
+            quiet,
+            elapsed,
+            &result,
+            agent_outcome(&result),
+        );
+        return Control::Return(output);
+    }
+    if !matches!(result, AgentResult::Finished { .. }) {
+        close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
+        return Control::Return(bump_failure(db, cwd, quiet, run_id));
+    }
+    let (verdict, body) = match agents::parse_codex_verdict(&result_text(&result)) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
+            return Control::Return(bump_failure(db, cwd, quiet, run_id));
+        }
+    };
+    let mut ledger = match Ledger::open(db) {
+        Ok(ledger) => ledger,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let mut run = match load_live(&ledger, run_id) {
+        Ok(run) => run,
+        Err(err) => return Control::Return(fail(&err)),
+    };
+    let recorded = match &scope {
+        CodexScope::Task(slug) => crate::gate::record_owned_task_review(
+            &mut ledger,
+            cwd,
+            slug,
+            &commit_sha,
+            &verdict,
+            &body,
+        ),
+        CodexScope::Release => {
+            crate::gate::record_owned_release_review(&mut ledger, cwd, &commit_sha, &verdict, &body)
+        }
+    };
+    if recorded.is_err() {
+        close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
+        drop(ledger);
+        return Control::Return(bump_failure(db, cwd, quiet, run_id));
+    }
+    if release && verdict != "approved" {
+        close_live(session, cwd, run_id, quiet, elapsed, &result, "halted");
+        return Control::Return(halt(
+            cwd,
+            &mut ledger,
+            &mut run,
+            "release review requested changes",
+        ));
+    }
+    if let CodexScope::Task(slug) = &scope
+        && verdict == "approved"
+        && let Err(_err) = ledger.accept_owned_gated_report(slug, &commit_sha, run_id, || {
+            crate::gate::recheck_gated_completion(cwd, &commit_sha)
+        })
+    {
+        close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
+        drop(ledger);
+        return Control::Return(bump_failure(db, cwd, quiet, run_id));
+    }
+    let report_verdict = match &scope {
+        CodexScope::Task(slug) => ledger
+            .latest_report_meta(slug)
+            .ok()
+            .flatten()
+            .and_then(|(_, stored)| stored)
+            .unwrap_or_else(|| {
+                if verdict == "approved" {
+                    "accepted".to_string()
+                } else {
+                    "reopened".to_string()
+                }
+            }),
+        CodexScope::Release => "approved".to_string(),
+    };
+    run.failure_streak = 0;
+    if release {
+        run.stage = "gate_release".to_string();
+        run.status = "waiting".to_string();
+        if let Err(err) = ledger.save_run(&mut run) {
+            return Control::Return(fail(&err.to_string()));
+        }
+        close_live(session, cwd, run_id, quiet, elapsed, &result, "waiting");
+        println!("{}", codex_review_line(&run, &label, &report_verdict));
+        return Control::Return(ok(&signoff_wait(cwd)));
+    }
+    let outcome = if report_verdict == "reopened" {
+        "reopened"
+    } else if gates == "plan,review" {
+        "paused at checkpoint"
+    } else {
+        "accepted"
+    };
+    close_live(session, cwd, run_id, quiet, elapsed, &result, outcome);
+    println!("{}", codex_review_line(&run, &label, &report_verdict));
+    run.stage = format!("gate_review:{report_verdict}");
+    if gates == "plan,review" {
+        run.status = "waiting".to_string();
+        if let Err(err) = ledger.save_run(&mut run) {
+            return Control::Return(fail(&err.to_string()));
+        }
+        return Control::Return(ok("waiting for approval: relaybook approve"));
+    }
+    run.stage = "after_review".to_string();
+    if let Err(err) = ledger.save_run(&mut run) {
+        return Control::Return(fail(&err.to_string()));
+    }
+    Control::Stay
+}
+
+fn review_packet(cwd: &Path, prepared: &crate::gate::PreparedReview) -> Result<String, String> {
+    let guide = crate::guide::render(Some(crate::guide::Role::Reviewer));
+    let handoff = serde_json::to_string_pretty(&prepared.handoff).map_err(|err| err.to_string())?;
+    let spec = match prepared.base_sha.as_deref() {
+        Some(base) => format!("{base}..{}", prepared.commit_sha),
+        None => format!("{sha}^..{sha}", sha = prepared.commit_sha),
+    };
+    let diff = git(cwd, &["diff", "--end-of-options", &spec])?;
+    Ok(format!("{guide}\n{handoff}\n{diff}"))
+}
+
+fn codex_review_line(run: &Run, slug: &str, verdict: &str) -> String {
+    format!(
+        "cycle {}: codex review -> {slug} {verdict}; calls {}",
+        run.cycle, run.agent_calls
+    )
+}
+
+fn queue_release_review(ledger: &mut Ledger, run: &mut Run) -> Result<(), String> {
+    run.stage = "release_review".to_string();
+    ledger.save_run(run).map_err(|err| err.to_string())
 }
 
 fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
