@@ -48,7 +48,7 @@ relaybook config set workflow gated
 **Auto mode today:**
 
 - With `workflow=classic`, `relaybook run` pushes the run branch to `origin` after every accepted review and whenever it halts, then pushes again and runs `gh pr create` without a checkpoint. See [auto-mode.md](auto-mode.md#pushes-and-the-pull-request).
-- With `workflow=gated`, `relaybook run`, `relaybook run --resume`, and `relaybook approve` refuse before any push. `relaybook config set workflow classic` requires a terminal. This workflow still does not use `relaybook run`.
+- With `workflow=gated`, `relaybook run`, `relaybook run --resume`, and `relaybook approve` refuse before any push. `relaybook config set workflow classic` requires a terminal, including a value that only differs by surrounding whitespace. This workflow still does not use `relaybook run`.
 
 **Planned:**
 

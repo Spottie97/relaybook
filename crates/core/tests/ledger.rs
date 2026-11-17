@@ -717,6 +717,51 @@ fn record_review_revalidate_holds_the_write_lock_and_rolls_back() {
     assert_eq!(ctx.tasks[0].task.status, Status::Done);
 }
 
+#[test]
+fn unconfirmed_classic_write_cannot_overwrite_concurrent_gated() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.set_setting("reviewer", "codex").expect("reviewer");
+    assert_eq!(ledger.settings().expect("settings").workflow, "classic");
+
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_path = path.clone();
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = thread::spawn(move || {
+        writer_barrier.wait();
+        let mut other = Ledger::open(&writer_path).expect("open");
+        other.set_setting("workflow", "gated").expect("gate");
+        assert_eq!(other.settings().expect("settings").workflow, "gated");
+        drop(other);
+        writer_barrier.wait();
+    });
+
+    barrier.wait();
+    barrier.wait();
+    for value in [
+        "classic",
+        " classic",
+        "classic ",
+        " classic ",
+        "\tclassic\n",
+    ] {
+        let err = ledger
+            .set_setting("workflow", value)
+            .expect_err("unconfirmed leave");
+        assert_eq!(
+            err.to_string(),
+            "leaving workflow=gated requires confirmation at a TTY"
+        );
+        assert_eq!(ledger.settings().expect("settings").workflow, "gated");
+    }
+    ledger
+        .set_setting_with("workflow", " classic ", true)
+        .expect("confirmed leave");
+    assert_eq!(ledger.settings().expect("settings").workflow, "classic");
+    writer.join().expect("writer");
+}
+
 fn spawn_claim(
     path: PathBuf,
     by: &'static str,

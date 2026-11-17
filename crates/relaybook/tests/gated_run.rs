@@ -412,6 +412,50 @@ fn leaving_gated_requires_terminal_confirmation() {
 }
 
 #[test]
+fn leaving_gated_rejects_padded_classic_without_a_tty() {
+    let dir = tempfile::tempdir().expect("temp");
+    enter_gated(dir.path());
+
+    for value in [" classic", "classic ", " classic ", "\tclassic\n"] {
+        relaybook(dir.path())
+            .args(["config", "set", "workflow", value])
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicates::str::contains(
+                "leaving workflow=gated requires confirmation at a TTY",
+            ));
+        assert_eq!(setting(dir.path(), "workflow"), json!("gated"));
+        assert_eq!(setting(dir.path(), "reviewer"), json!("codex"));
+    }
+
+    let accepted = answer_at_tty(
+        dir.path(),
+        &["config", "set", "workflow", " classic "],
+        "y\n",
+    );
+    assert!(accepted.success, "{}", accepted.output);
+    assert!(
+        accepted.output.contains("Leave gated workflow?"),
+        "{}",
+        accepted.output
+    );
+    assert!(
+        accepted.output.contains("workflow classic"),
+        "{}",
+        accepted.output
+    );
+    assert_eq!(setting(dir.path(), "workflow"), json!("classic"));
+
+    relaybook(dir.path())
+        .args(["config", "set", "workflow", " classic "])
+        .assert()
+        .success()
+        .stdout("workflow classic\n");
+    assert_eq!(setting(dir.path(), "workflow"), json!("classic"));
+}
+
+#[test]
 fn entering_gated_needs_no_terminal() {
     let dir = tempfile::tempdir().expect("temp");
     enter_gated(dir.path());

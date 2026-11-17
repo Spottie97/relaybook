@@ -559,7 +559,24 @@ impl Ledger {
         key: &str,
         value: &str,
     ) -> Result<crate::settings::Snapshot, Error> {
-        self.transaction(|conn| crate::settings::set(conn, key, value))
+        self.set_setting_with(key, value, false)
+    }
+
+    /// Writes a setting in one immediate transaction.
+    ///
+    /// `leave_gated_confirmed` allows `workflow` to change from `gated` to
+    /// `classic`. The stored value is the trimmed one `settings::set` keeps,
+    /// and that comparison runs inside the write transaction.
+    pub fn set_setting_with(
+        &mut self,
+        key: &str,
+        value: &str,
+        leave_gated_confirmed: bool,
+    ) -> Result<crate::settings::Snapshot, Error> {
+        self.transaction(|conn| {
+            authorize_workflow_change(conn, key, value, leave_gated_confirmed)?;
+            crate::settings::set(conn, key, value)
+        })
     }
 
     pub fn status_view(&self) -> Result<crate::settings::StatusView, Error> {
@@ -1494,6 +1511,23 @@ impl Ledger {
             Err(err) => Err(err),
         }
     }
+}
+
+fn authorize_workflow_change(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+    leave_gated_confirmed: bool,
+) -> Result<(), Error> {
+    if key != "workflow" || leave_gated_confirmed || value.trim() != "classic" {
+        return Ok(());
+    }
+    if crate::settings::load(conn)?.workflow == "gated" {
+        return Err(Error::InvalidSetting(
+            "leaving workflow=gated requires confirmation at a TTY".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for Ledger {

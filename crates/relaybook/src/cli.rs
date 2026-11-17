@@ -1882,12 +1882,19 @@ fn confirm_leave_gated() -> Result<(), Fail> {
     }
 }
 
+fn workflow_leave_confirmed(ledger: &Ledger, key: &str, value: &str) -> Result<bool, Fail> {
+    // `settings::set` trims before it validates and stores the value.
+    if key != "workflow" || value.trim() != "classic" || ledger.settings()?.workflow != "gated" {
+        return Ok(false);
+    }
+    confirm_leave_gated()?;
+    Ok(true)
+}
+
 fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    if key == "workflow" && value == "classic" && ledger.settings()?.workflow == "gated" {
-        confirm_leave_gated()?;
-    }
-    let settings = ledger.set_setting(key, value)?;
+    let leave_confirmed = workflow_leave_confirmed(&ledger, key, value)?;
+    let settings = ledger.set_setting_with(key, value, leave_confirmed)?;
     let shown = match key {
         "est_cost_cap_usd" => settings
             .est_cost_cap_usd
