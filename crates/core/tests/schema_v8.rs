@@ -223,6 +223,40 @@ fn fresh_ledger_is_v8_with_guards() {
 }
 
 #[test]
+fn existing_v8_ledger_gains_the_live_run_index_without_a_version_bump() {
+    let (_dir, path) = fresh_path();
+    drop(Ledger::initialize(&path).expect("init"));
+    assert_eq!(user_version(&path), 8);
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute("DROP INDEX runs_one_live_gated", [])
+            .expect("drop");
+        let missing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'runs_one_live_gated'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(missing, 0);
+    }
+    let ledger = Ledger::open(&path).expect("reopen");
+    assert!(!ledger.guards_restored());
+    drop(ledger);
+    assert_eq!(user_version(&path), 8);
+    let conn = Connection::open(&path).expect("open");
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'runs_one_live_gated'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("index");
+    assert!(sql.contains("workflow = 'gated'"), "{sql}");
+    assert!(sql.contains("stage = 'publishing'"), "{sql}");
+}
+
+#[test]
 fn v7_ledger_migrates_to_v8_with_payloads_unchanged() {
     let (_dir, path) = fresh_path();
     let event = r#"{"slug":"auth","title":"Add auth"}"#;

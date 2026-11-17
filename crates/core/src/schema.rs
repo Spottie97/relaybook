@@ -175,6 +175,26 @@ CREATE TABLE IF NOT EXISTS remote_checks (
     override INTEGER NOT NULL DEFAULT 0 CHECK (override IN (0, 1)),
     created_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS runs_one_live_gated
+ON runs (workflow)
+WHERE workflow = 'gated'
+  AND (
+    status IN ('active', 'waiting', 'paused')
+    OR stage = 'publishing'
+  );
+";
+
+/// One live gated run. `publishing` is the stage set once the push has started.
+/// A read-write open installs this on an existing schema 8 ledger.
+pub(crate) const ONE_LIVE_GATED_INDEX: &str = "
+CREATE UNIQUE INDEX IF NOT EXISTS runs_one_live_gated
+ON runs (workflow)
+WHERE workflow = 'gated'
+  AND (
+    status IN ('active', 'waiting', 'paused')
+    OR stage = 'publishing'
+  );
 ";
 
 /// Triggers installed for schema 8. They only `RAISE`; they do not write.
@@ -241,6 +261,7 @@ END;
 /// Additive v8 objects. Column alters are guarded in `migrate`. A v6 fixture
 /// can lack `settings` or `runs`; the triggers read and target those tables,
 /// so both are created when missing. Triggers come from [`GUARDS`].
+/// [`ONE_LIVE_GATED_INDEX`] is the same partial index, installed again on open.
 pub(crate) const MIGRATE_V7_TO_V8: &str = "
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -279,6 +300,14 @@ CREATE TABLE IF NOT EXISTS remote_checks (
     override INTEGER NOT NULL DEFAULT 0 CHECK (override IN (0, 1)),
     created_at TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS runs_one_live_gated
+ON runs (workflow)
+WHERE workflow = 'gated'
+  AND (
+    status IN ('active', 'waiting', 'paused')
+    OR stage = 'publishing'
+  );
 ";
 
 pub(crate) const MIGRATE_V3_TO_V4: &str = "
@@ -443,7 +472,9 @@ CREATE TABLE IF NOT EXISTS release_authorizations (
 
 #[cfg(test)]
 mod guard_sql {
-    use super::{GUARD_MESSAGE, GUARD_NAMES, GUARDS, MIGRATE_V7_TO_V8, SCHEMA};
+    use super::{
+        GUARD_MESSAGE, GUARD_NAMES, GUARDS, MIGRATE_V7_TO_V8, ONE_LIVE_GATED_INDEX, SCHEMA,
+    };
 
     #[test]
     fn guard_text_is_the_raised_message() {
@@ -455,5 +486,12 @@ mod guard_sql {
         assert!(SCHEMA.contains("write_stamp INTEGER NOT NULL DEFAULT 0"));
         assert!(SCHEMA.contains("method TEXT"));
         assert!(MIGRATE_V7_TO_V8.contains("CREATE TABLE IF NOT EXISTS remote_checks"));
+        assert!(SCHEMA.contains("runs_one_live_gated"));
+        assert!(MIGRATE_V7_TO_V8.contains("runs_one_live_gated"));
+        assert!(
+            ONE_LIVE_GATED_INDEX.contains("CREATE UNIQUE INDEX IF NOT EXISTS runs_one_live_gated")
+        );
+        assert!(SCHEMA.contains(ONE_LIVE_GATED_INDEX.trim()));
+        assert!(MIGRATE_V7_TO_V8.contains(ONE_LIVE_GATED_INDEX.trim()));
     }
 }

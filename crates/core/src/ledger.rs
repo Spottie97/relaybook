@@ -803,6 +803,22 @@ impl Ledger {
         crate::runs::active(&self.conn)
     }
 
+    /// Every gated run that occupies the one-live slot, oldest first.
+    pub fn live_gated_runs(&self) -> Result<Vec<crate::runs::Run>, Error> {
+        crate::runs::live_gated(&self.conn)
+    }
+
+    /// Whether `slug` is owned by a live gated run.
+    pub fn live_gated_owns_task(&self, slug: &str) -> Result<bool, Error> {
+        crate::runs::live_gated_owns_task(&self.conn, slug)
+    }
+
+    /// The gated run that owns publication, including a `publishing` stage
+    /// that `run stop` did not clear.
+    pub fn publishing_run(&self) -> Result<Option<crate::runs::Run>, Error> {
+        crate::runs::publishing(&self.conn)
+    }
+
     pub fn run_by_id(&self, id: i64) -> Result<crate::runs::Run, Error> {
         crate::runs::load(&self.conn, id)
     }
@@ -1740,50 +1756,37 @@ impl Ledger {
 const LIVE_RUN_OWNS: &str = "a gated run owns this; use relaybook approve / run --resume";
 
 fn refuse_live_gated_run(conn: &Connection) -> Result<(), Error> {
-    match crate::runs::active(conn)? {
-        Some(run) if run.workflow.as_deref() == Some("gated") => {
-            Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
-        }
-        _ => Ok(()),
+    if crate::runs::live_gated(conn)?.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
     }
 }
 
 /// `run_id` for a release authorization, decided while the write lock is held.
 ///
-/// A gated run waiting at `gate_release` on `branch` supplies its id even when
-/// `supplied` is null. A gated run waiting at `gate_release` on another branch
-/// keeps `supplied`. Any other live gated run refuses. With no live gated run,
-/// `supplied` is stored unchanged.
+/// Every live gated run is considered, not only the newest run of any
+/// workflow. A gated run waiting at `gate_release` on `branch` supplies its
+/// id even when `supplied` is null. A gated run waiting at `gate_release` on
+/// another branch keeps `supplied`. Any other live gated run refuses. With
+/// no live gated run, `supplied` is stored unchanged.
 fn stored_authorization_run_id(
     conn: &Connection,
     branch: &str,
     supplied: Option<i64>,
 ) -> Result<Option<i64>, Error> {
-    match crate::runs::active(conn)? {
-        Some(run) if run.workflow.as_deref() == Some("gated") => {
-            if run.status == "waiting" && run.stage == "gate_release" && run.branch == branch {
-                Ok(Some(run.id))
-            } else if run.status == "waiting" && run.stage == "gate_release" {
-                Ok(supplied)
-            } else {
-                Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
-            }
+    match crate::runs::live_gated(conn)?.as_slice() {
+        [] => Ok(supplied),
+        [run] if run.status == "waiting" && run.stage == "gate_release" && run.branch == branch => {
+            Ok(Some(run.id))
         }
-        _ => Ok(supplied),
+        [run] if run.status == "waiting" && run.stage == "gate_release" => Ok(supplied),
+        _ => Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string())),
     }
 }
 
 fn refuse_live_gated_task(conn: &Connection, slug: &str) -> Result<(), Error> {
-    let Some(run) = crate::runs::active(conn)? else {
-        return Ok(());
-    };
-    if run.workflow.as_deref() != Some("gated") {
-        return Ok(());
-    }
-    let owned = crate::runs::task_slugs(conn, run.id)?
-        .iter()
-        .any(|item| item == slug);
-    if owned {
+    if crate::runs::live_gated_owns_task(conn, slug)? {
         Err(Error::InvalidSetting(LIVE_RUN_OWNS.to_string()))
     } else {
         Ok(())

@@ -58,16 +58,68 @@ pub fn resumable(conn: &Connection) -> Result<Option<Run>, Error> {
     Ok(row)
 }
 
-/// The run that currently owns publication, if one is `active` at `publish`.
+/// The gated run that currently owns publication.
+///
+/// That is an active run still at `publish`, or any run whose stage is
+/// `publishing` after the push has started. A stopped row stays the owner
+/// until the publishing process clears that stage.
 pub fn publishing(conn: &Connection) -> Result<Option<Run>, Error> {
     let row = conn
         .query_row(
-            &select_run("WHERE status = 'active' AND stage = 'publish' ORDER BY id DESC LIMIT 1"),
+            &select_run(
+                "WHERE workflow = 'gated'
+                   AND (
+                     (status = 'active' AND stage = 'publish')
+                     OR stage = 'publishing'
+                   )
+                 ORDER BY id DESC
+                 LIMIT 1",
+            ),
             [],
             read_run,
         )
         .optional()?;
     Ok(row)
+}
+
+/// Gated runs that occupy the one-live slot. Same predicate as
+/// `runs_one_live_gated`.
+pub fn live_gated(conn: &Connection) -> Result<Vec<Run>, Error> {
+    let mut statement = conn.prepare(&select_run(
+        "WHERE workflow = 'gated'
+           AND (
+             status IN ('active', 'waiting', 'paused')
+             OR stage = 'publishing'
+           )
+         ORDER BY id",
+    ))?;
+    let rows = statement.query_map([], read_run)?;
+    let mut runs = Vec::new();
+    for row in rows {
+        runs.push(row?);
+    }
+    Ok(runs)
+}
+
+/// Whether `slug`'s owning run is a live gated run.
+pub fn live_gated_owns_task(conn: &Connection, slug: &str) -> Result<bool, Error> {
+    let found = conn
+        .query_row(
+            "SELECT 1
+             FROM tasks AS t
+             JOIN runs AS r ON r.id = t.run_id
+             WHERE t.slug = ?1
+               AND r.workflow = 'gated'
+               AND (
+                 r.status IN ('active', 'waiting', 'paused')
+                 OR r.stage = 'publishing'
+               )
+             LIMIT 1",
+            params![slug],
+            |_| Ok(1_i64),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 pub fn insert(
@@ -78,37 +130,46 @@ pub fn insert(
     started_at: &str,
     workflow: Option<&str>,
 ) -> Result<Run, Error> {
+    if workflow == Some("gated") && another_live_gated(conn, None)? {
+        return Err(Error::InvalidSetting(ALREADY_LIVE.to_string()));
+    }
     conn.execute(
         "INSERT INTO runs (
             prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd,
             status, started_at, failure_streak, complete_requested, workflow
          ) VALUES (?1, ?2, ?3, 'plan', 0, 0, 0, 'active', ?4, 0, 0, ?5)",
         params![prd_path, prd_sha256, branch, started_at, workflow],
-    )?;
+    )
+    .map_err(map_live_run)?;
     load(conn, conn.last_insert_rowid())
 }
 
 pub fn save(conn: &Connection, run: &mut Run) -> Result<(), Error> {
-    let changed = conn.execute(
-        "UPDATE runs SET
+    if counts_as_live_gated(run) && another_live_gated(conn, Some(run.id))? {
+        return Err(Error::InvalidSetting(ALREADY_LIVE.to_string()));
+    }
+    let changed = conn
+        .execute(
+            "UPDATE runs SET
             stage = ?1, cycle = ?2, agent_calls = ?3, est_cost_usd = ?4, status = ?5,
             stop_reason = ?6, failure_streak = ?7, current_slug = ?8, complete_requested = ?9,
             write_stamp = write_stamp + 1
          WHERE id = ?10 AND write_stamp = ?11",
-        params![
-            run.stage,
-            run.cycle,
-            run.agent_calls,
-            run.est_cost_usd,
-            run.status,
-            run.stop_reason,
-            run.failure_streak,
-            run.current_slug,
-            i64::from(run.complete_requested),
-            run.id,
-            run.write_stamp,
-        ],
-    )?;
+            params![
+                run.stage,
+                run.cycle,
+                run.agent_calls,
+                run.est_cost_usd,
+                run.status,
+                run.stop_reason,
+                run.failure_streak,
+                run.current_slug,
+                i64::from(run.complete_requested),
+                run.id,
+                run.write_stamp,
+            ],
+        )
+        .map_err(map_live_run)?;
     if changed != 1 {
         return Err(Error::InvalidSetting(
             "run changed concurrently".to_string(),
@@ -199,6 +260,35 @@ fn read_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         workflow: row.get(14)?,
         write_stamp: row.get(15)?,
     })
+}
+
+const ALREADY_LIVE: &str = "a gated run is already live";
+
+fn counts_as_live_gated(run: &Run) -> bool {
+    run.workflow.as_deref() == Some("gated")
+        && (matches!(run.status.as_str(), "active" | "waiting" | "paused")
+            || run.stage == "publishing")
+}
+
+fn another_live_gated(conn: &Connection, except: Option<i64>) -> Result<bool, Error> {
+    Ok(live_gated(conn)?
+        .into_iter()
+        .any(|run| Some(run.id) != except))
+}
+
+fn map_live_run(err: rusqlite::Error) -> Error {
+    let unique = matches!(
+        &err,
+        rusqlite::Error::SqliteFailure(code, Some(message))
+            if code.code == rusqlite::ErrorCode::ConstraintViolation
+                && (message.contains("runs_one_live_gated")
+                    || message.contains("UNIQUE constraint failed: runs.workflow"))
+    );
+    if unique {
+        Error::InvalidSetting(ALREADY_LIVE.to_string())
+    } else {
+        Error::from(err)
+    }
 }
 
 pub fn ready_slug(tasks: &[Task]) -> Option<String> {

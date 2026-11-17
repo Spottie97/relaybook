@@ -3,7 +3,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use crate::error::Error;
 use crate::schema::{
     GUARD_MESSAGE, GUARD_NAMES, GUARDS, MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4,
-    MIGRATE_V5_TO_V6, MIGRATE_V6_TO_V7, MIGRATE_V7_TO_V8, SCHEMA, SCHEMA_VERSION,
+    MIGRATE_V5_TO_V6, MIGRATE_V6_TO_V7, MIGRATE_V7_TO_V8, ONE_LIVE_GATED_INDEX, SCHEMA,
+    SCHEMA_VERSION,
 };
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
@@ -129,12 +130,22 @@ pub(crate) fn newer_ledger() -> Error {
     Error::InvalidSetting("this ledger needs a newer relaybook".to_string())
 }
 
+/// Install the one-live-gated-run index. `IF NOT EXISTS` keeps an existing
+/// schema 8 ledger at the same `user_version`.
+pub(crate) fn ensure_one_live_gated(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(ONE_LIVE_GATED_INDEX)?;
+    Ok(())
+}
+
 /// Recreate any missing schema-8 trigger. Returns whether one was missing.
+/// Also installs [`ONE_LIVE_GATED_INDEX`] so a ledger already at version 8
+/// gains it on the next read-write open.
 pub(crate) fn ensure_guards(conn: &Connection) -> Result<bool, Error> {
     debug_assert!(
         GUARDS.contains(GUARD_MESSAGE),
         "guard SQL must raise {GUARD_MESSAGE}"
     );
+    ensure_one_live_gated(conn)?;
     let mut missing = false;
     for name in GUARD_NAMES {
         if !trigger_exists(conn, name)? {

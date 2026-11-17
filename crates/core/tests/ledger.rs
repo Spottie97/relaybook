@@ -1105,3 +1105,242 @@ fn claim_run_rejects_a_different_run_while_publishing() {
     assert_eq!(publisher.status, "active");
     assert_eq!(publisher.stage, "publish");
 }
+
+fn review_count(path: &std::path::Path, slug: &str) -> i64 {
+    let conn = rusqlite::Connection::open(path).expect("open");
+    conn.query_row(
+        "SELECT COUNT(*) FROM reviews AS r
+         JOIN tasks AS t ON t.id = r.task_id
+         WHERE t.slug = ?1",
+        [slug],
+        |row| row.get(0),
+    )
+    .expect("reviews")
+}
+
+#[test]
+fn review_and_accept_refuse_a_task_owned_by_an_older_live_gated_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    ledger.set_setting("reviewer", "codex").expect("reviewer");
+    ledger.create_task("owned", "Owned").expect("owned");
+    ledger.create_task("free", "Free").expect("free");
+    ledger.claim_task("owned", "cursor").expect("claim");
+    ledger
+        .finish_task("owned", None, Some("abc123"))
+        .expect("done");
+    ledger
+        .start_review(
+            "task",
+            Some("owned"),
+            None,
+            "feature",
+            "codex",
+            None,
+            "abc123",
+            None,
+            "fp",
+        )
+        .expect("start");
+    ledger
+        .record_review(
+            "task",
+            Some("owned"),
+            "codex",
+            "abc123",
+            "abc123",
+            "fp",
+            "approved",
+            TASK_REVIEW,
+            false,
+        )
+        .expect("record");
+    let reviews_before = review_count(&path, "owned");
+    assert_eq!(reviews_before, 1);
+
+    let older = ledger
+        .start_run("old.md", "digest", "feature", Some("gated"))
+        .expect("older");
+    let conn = rusqlite::Connection::open(&path).expect("open");
+    conn.execute(
+        "UPDATE tasks SET run_id = ?1 WHERE slug = 'owned'",
+        [older.id],
+    )
+    .expect("link");
+    drop(conn);
+    let newer = ledger
+        .start_run("new.md", "digest", "feature", Some("classic"))
+        .expect("classic");
+    assert!(newer.id > older.id);
+    assert_eq!(
+        ledger.active_run().expect("active").expect("newest").id,
+        newer.id
+    );
+
+    let err = ledger
+        .start_review(
+            "task",
+            Some("owned"),
+            None,
+            "feature",
+            "codex",
+            None,
+            "abc123",
+            None,
+            "fp",
+        )
+        .expect_err("review");
+    assert_eq!(err.to_string(), OWNED);
+    assert_eq!(review_count(&path, "owned"), reviews_before);
+
+    let err = ledger
+        .accept_gated_report("owned", "abc123", || Ok(()))
+        .expect_err("accept gated");
+    assert_eq!(err.to_string(), OWNED);
+    let err = ledger.accept_report("owned").expect_err("accept");
+    assert_eq!(err.to_string(), OWNED);
+    assert_eq!(report_verdict(&path, "owned"), None);
+
+    let err = ledger
+        .set_setting_with("workflow", "gated", true)
+        .expect_err("workflow");
+    assert_eq!(err.to_string(), OWNED);
+    assert_eq!(ledger.settings().expect("settings").workflow, "classic");
+
+    ledger
+        .start_review(
+            "task",
+            Some("free"),
+            None,
+            "feature",
+            "codex",
+            None,
+            "abc123",
+            None,
+            "fp",
+        )
+        .expect("free task is not owned");
+
+    let mut older = ledger.run_by_id(older.id).expect("reload");
+    older.status = "stopped".to_string();
+    ledger.save_run(&mut older).expect("stop");
+    ledger.accept_report("owned").expect("stopped owner");
+    assert_eq!(report_verdict(&path, "owned").as_deref(), Some("accepted"));
+}
+
+#[test]
+fn two_connections_cannot_insert_or_activate_a_second_live_gated_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ledger.db");
+    {
+        let mut ledger = Ledger::initialize(&path).expect("init");
+        ledger.set_setting("reviewer", "codex").expect("reviewer");
+        ledger.set_setting("workflow", "gated").expect("gated");
+    }
+    let barrier = Arc::new(Barrier::new(2));
+    let spawn = |path: PathBuf, barrier: Arc<Barrier>| {
+        thread::spawn(move || {
+            barrier.wait();
+            let mut ledger = Ledger::open(&path).expect("open");
+            ledger.start_run("race.md", "digest", "feature", Some("gated"))
+        })
+    };
+    let first = spawn(path.clone(), Arc::clone(&barrier));
+    let second = spawn(path.clone(), barrier);
+    let first = first.join().expect("first");
+    let second = second.join().expect("second");
+    let (winner, loser) = match (first, second) {
+        (Ok(run), Err(err)) => (run, err),
+        (Err(err), Ok(run)) => (run, err),
+        (Ok(left), Ok(right)) => panic!("both inserts landed: {} and {}", left.id, right.id),
+        (Err(left), Err(right)) => panic!("both inserts failed: {left} / {right}"),
+    };
+    assert_eq!(loser.to_string(), "a gated run is already live");
+
+    let mut left = Ledger::open(&path).expect("left");
+    let mut right = Ledger::open(&path).expect("right");
+    let version: i64 = rusqlite::Connection::open(&path)
+        .expect("open")
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 8);
+    let index: String = rusqlite::Connection::open(&path)
+        .expect("open")
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'runs_one_live_gated'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("index");
+    assert!(index.contains("workflow = 'gated'"), "{index}");
+
+    let mut winner = left.run_by_id(winner.id).expect("winner");
+    winner.status = "stopped".to_string();
+    left.save_run(&mut winner).expect("stop winner");
+    let mut parked = right
+        .start_run("old.md", "digest", "feature", Some("gated"))
+        .expect("parked");
+    parked.status = "stopped".to_string();
+    right.save_run(&mut parked).expect("park");
+    let mut live = left
+        .start_run("new.md", "digest", "feature", Some("gated"))
+        .expect("live");
+    parked.status = "active".to_string();
+    let err = right.save_run(&mut parked).expect_err("activate");
+    assert_eq!(err.to_string(), "a gated run is already live");
+    assert_eq!(
+        right.run_by_id(parked.id).expect("parked").status,
+        "stopped"
+    );
+    assert_eq!(left.run_by_id(live.id).expect("live").status, "active");
+
+    live.status = "paused".to_string();
+    left.save_run(&mut live).expect("pause");
+    let err = right
+        .start_run("paused.md", "digest", "feature", Some("gated"))
+        .expect_err("paused slot");
+    assert_eq!(err.to_string(), "a gated run is already live");
+    live.status = "waiting".to_string();
+    left.save_run(&mut live).expect("wait");
+    let err = right
+        .start_run("waiting.md", "digest", "feature", Some("gated"))
+        .expect_err("waiting slot");
+    assert_eq!(err.to_string(), "a gated run is already live");
+    live.status = "stopped".to_string();
+    live.stage = "publishing".to_string();
+    left.save_run(&mut live).expect("claim held");
+    let err = right
+        .start_run("claim.md", "digest", "feature", Some("gated"))
+        .expect_err("publish claim");
+    assert_eq!(err.to_string(), "a gated run is already live");
+    live.stage = "publish".to_string();
+    left.save_run(&mut live).expect("release claim");
+
+    left.set_setting_with("workflow", "classic", true)
+        .expect("classic");
+    let classic = left
+        .start_run("c1.md", "digest", "feature", Some("classic"))
+        .expect("classic");
+    let other = right
+        .start_run("c2.md", "digest", "feature", Some("classic"))
+        .expect("second classic");
+    let alongside = left
+        .start_run("g.md", "digest", "feature", Some("gated"))
+        .expect("gated beside classic");
+    let err = right
+        .start_run("g2.md", "digest", "feature", Some("gated"))
+        .expect_err("second gated");
+    assert_eq!(err.to_string(), "a gated run is already live");
+    assert_eq!(left.run_by_id(classic.id).expect("c1").status, "active");
+    assert_eq!(right.run_by_id(other.id).expect("c2").status, "active");
+    assert_eq!(
+        left.run_by_id(alongside.id).expect("gated").status,
+        "active"
+    );
+    let version: i64 = rusqlite::Connection::open(&path)
+        .expect("open")
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("version");
+    assert_eq!(version, 8);
+}

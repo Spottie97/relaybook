@@ -1302,6 +1302,169 @@ fn resume_during_publish_does_not_push() {
 
 #[cfg(unix)]
 #[test]
+fn stop_then_resume_during_publish_pushes_once() {
+    use std::process::Stdio;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let repo = gated_repo();
+    let older = seed_stopped(repo.path(), "relaybook/prd", Some("gated"));
+    let (head, newer) = reviewed_release(&repo);
+    assert!(older < newer);
+    let authorized = answer_at_tty(repo.path(), &["release", "authorize", "--sha", &head], true);
+    assert!(authorized.success, "{}", authorized.output);
+    let probes = install_probes();
+    write_push_gate_wrapper(&probes.bin.join("git"), &program_on_path("git"));
+    let gate = probes.log.join("allow-push");
+    struct ReleasePush(PathBuf);
+    impl Drop for ReleasePush {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, "go\n");
+        }
+    }
+    let _release = ReleasePush(gate.clone());
+
+    let mut approve = relaybook(repo.path());
+    apply_probes(&mut approve, &probes);
+    approve.env("RELAYBOOK_PUSH_GATE", &gate);
+    approve.arg("approve");
+    approve.stdout(Stdio::piped());
+    approve.stderr(Stdio::piped());
+    let mut approve = approve.spawn().expect("spawn approve");
+    let trace_path = probes.log.join("invocations");
+    let pushes = |text: &str| {
+        text.lines()
+            .filter(|line| line.starts_with("git push "))
+            .count()
+    };
+    let started = Instant::now();
+    loop {
+        let text = fs::read_to_string(&trace_path).unwrap_or_default();
+        if pushes(&text) >= 1 || started.elapsed() > Duration::from_secs(20) {
+            break;
+        }
+        if matches!(approve.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    let held = fs::read_to_string(&trace_path).unwrap_or_default();
+    assert_eq!(pushes(&held), 1, "approve did not reach push:\n{held}");
+
+    let stop = relaybook(repo.path())
+        .args(["run", "stop"])
+        .output()
+        .expect("stop");
+    let stop_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert_eq!(stop.status.code(), Some(1), "{stop_text}");
+    assert!(
+        stop_text.contains("a publish claim is in progress; stop does not release it"),
+        "{stop_text}"
+    );
+    let (held_status, held_stage) = run_status(repo.path(), newer);
+    assert_eq!(held_status, "active", "{stop_text}");
+    assert_eq!(held_stage, "publishing", "{stop_text}");
+
+    let mut resume = relaybook(repo.path());
+    apply_probes(&mut resume, &probes);
+    resume.env("RELAYBOOK_PUSH_GATE", &gate);
+    resume.args(["run", "--resume"]);
+    resume.stdout(Stdio::piped());
+    resume.stderr(Stdio::piped());
+    let mut resume = resume.spawn().expect("spawn resume");
+    let started = Instant::now();
+    let resume = loop {
+        let text = fs::read_to_string(&trace_path).unwrap_or_default();
+        let exited = matches!(resume.try_wait(), Ok(Some(_)));
+        if exited || pushes(&text) >= 2 || started.elapsed() > Duration::from_secs(15) {
+            break resume;
+        }
+        thread::sleep(Duration::from_millis(30));
+    };
+    fs::write(&gate, "go\n").expect("release push");
+    let resume_output = resume.wait_with_output().expect("wait resume");
+    let approve_output = approve.wait_with_output().expect("wait approve");
+    let resume_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&resume_output.stdout),
+        String::from_utf8_lossy(&resume_output.stderr)
+    );
+    let approve_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&approve_output.stdout),
+        String::from_utf8_lossy(&approve_output.stderr)
+    );
+    let trace = fs::read_to_string(&trace_path).unwrap_or_default();
+    assert_eq!(
+        pushes(&trace),
+        1,
+        "{trace}\nresume={resume_text}\napprove={approve_text}"
+    );
+    assert_eq!(
+        trace
+            .lines()
+            .filter(|line| line.starts_with("gh pr create"))
+            .count(),
+        1,
+        "{trace}"
+    );
+    assert!(
+        resume_text.contains("a run is already publishing"),
+        "{resume_text}"
+    );
+    assert!(
+        approve_text.contains("opened https://example.test/pr/1"),
+        "{approve_text}"
+    );
+    let (older_status, _) = run_status(repo.path(), older);
+    assert_eq!(older_status, "stopped", "{resume_text}");
+    let (newer_status, newer_stage) = run_status(repo.path(), newer);
+    assert_eq!(newer_status, "complete", "{approve_text}");
+    assert_eq!(newer_stage, "done");
+    assert_eq!(
+        bare_rev(&repo.bare, "refs/heads/relaybook/prd").as_deref(),
+        Some(head.as_str())
+    );
+}
+
+#[test]
+fn older_gated_run_cannot_resume_while_a_newer_one_is_live() {
+    let repo = gated_repo();
+    let older = seed_stopped(repo.path(), "relaybook/prd", Some("gated"));
+    let newer = seed_run(repo.path(), "relaybook/prd", "execute", "active");
+    assert!(older < newer);
+    let probes = install_probes();
+    let output = run_probed(repo.path(), &probes, &["run", "--resume"]);
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(
+        text.contains("a gated run is already live"),
+        "stdout={text}\nstderr={err}"
+    );
+    assert!(!probes.log.join("gh.args").exists(), "{text}{err}");
+    let (older_status, _) = run_status(repo.path(), older);
+    assert_eq!(older_status, "stopped", "{text}{err}");
+    let (newer_status, newer_stage) = run_status(repo.path(), newer);
+    assert_eq!(newer_status, "active", "{text}{err}");
+    assert_eq!(newer_stage, "execute");
+    assert!(bare_rev(&repo.bare, "refs/heads/relaybook/prd").is_none());
+    #[cfg(unix)]
+    {
+        let trace = fs::read_to_string(probes.log.join("invocations")).unwrap_or_default();
+        assert!(
+            !trace.lines().any(|line| line.starts_with("git push ")),
+            "{trace}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn release_authorize_refuses_a_run_resumed_during_confirmation() {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;

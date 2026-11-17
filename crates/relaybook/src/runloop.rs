@@ -86,6 +86,9 @@ fn stop_requested(db: &Path) -> RunOutput {
     let Some(mut run) = found else {
         return fail("no active run");
     };
+    if run.stage == "publishing" {
+        return fail("a publish claim is in progress; stop does not release it");
+    }
     if run.status == "active"
         || run.status == "waiting"
         || run.status == "paused"
@@ -322,6 +325,14 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<i64, String> {
     let Some(mut run) = ledger.resumable_run().map_err(|err| err.to_string())? else {
         return Err("no run to resume".to_string());
     };
+    if run.stage == "publishing"
+        || ledger
+            .publishing_run()
+            .map_err(|err| err.to_string())?
+            .is_some_and(|owner| owner.id != run.id)
+    {
+        return Err("a run is already publishing".to_string());
+    }
     if approve && run.status != "waiting" {
         return Err("run is not waiting".to_string());
     }
@@ -910,6 +921,9 @@ fn stop_workflow_mismatch(ledger: &mut Ledger, run: &mut Run) -> RunOutput {
 }
 
 fn stop_run(ledger: &mut Ledger, run: &mut Run, reason: &str) -> RunOutput {
+    if run.stage == "publishing" {
+        run.stage = "publish".to_string();
+    }
     run.status = "stopped".to_string();
     run.stop_reason = Some(reason.to_string());
     if let Err(err) = ledger.save_run(run) {
@@ -1311,6 +1325,12 @@ fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
     if let Some(output) = refuse_workflow_change(ledger, run) {
         return output;
     }
+    // Commit the claim before git push. `run stop` and `run --resume` do not
+    // clear this stage; only this process does, when it finishes or stops.
+    run.stage = "publishing".to_string();
+    if let Err(err) = ledger.claim_run(run) {
+        return fail(&err.to_string());
+    }
     let spec = format!("{head}:refs/heads/{}", run.branch);
     if let Err(err) = git(cwd, &["push", "--no-follow-tags", "-u", "origin", &spec]) {
         return halt(cwd, ledger, run, &err);
@@ -1644,7 +1664,10 @@ mod tests {
             .start_run("prd.md", "abc", "relaybook/prd", Some("gated"))
             .expect("older");
         older.stage = "release_review".to_string();
-        ledger.save_run(&mut older).expect("older stage");
+        older.status = "stopped".to_string();
+        ledger.save_run(&mut older).expect("stop older");
+        // One live gated run. The older row stays stopped so the newer one
+        // can hold publish. drive must follow the claimed id and not push.
         let mut newer = ledger
             .start_run("prd.md", "abc", "relaybook/prd", Some("gated"))
             .expect("newer");
@@ -1656,20 +1679,13 @@ mod tests {
 
         let output = drive(&db, &work, true, older_id);
         assert_eq!(output.code, 1, "{}", output.text);
-        assert!(
-            output.text.contains("codex routing not built"),
-            "{}",
-            output.text
-        );
+        assert!(output.text.contains("no active run"), "{}", output.text);
         assert!(!bare_has(&bare, "refs/heads/relaybook/prd"));
         let ledger = relaybook_core::Ledger::open(&db).expect("open");
         let older = ledger.run_by_id(older_id).expect("older");
         let newer = ledger.run_by_id(newer_id).expect("newer");
         assert_eq!(older.status, "stopped");
-        assert_eq!(
-            older.stop_reason.as_deref(),
-            Some("codex routing not built")
-        );
+        assert_eq!(older.stage, "release_review");
         assert_eq!(newer.status, "active");
         assert_eq!(newer.stage, "publish");
     }
