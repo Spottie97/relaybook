@@ -1231,8 +1231,10 @@ impl Ledger {
     /// Same as [`Self::authorize_release`]. `release_commits` is the release
     /// range; when set, every in-scope task must be accepted and no task may
     /// be claimed. `method` is `tty-typed` with no evidence, or
-    /// `tty-typed+signed-tag` with evidence. `revalidate` runs inside the
-    /// write transaction after the row is inserted and before commit.
+    /// `tty-typed+signed-tag` with evidence. The current `signoff` setting is
+    /// read again inside this write transaction: `signed-tag` refuses any
+    /// other method. `revalidate` runs inside the write transaction after the
+    /// row is inserted and before commit.
     #[allow(clippy::too_many_arguments)] // sha, head, the range, and the recheck are distinct
     pub fn authorize_release_with(
         &mut self,
@@ -1255,6 +1257,7 @@ impl Ledger {
         }
         let (method, evidence) = checked_signoff(method, evidence)?;
         self.transaction(|conn| {
+            require_signoff_policy(conn, method.as_deref(), evidence.as_deref())?;
             if let Some(commits) = release_commits {
                 accepted_in_scope(conn, commits)?;
             }
@@ -1715,6 +1718,31 @@ fn authorize_workflow_change(
         ));
     }
     Ok(())
+}
+
+/// `signed-tag` is enforced on the value committed in this transaction.
+/// A caller that read `typed` before waiting on the write lock cannot
+/// store `tty-typed` after another transaction has set `signed-tag`.
+fn require_signoff_policy(
+    conn: &Connection,
+    method: Option<&str>,
+    evidence: Option<&str>,
+) -> Result<(), Error> {
+    match crate::settings::load(conn)?.signoff.as_str() {
+        "typed" => Ok(()),
+        "signed-tag" => {
+            if method == Some("tty-typed+signed-tag")
+                && evidence.is_some_and(|text| !text.trim().is_empty())
+            {
+                Ok(())
+            } else {
+                Err(Error::InvalidSetting(
+                    "signoff=signed-tag requires a signed tag".to_string(),
+                ))
+            }
+        }
+        other => Err(Error::InvalidSetting(format!("invalid signoff: {other}"))),
+    }
 }
 
 fn checked_signoff(
@@ -3071,5 +3099,107 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("version");
         assert_eq!(version, 8);
+    }
+
+    #[test]
+    fn authorization_rechecks_signoff_while_waiting_for_the_write_lock() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let (dir, mut ledger) = open_ledger();
+        let path = dir.path().join("ledger.db");
+        ledger
+            .start_review(
+                "release", None, None, "feature", "codex", None, "sha-head", None, "fp",
+            )
+            .expect("start");
+        ledger
+            .record_review(
+                "release",
+                None,
+                "codex",
+                "sha-head",
+                "sha-head",
+                "fp",
+                "approved",
+                r#"{"findings":[],"security":"ok","tests_checked":[],"not_checked":[],"prd_covered":true,"gaps":[]}"#,
+                false,
+            )
+            .expect("record");
+
+        let holder = rusqlite::Connection::open(&path).expect("holder");
+        holder.execute_batch("BEGIN IMMEDIATE").expect("lock");
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let opened = path.clone();
+        let authorizer = thread::spawn(move || {
+            let mut waiting = Ledger::open(&opened).expect("open");
+            let mut signaled = false;
+            waiting
+                .conn
+                .busy_handler(Some(move |_| {
+                    if !signaled {
+                        signaled = true;
+                        let _ = blocked_tx.send(());
+                        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                        return true;
+                    }
+                    false
+                }))
+                .expect("busy handler");
+            waiting.authorize_release_with(
+                "feature",
+                "sha-head",
+                "sha-head",
+                "maintainer",
+                None,
+                None,
+                Some("tty-typed"),
+                None,
+                || Ok(()),
+            )
+        });
+        blocked_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("authorizer waited for the write lock");
+        holder
+            .execute(
+                "INSERT INTO settings (key, value, updated_at, updated_by)
+                 VALUES ('signoff', 'signed-tag', '2026-01-01T00:00:00.000Z', 'test')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .expect("publish signoff");
+        holder.execute_batch("COMMIT").expect("commit signoff");
+        release_tx.send(()).expect("release");
+
+        let err = authorizer
+            .join()
+            .expect("authorizer")
+            .expect_err("typed authorization after signoff=signed-tag");
+        assert_eq!(err.to_string(), "signoff=signed-tag requires a signed tag");
+        let rows: i64 = rusqlite::Connection::open(&path)
+            .expect("count")
+            .query_row("SELECT COUNT(*) FROM release_authorizations", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(rows, 0);
+
+        let stored = ledger
+            .authorize_release_with(
+                "feature",
+                "sha-head",
+                "sha-head",
+                "maintainer",
+                None,
+                None,
+                Some("tty-typed+signed-tag"),
+                Some("tag relaybook-signoff/sha-head0000\nobject abc\nverifier Good"),
+                || Ok(()),
+            )
+            .expect("signed authorization");
+        assert_eq!(stored.method.as_deref(), Some("tty-typed+signed-tag"));
     }
 }

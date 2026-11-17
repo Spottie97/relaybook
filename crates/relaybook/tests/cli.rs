@@ -4238,6 +4238,42 @@ fn signed_tag_mode_accepts_valid_signature() {
 }
 
 #[test]
+fn signed_tag_replaced_between_commands_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    let _keys = install_ssh_signing(dir.path());
+    let switched = answer_prompts(
+        dir.path(),
+        &["config", "set", "signoff", "signed-tag"],
+        &[PromptAnswer::Phrase],
+    );
+    assert!(switched.success, "{}", switched.output);
+    let tag = format!("relaybook-signoff/{}", &head[..12]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "tag.gpgsign=false",
+            "tag",
+            "-a",
+            "-m",
+            "unsigned",
+            &tag,
+        ],
+    );
+    let parent = git(dir.path(), &["rev-parse", "HEAD^"]);
+    let replaced = authorize_and_replace_signoff_tag(dir.path(), &fake, &head, &tag, &parent);
+    assert!(!replaced.success, "{}", replaced.output);
+    assert!(
+        replaced.output.contains("is not a valid signature"),
+        "{}",
+        replaced.output
+    );
+    assert!(authorizations(dir.path()).is_empty());
+}
+
+#[test]
 fn gated_manual_flow_never_pushes_or_calls_gh() {
     let dir = tempfile::tempdir().expect("tempdir");
     let fake = GraphifyFake::install();
@@ -5548,6 +5584,146 @@ struct PtyOutput {
     success: bool,
     code: u32,
     output: String,
+}
+
+/// Answer the authorize prompt, then replace the sign-off tag while git is
+/// paused on the signature check. The unsigned tag at HEAD is what a pinned
+/// object id verifies. A check that looks the name up again sees the signed
+/// tag on the parent instead.
+fn authorize_and_replace_signoff_tag(
+    dir: &Path,
+    fake: &GraphifyFake,
+    sha: &str,
+    tag: &str,
+    parent: &str,
+) -> PtyOutput {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    use portable_pty::{
+        Child as PtyChild, ChildKiller, CommandBuilder, PtySize, native_pty_system,
+    };
+
+    static GATES: AtomicU64 = AtomicU64::new(1);
+    let root = std::env::var_os("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let gate = root.join(format!(
+        "relaybook-tag-gate-{}-{}",
+        std::process::id(),
+        GATES.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir_all(&gate).expect("gate");
+    let mut path = git_shim_dir().into_os_string();
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(&fake.path);
+
+    let system = native_pty_system();
+    let pair = system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("pty");
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_relaybook"));
+    cmd.arg("release");
+    cmd.arg("authorize");
+    cmd.arg("--sha");
+    cmd.arg(sha);
+    cmd.cwd(dir);
+    cmd.env("PATH", path);
+    cmd.env("GRAPHIFY_LOG", &fake.log);
+    cmd.env("RELAYBOOK_FAKE_GRAPHIFY", "graph");
+    cmd.env("RELAYBOOK_GIT_GATE", &gate);
+    cmd.env("RELAYBOOK_GIT_GATE_CMD", "tag");
+    cmd.env("RELAYBOOK_GIT_GATE_CMD_ALT", "verify-tag");
+    cmd.env("RELAYBOOK_REAL_GIT", real_git());
+    cmd.env(
+        "RELAYBOOK_REAL_PATH",
+        std::env::var_os("PATH").expect("PATH"),
+    );
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("reader");
+    let mut writer = pair.master.take_writer().expect("writer");
+    let (send, recv) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 1024];
+        let mut sent = false;
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(count) => {
+                    buf.extend_from_slice(&tmp[..count]);
+                    let phrases = typed_phrases(&buf);
+                    if !sent && !phrases.is_empty() {
+                        let phrase = format!("{}\n", phrases[0]);
+                        let _ = writer.write_all(phrase.as_bytes());
+                        let _ = writer.flush();
+                        sent = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = send.send(buf);
+    });
+
+    let entered = gate.join("entered-1");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if entered.exists() {
+            break;
+        }
+        match PtyChild::try_wait(child.as_mut()) {
+            Ok(Some(_)) => {
+                let buf = recv
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_default();
+                panic!(
+                    "authorize exited before the tag check: {}",
+                    String::from_utf8_lossy(&buf)
+                );
+            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = ChildKiller::kill(child.as_mut());
+                panic!("sign-off git verify did not start");
+            }
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    }
+    git(dir, &["tag", "-d", tag]);
+    git(dir, &["tag", "-s", "-m", "moved", tag, parent]);
+    fs::write(gate.join("release-1"), b"1").expect("release");
+
+    let started = Instant::now();
+    let status = loop {
+        match PtyChild::try_wait(child.as_mut()) {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(20) => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = ChildKiller::kill(child.as_mut());
+                panic!("timed out waiting for release authorize");
+            }
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    };
+    let buf = recv
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    PtyOutput {
+        success: status.success(),
+        code: status.exit_code(),
+        output: String::from_utf8_lossy(&buf).into_owned(),
+    }
 }
 
 fn authorize_at_tty(dir: &Path, fake: &GraphifyFake, log: Option<&Path>, sha: &str) -> PtyOutput {

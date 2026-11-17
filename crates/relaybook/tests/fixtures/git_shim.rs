@@ -1,6 +1,7 @@
 //! Pause one git subcommand so a test can mutate the worktree while Relaybook
 //! holds its ledger write lock. `RELAYBOOK_GIT_GATE_CMD` selects that
-//! subcommand and defaults to `status`. Other git commands run immediately.
+//! subcommand and defaults to `status`. `RELAYBOOK_GIT_GATE_CMD_ALT` pauses a
+//! second argument as well. Other git commands run immediately.
 
 use std::env;
 use std::ffi::OsString;
@@ -24,7 +25,11 @@ fn main() {
     log_env(&args);
     hold_stderr(&args);
     let gate_cmd = env::var("RELAYBOOK_GIT_GATE_CMD").unwrap_or_else(|_| "status".to_string());
-    if args.iter().any(|arg| arg == gate_cmd.as_str()) {
+    let gate_alt = env::var("RELAYBOOK_GIT_GATE_CMD_ALT").unwrap_or_default();
+    if args
+        .iter()
+        .any(|arg| arg == gate_cmd.as_str() || (!gate_alt.is_empty() && arg == gate_alt.as_str()))
+    {
         let n = claim_index(&gate);
         let dir = PathBuf::from(&gate);
         if let Err(err) = fs::write(dir.join(format!("entered-{n}")), b"1") {
@@ -48,6 +53,7 @@ fn main() {
     }
     command.env_remove("RELAYBOOK_GIT_GATE");
     command.env_remove("RELAYBOOK_GIT_GATE_CMD");
+    command.env_remove("RELAYBOOK_GIT_GATE_CMD_ALT");
     command.env_remove("RELAYBOOK_REAL_GIT");
     command.env_remove("RELAYBOOK_REAL_PATH");
     command.env_remove("RELAYBOOK_GIT_ENV_LOG");

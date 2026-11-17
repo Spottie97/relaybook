@@ -82,15 +82,25 @@ pub(crate) fn confirmation_token(cwd: &Path) -> String {
 
 /// Check annotated tag `relaybook-signoff/<sha12>` on `sha`.
 ///
-/// The stored evidence is the tag name, the tag object SHA, and the first
-/// verifier line. `git tag -v` is run with `LC_ALL=C` so that line does not
-/// follow the operator locale. Relaybook does not create or push the tag.
+/// `refs/tags/<name>` is resolved once. The peel, `git verify-tag`, and the
+/// stored object id all use that object. `git tag -v` looks the name up
+/// again, so a tag that moves between commands could pair one commit with
+/// another tag's signature. The stored evidence is the tag name, that object
+/// id, and the first verifier line. Git runs with `LC_ALL=C` so the line
+/// does not follow the operator locale. Relaybook does not create or push
+/// the tag.
 pub(crate) fn verify_signoff_tag(root: &Path, sha: &str) -> Result<String, Error> {
     let sha = sha.trim();
     let name = format!("relaybook-signoff/{}", token_from_sha(sha)?);
-    let Some(peeled) = git_rev(root, &format!("{name}^{{commit}}"))? else {
+    let qualified = format!("refs/tags/{name}");
+    let Some(object) = git_rev(root, &qualified)? else {
         return Err(Error::InvalidSetting(format!(
             "sign-off tag {name} is missing"
+        )));
+    };
+    let Some(peeled) = git_rev(root, &format!("{object}^{{commit}}"))? else {
+        return Err(Error::InvalidSetting(format!(
+            "sign-off tag {name} does not point at HEAD"
         )));
     };
     if peeled != sha {
@@ -98,14 +108,12 @@ pub(crate) fn verify_signoff_tag(root: &Path, sha: &str) -> Result<String, Error
             "sign-off tag {name} does not point at HEAD"
         )));
     }
-    let verified = git_tag_verify(root, &name)?;
+    let verified = git_tag_verify(root, &object)?;
     if !verified.status.success() {
         return Err(Error::InvalidSetting(format!(
             "sign-off tag {name} is not a valid signature"
         )));
     }
-    let object = git_rev(root, &format!("refs/tags/{name}"))?
-        .ok_or_else(|| Error::InvalidSetting(format!("sign-off tag {name} is missing")))?;
     let verifier = first_line(&verified.stderr)
         .or_else(|| first_line(&verified.stdout))
         .unwrap_or_default();
@@ -167,11 +175,11 @@ fn git_rev(root: &Path, rev: &str) -> Result<Option<String>, Error> {
     }
 }
 
-fn git_tag_verify(root: &Path, name: &str) -> Result<Output, Error> {
+fn git_tag_verify(root: &Path, object: &str) -> Result<Output, Error> {
     git_cmd(root)
-        .args(["tag", "-v", "--end-of-options", name])
+        .args(["verify-tag", "--end-of-options", object])
         .output()
-        .map_err(|err| Error::InvalidSetting(format!("git tag failed: {err}")))
+        .map_err(|err| Error::InvalidSetting(format!("git verify-tag failed: {err}")))
 }
 
 fn first_line(bytes: &[u8]) -> Option<String> {
