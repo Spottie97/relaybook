@@ -937,7 +937,7 @@ fn hook_prompt_is_one_line_or_silent() {
     run(dir.path(), ["hook", "prompt"])
         .assert()
         .success()
-        .stdout("2 new Cursor reports: relaybook inbox\n")
+        .stdout("2 new reports: relaybook inbox\n")
         .stderr("");
 
     let broken = dir.path().join(".relaybook").join("ledger.db");

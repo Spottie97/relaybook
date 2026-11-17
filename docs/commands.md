@@ -13,10 +13,11 @@ Plain text is the default. `relaybook status --json` prints one JSON envelope on
 relaybook guide
 relaybook guide planner
 relaybook guide executor
+relaybook guide reviewer
 relaybook hook session
 ```
 
-`relaybook guide` prints the planner and executor workflows, including one worked example each. Pass `planner` or `executor` to print one role. Each role stays under 4,000 bytes. `relaybook hook session` prints one line when a ready task or an unreviewed report is waiting, and prints nothing otherwise.
+`relaybook guide` prints the planner, executor, and reviewer workflows. The planner and executor guides include one worked example each. Pass `planner`, `executor`, or `reviewer` to print one role. Each role stays under 4,000 bytes. `relaybook hook session` prints one line when a ready task or an unreviewed report is waiting, and prints nothing otherwise. The reviewer guide is for Codex in the gated workflow. See [orca-workflow.md](orca-workflow.md).
 
 ## Daily workflow
 
@@ -57,7 +58,7 @@ relaybook task reopen greet --reason "needs a test"
 
 `relaybook progress report` stores `git rev-parse HEAD` when that succeeds. A second report for the same task and commit fails with `already reported for <sha>`. Outside a git checkout the commit is null, and each report is appended.
 
-`relaybook task done` requires a claim. On an open task it fails with `claim it first: relaybook task claim greet --by <agent>` and exit code 1, and it writes nothing. A task that is already done succeeds and does not write another event. `relaybook task done greet --no-report` still stores an empty report and does not store a second one if the task is already done.
+`relaybook task done` requires a claim. On an open task it fails with `claim it first: relaybook task claim greet --by <agent>` and exit code 1, and it writes nothing. A task that is already done succeeds and does not write another event. `relaybook task done greet --no-report` still stores an empty report and does not store a second one if the task is already done. The report stores `commit_sha` from `HEAD` when that succeeds, in classic mode and in gated mode. Gated claim and done also require a clean tree. See [orca-workflow.md](orca-workflow.md).
 
 ## Checklist, decisions, and context
 
@@ -92,7 +93,7 @@ relaybook report accept --all
 relaybook task reopen greet --reason "needs a test"
 ```
 
-The executor claims the task, then finishes with short bullets under 1,500 bytes. A cross-task note uses `relaybook report note`. On the next prompt, `UserPromptSubmit` runs `command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true`. On Windows without Git Bash it runs `if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }`. When reports are waiting it prints one line, `N new Cursor reports: relaybook inbox`. Otherwise it prints nothing and exits 0.
+The executor claims the task, then finishes with short bullets under 1,500 bytes. A cross-task note uses `relaybook report note`. On the next prompt, `UserPromptSubmit` runs `command -v relaybook >/dev/null 2>&1 && relaybook hook prompt || true`. On Windows without Git Bash it runs `if (Get-Command relaybook -ErrorAction SilentlyContinue) { relaybook hook prompt }`. When reports are waiting it prints one line, `N new reports: relaybook inbox`. Otherwise it prints nothing and exits 0.
 
 The planner runs `relaybook inbox`, then `relaybook report accept greet` or `relaybook task reopen greet --reason "needs a test"`. A reopened task returns to `relaybook task list --ready` with `reopened: needs a test` until it is done again. A larger problem becomes a new task.
 

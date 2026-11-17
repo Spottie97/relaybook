@@ -25,3 +25,5 @@ relaybook task reopen uploads --reason "needs a test"
 A report has changed, verified, not-verified, and review, and stays under 1,500 bytes.
 
 Common mistakes: planning from memory, marking a task done as the planner, and implementing the work yourself.
+
+Never run `graphify extract`. In `workflow=gated`, Orca runs `relaybook graph refresh --step plan` before planning, and Codex reviews the commit. You still do not implement.

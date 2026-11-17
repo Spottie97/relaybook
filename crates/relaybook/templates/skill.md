@@ -19,4 +19,5 @@ allowed-tools:
 # relaybook:managed
 
 Run `relaybook guide planner` and `relaybook context` before you plan or review.
+Never run `graphify extract`.
 The allowed-tools list lasts for the turn that opens this skill. Project permissions cover the same commands for the rest of the session.

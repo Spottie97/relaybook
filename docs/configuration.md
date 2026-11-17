@@ -25,7 +25,11 @@ relaybook setup --ci
 
 Local hooks are the default. `graphify hook install` refreshes the graph after a commit and a checkout. `relaybook setup` adds post-merge and post-rewrite hooks that run `graphify update .` in the background, so `git pull` and `git pull --rebase` return immediately. `relaybook setup --no-hooks` leaves those hooks out.
 
-Relaybook does not check whether `graphify-out/graph.json` exists, whether it is current, or which Graphify version built it, and it does not record which commit the graph was built from. The auto runner never calls Graphify. Relaybook runs Graphify only from `relaybook setup`, `relaybook uninstall --graphify`, and the post-merge and post-rewrite hooks. Relaybook never runs `graphify extract`; only the opt-in workflow below does. The Graphify section of `CLAUDE.md` mentions `graphify-out/wiki/index.md`. That file exists only after `graphify export wiki`, which neither `graphify update` nor Relaybook runs. A planned workflow refreshes the graph before every agent step and records the graph's commit in each handoff. It is not built yet. See [orca-workflow.md](orca-workflow.md).
+With `workflow=classic` (the default), Relaybook does not check whether `graphify-out/graph.json` exists or which Graphify version built it, and it does not record which commit the graph was built from. The auto runner never calls Graphify. Relaybook runs Graphify from `relaybook setup`, `relaybook uninstall --graphify`, and the post-merge and post-rewrite hooks.
+
+With `workflow=gated`, `relaybook graph refresh`, a gated `relaybook task claim`, `relaybook review start`, and a gated `relaybook task done` also run `graphify update .` and record that commit. When that refresh is `built`, `relaybook review start` adds `graphify affected` output for the files in the reviewed range, capped at 4,000 bytes. If Graphify is missing, the update fails, or `graphify-out/graph.json` is missing afterwards, the recorded status is `skipped` or `failed`, `graph_sha` is null, and the handoff says `no graph`. That does not stop the command. Gated mode needs `graphify-out/` gitignored. `relaybook setup --ci` tracks `graphify-out/graph.json`, so that layout is not usable with `workflow=gated`.
+
+Relaybook never runs `graphify extract`. The opt-in workflow below does, when an LLM API secret is set. The Graphify section of `CLAUDE.md` mentions `graphify-out/wiki/index.md`. That file exists only after `graphify export wiki`, which neither `graphify update` nor Relaybook runs. Refreshing the graph from the auto runner is planned and not built. See [orca-workflow.md](orca-workflow.md).
 
 `relaybook setup --ci` is the opt-in GitHub Actions path for teams that want the graph committed. Pushes that only change `graphify-out/` do not start another run. Delete `.github/workflows/graphify-update.yml` to turn that job off.
 
@@ -54,17 +58,23 @@ relaybook gates
 relaybook gates none
 relaybook gates plan
 relaybook gates plan,review
+relaybook config set reviewer codex
+relaybook config set workflow gated
 ```
 
 | Key | Default | Values |
 | --- | --- | --- |
 | `mode` | `manual` | `manual` or `auto` |
 | `gates` | `plan` | `none`, `plan`, or `plan,review` |
+| `reviewer` | `claude` | `claude` or `codex` |
+| `workflow` | `classic` | `classic` or `gated` |
 | `max_cycles` | 20 | integer, at least 1 |
 | `max_reopens_per_task` | 2 | integer, at least 1 |
 | `max_agent_calls` | 60 | integer, at least 1 |
 | `cursor_timeout_min` | 30 | integer, at least 1 |
 | `est_cost_cap_usd` | unset | a number greater than 0, or `unset` to clear it |
+
+`workflow=gated` requires `reviewer=codex`. Set `reviewer` first. `relaybook config set workflow gated` fails with `workflow=gated requires reviewer=codex` while the reviewer is `claude`. The gated commands are in [orca-workflow.md](orca-workflow.md).
 
 `relaybook mode` prints the current mode. `relaybook mode auto` sets it. `relaybook gates` prints the current checkpoints. `relaybook gates plan` sets them. The same words work from `/relaybook` in Claude Code and Cursor. `/relaybook` with no arguments shows status and a menu.
 

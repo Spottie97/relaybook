@@ -129,9 +129,9 @@ enum Command {
     },
     /// Print mode, limits, and the active run.
     Status,
-    /// Print the planner or executor workflow.
+    /// Print the planner, executor, or reviewer workflow.
     Guide {
-        /// `planner` or `executor`. Omit this to print both.
+        /// `planner`, `executor`, or `reviewer`. Omit this to print all three.
         role: Option<GuideRole>,
     },
     /// Run the auto-mode loop, or stop and complete it.
@@ -395,6 +395,8 @@ enum GuideRole {
     Planner,
     /// The implementation workflow.
     Executor,
+    /// The Codex review workflow. It does not edit the ledger.
+    Reviewer,
 }
 
 #[derive(Subcommand)]
@@ -716,6 +718,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             let text = guide::render(role.map(|role| match role {
                 GuideRole::Planner => guide::Role::Planner,
                 GuideRole::Executor => guide::Role::Executor,
+                GuideRole::Reviewer => guide::Role::Reviewer,
             }));
             Ok(Outcome {
                 human: text,
@@ -1782,7 +1785,7 @@ fn hook_prompt() {
         return;
     };
     if count > 0 {
-        println!("{count} new Cursor reports: relaybook inbox");
+        println!("{count} new reports: relaybook inbox");
     }
     if let Ok(Some(line)) = ledger.hook_wait_line() {
         println!("{line}");

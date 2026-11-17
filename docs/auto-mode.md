@@ -77,7 +77,7 @@ When the repository has an `origin` remote, the run pushes its branch with `git 
 
 When no run task is unfinished, the run pushes and runs `gh pr create --base main` without asking. Checkpoints pause after planning and after reviews only. There is no checkpoint before a push or the pull request. Without an `origin` remote nothing is pushed, but `gh pr create` still runs. Relaybook never merges and never creates a tag.
 
-The planned Orca workflow publishes nothing before sign-off, so it does not use `relaybook run`. See [orca-workflow.md](orca-workflow.md).
+The manual gated workflow publishes nothing before sign-off, so it does not use `relaybook run`. See [orca-workflow.md](orca-workflow.md). `relaybook run` still pushes when `workflow=gated`. Skipping those pushes, and routing the auto reviewer to Codex, is planned and not built.
 
 ## PRD template
 

@@ -826,10 +826,13 @@ fn guide_prints_a_role_or_both() {
     assert!(both.status.success(), "{text}");
     assert!(text.contains("# Planner"), "{text}");
     assert!(text.contains("# Executor"), "{text}");
+    assert!(text.contains("# Reviewer"), "{text}");
     assert!(text.contains("depends-on login"), "{text}");
     assert!(text.contains("planning from memory"), "{text}");
     assert!(text.contains("working unclaimed"), "{text}");
     assert!(text.contains("1,500 bytes"), "{text}");
+    assert!(text.contains("graphify extract"), "{text}");
+    assert!(text.contains("no graph"), "{text}");
     let planner = relaybook(dir.path())
         .args(["guide", "planner"])
         .output()
@@ -837,6 +840,7 @@ fn guide_prints_a_role_or_both() {
     let planner = String::from_utf8_lossy(&planner.stdout);
     assert!(planner.contains("depends-on login"), "{planner}");
     assert!(!planner.contains("# Executor"), "{planner}");
+    assert!(!planner.contains("# Reviewer"), "{planner}");
     assert!(planner.len() <= 4000, "{}", planner.len());
     let executor = relaybook(dir.path())
         .args(["guide", "executor"])
@@ -845,7 +849,20 @@ fn guide_prints_a_role_or_both() {
     let executor = String::from_utf8_lossy(&executor.stdout);
     assert!(executor.contains("task claim login"), "{executor}");
     assert!(!executor.contains("# Planner"), "{executor}");
+    assert!(!executor.contains("# Reviewer"), "{executor}");
     assert!(executor.len() <= 4000, "{}", executor.len());
+    let reviewer = relaybook(dir.path())
+        .args(["guide", "reviewer"])
+        .output()
+        .expect("reviewer");
+    let reviewer = String::from_utf8_lossy(&reviewer.stdout);
+    assert!(reviewer.contains("graphify extract"), "{reviewer}");
+    assert!(reviewer.contains("codex"), "{reviewer}");
+    assert!(reviewer.contains("no graph"), "{reviewer}");
+    assert!(reviewer.contains("findings"), "{reviewer}");
+    assert!(!reviewer.contains("# Planner"), "{reviewer}");
+    assert!(!reviewer.contains("# Executor"), "{reviewer}");
+    assert!(reviewer.len() <= 4000, "{}", reviewer.len());
 }
 
 #[test]

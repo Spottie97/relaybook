@@ -4,6 +4,24 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 
 ## [Unreleased]
 
+## [0.4.0] - Unreleased
+
+### Added
+
+- Schema 7. An older ledger migrates in place: reports gain `commit_sha`, `base_sha`, and `graph_sha`, and the ledger stores reviews, graph builds, and release authorizations.
+- `reviewer` and `workflow` settings. Defaults stay `reviewer=claude` and `workflow=classic`. `workflow=gated` requires `reviewer=codex`.
+- `relaybook task done` records `commit_sha` in classic and gated mode. Gated claim and done require a clean tree.
+- Gated graph refresh records `graph_sha` and a `graph_context` of at most 4,000 bytes. Relaybook runs `graphify update .` at those step boundaries.
+- `relaybook review start` and `relaybook review record` for a task. A changes-requested verdict reopens the task. Gated `relaybook report accept` requires an approved review at `HEAD`.
+- Release review, `relaybook release authorize`, and `relaybook release status`. The maintainer authorizes one commit at a terminal after an approved release review at `HEAD`.
+- `relaybook guide reviewer` for Codex. Planner, executor, and skill text tell agents never to run `graphify extract`.
+
+### Changed
+
+- The prompt hook prints `N new reports: relaybook inbox`.
+- Docs describe the manual gated workflow as implemented and pin the minimum version: gated work requires Relaybook 0.4.0 or later (ledger schema 7). 0.3.3 and earlier open a schema 7 ledger and ignore the gates.
+- Auto mode still pushes the run branch before sign-off. The auto-mode gates are not built.
+
 ## [0.3.3] - 2026-11-12
 
 ### Fixed
