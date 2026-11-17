@@ -29,6 +29,7 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 - `relaybook setup` keeps an existing `merge.graphify.driver`, including a driver in global or system git config and the driver `graphify hook install` registers. When that key is unset in the effective git configuration, setup still registers a repository-local `graphify merge-driver %O %A %B`.
 - `relaybook setup` warns `CLAUDE.md: warn (graphify claude install changed CLAUDE.md)` when that command changes `CLAUDE.md`. The warning does not fail setup.
 - `relaybook uninstall --dry-run --graphify` lists what Graphify's uninstall commands change: the Graphify section of `CLAUDE.md`, Graphify hooks in `.claude/settings.json`, `.cursor/rules/graphify.mdc`, Graphify git hooks, the `graphify-out/graph.json` merge attribute, and `merge.graphify.*`.
+- Tests that run graph refresh with Graphify hidden drop every `PATH` entry where `graphify` resolves, including Windows `.cmd` and `.bat` shims.
 
 ## [0.3.3] - 2026-11-12
 

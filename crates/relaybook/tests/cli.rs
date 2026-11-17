@@ -1855,6 +1855,97 @@ fn graph_refresh_skips_without_graphify() {
 }
 
 #[test]
+fn graphify_hiding_helper_matches_production_lookup() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let shim = root.path().join("shim");
+    fs::create_dir_all(&shim).expect("shim");
+    let program = shim.join(if cfg!(windows) {
+        "graphify.exe"
+    } else {
+        "graphify"
+    });
+    fs::write(&program, b"").expect("graphify");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&program).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).expect("chmod");
+    }
+    let mut raw = OsString::from(&shim);
+    raw.push(if cfg!(windows) { ";" } else { ":" });
+    if let Some(rest) = std::env::var_os("PATH") {
+        raw.push(rest);
+    }
+    assert!(
+        which::which_in("graphify", Some(shim.as_os_str()), root.path()).is_ok(),
+        "planted graphify was not visible to which"
+    );
+    let hidden = path_without_graphify(&raw, root.path());
+    assert!(
+        std::env::split_paths(&hidden).all(|entry| entry != shim),
+        "helper kept {}",
+        shim.display()
+    );
+    for entry in std::env::split_paths(&hidden) {
+        assert!(
+            which::which_in("graphify", Some(entry.as_os_str()), root.path()).is_err(),
+            "remaining PATH entry resolves graphify: {}",
+            entry.display()
+        );
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn graphify_hiding_helper_drops_cmd_and_bat_shims() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git_repo(dir.path());
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    run(dir.path(), ["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+
+    let shim_root = tempfile::tempdir().expect("shim");
+    let shim = shim_root.path();
+    fs::write(shim.join("graphify.cmd"), "@echo off\r\nexit /b 0\r\n").expect("cmd");
+    fs::write(shim.join("graphify.bat"), "@echo off\r\nexit /b 0\r\n").expect("bat");
+    let mut raw = OsString::from(shim);
+    raw.push(";");
+    if let Some(rest) = std::env::var_os("PATH") {
+        raw.push(rest);
+    }
+    assert!(
+        which::which_in("graphify", Some(shim.as_os_str()), dir.path()).is_ok(),
+        "cmd and bat shims were not visible to which"
+    );
+    let hidden = path_without_graphify(&raw, dir.path());
+    assert!(
+        std::env::split_paths(&hidden).all(|entry| entry != shim),
+        "helper kept {}",
+        shim.display()
+    );
+
+    let data = json_on_path_without_graphify(
+        dir.path(),
+        &raw,
+        ["graph", "refresh", "--step", "plan", "--json"],
+    );
+    let head = git(dir.path(), &["rev-parse", "HEAD"]);
+    assert_eq!(data["commit_sha"], json!(head));
+    assert!(data["graph_sha"].is_null());
+    assert_eq!(data["status"], json!("skipped"));
+    assert_eq!(data["detail"], json!("no graph"));
+    assert_eq!(
+        graph_builds(dir.path()),
+        vec![("plan".to_string(), head, "skipped".to_string())]
+    );
+}
+
+#[test]
 fn flow_never_runs_graphify_extract() {
     let dir = tempfile::tempdir().expect("tempdir");
     seed_graph_task(dir.path());
@@ -3629,25 +3720,17 @@ fn fake_data(
 }
 
 fn json_without_graphify(dir: &Path, args: impl IntoIterator<Item = &'static str>) -> Value {
-    let mut path = OsString::new();
-    let mut first = true;
-    if let Some(current) = std::env::var_os("PATH") {
-        for entry in std::env::split_paths(&current) {
-            let has_graphify = ["graphify", "graphify.exe"]
-                .iter()
-                .any(|name| entry.join(name).is_file());
-            if has_graphify {
-                continue;
-            }
-            if !first {
-                path.push(if cfg!(windows) { ";" } else { ":" });
-            }
-            first = false;
-            path.push(entry);
-        }
-    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    json_on_path_without_graphify(dir, &path, args)
+}
+
+fn json_on_path_without_graphify(
+    dir: &Path,
+    path: &std::ffi::OsStr,
+    args: impl IntoIterator<Item = &'static str>,
+) -> Value {
     let output = command(dir)
-        .env("PATH", path)
+        .env("PATH", path_without_graphify(path, dir))
         .args(args)
         .output()
         .expect("output");
@@ -3655,6 +3738,23 @@ fn json_without_graphify(dir: &Path, args: impl IntoIterator<Item = &'static str
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("json");
     assert_eq!(envelope["ok"], json!(true), "{envelope}");
     envelope["data"].clone()
+}
+
+/// Drop every PATH entry for which production `which::which("graphify")` would succeed.
+fn path_without_graphify(path: &std::ffi::OsStr, cwd: &Path) -> OsString {
+    let mut filtered = OsString::new();
+    let mut first = true;
+    for entry in std::env::split_paths(path) {
+        if which::which_in("graphify", Some(entry.as_os_str()), cwd).is_ok() {
+            continue;
+        }
+        if !first {
+            filtered.push(if cfg!(windows) { ";" } else { ":" });
+        }
+        first = false;
+        filtered.push(&entry);
+    }
+    filtered
 }
 
 fn graph_builds(dir: &Path) -> Vec<(String, String, String)> {
