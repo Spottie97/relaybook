@@ -77,6 +77,16 @@ fn graphify(args: &[String]) {
             eprintln!("boom");
             std::process::exit(1);
         }
+        Some("hold") => {
+            if args.first().map(String::as_str) == Some("update") && !wait_for_graphify_hold() {
+                eprintln!("graphify hold timed out");
+                std::process::exit(98);
+            }
+            if args.first().map(String::as_str) == Some("update") {
+                write_graph();
+            }
+            return;
+        }
         _ => {}
     }
     eprintln!("boom");
@@ -386,6 +396,35 @@ fn codex(args: &[String]) {
         _ => {}
     }
     write_out(out.as_deref(), &verdict_json(args, "approved"));
+}
+
+fn wait_for_graphify_hold() -> bool {
+    let Some(dir) = env::var("RELAYBOOK_GRAPHIFY_HOLD").ok() else {
+        eprintln!("RELAYBOOK_GRAPHIFY_HOLD is unset");
+        std::process::exit(99);
+    };
+    let from = env::var("RELAYBOOK_GRAPHIFY_HOLD_FROM")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1);
+    let seq = claim_hold_slot(&dir);
+    if seq == 0 {
+        eprintln!("graphify hold slot failed");
+        std::process::exit(98);
+    }
+    let root = PathBuf::from(&dir);
+    let _ = fs::write(root.join(format!("started-{seq}")), "update");
+    if seq < from {
+        return true;
+    }
+    let release = root.join(format!("release-{seq}"));
+    for _ in 0..1600 {
+        if release.is_file() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
 }
 
 fn claim_hold_slot(dir: &str) -> i64 {

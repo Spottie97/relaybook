@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     bytes INTEGER,
     started_at TEXT NOT NULL,
     recorded_at TEXT,
+    invocation_token TEXT,
     CHECK ((scope = 'task') = (task_id IS NOT NULL))
 );
 
@@ -183,6 +184,10 @@ WHERE workflow = 'gated'
     status IN ('active', 'waiting', 'paused')
     OR stage = 'publishing'
   );
+
+CREATE UNIQUE INDEX IF NOT EXISTS reviews_invocation_token
+ON reviews (invocation_token)
+WHERE invocation_token IS NOT NULL;
 ";
 
 /// One live gated run. `publishing` is the stage set once the push has started.
@@ -195,6 +200,14 @@ WHERE workflow = 'gated'
     status IN ('active', 'waiting', 'paused')
     OR stage = 'publishing'
   );
+";
+
+/// One token per new review. NULL stays allowed so a migrated row is unchanged.
+/// A read-write open installs this on an existing schema 8 ledger.
+pub(crate) const REVIEW_INVOCATION_INDEX: &str = "
+CREATE UNIQUE INDEX IF NOT EXISTS reviews_invocation_token
+ON reviews (invocation_token)
+WHERE invocation_token IS NOT NULL;
 ";
 
 /// Triggers installed for schema 8. They only `RAISE`; they do not write.
@@ -473,7 +486,8 @@ CREATE TABLE IF NOT EXISTS release_authorizations (
 #[cfg(test)]
 mod guard_sql {
     use super::{
-        GUARD_MESSAGE, GUARD_NAMES, GUARDS, MIGRATE_V7_TO_V8, ONE_LIVE_GATED_INDEX, SCHEMA,
+        GUARD_MESSAGE, GUARD_NAMES, GUARDS, MIGRATE_V6_TO_V7, MIGRATE_V7_TO_V8,
+        ONE_LIVE_GATED_INDEX, REVIEW_INVOCATION_INDEX, SCHEMA,
     };
 
     #[test]
@@ -493,5 +507,12 @@ mod guard_sql {
         );
         assert!(SCHEMA.contains(ONE_LIVE_GATED_INDEX.trim()));
         assert!(MIGRATE_V7_TO_V8.contains(ONE_LIVE_GATED_INDEX.trim()));
+        assert!(SCHEMA.contains("invocation_token TEXT"));
+        assert!(!MIGRATE_V6_TO_V7.contains("invocation_token"));
+        assert!(SCHEMA.contains(REVIEW_INVOCATION_INDEX.trim()));
+        assert!(
+            REVIEW_INVOCATION_INDEX
+                .contains("CREATE UNIQUE INDEX IF NOT EXISTS reviews_invocation_token")
+        );
     }
 }

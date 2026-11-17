@@ -257,6 +257,39 @@ fn existing_v8_ledger_gains_the_live_run_index_without_a_version_bump() {
 }
 
 #[test]
+fn existing_v8_ledger_gains_the_review_token_without_a_version_bump() {
+    let (_dir, path) = fresh_path();
+    drop(Ledger::initialize(&path).expect("init"));
+    assert_eq!(user_version(&path), 8);
+    assert!(column_names(&path, "reviews").contains(&"invocation_token".to_string()));
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute("DROP INDEX reviews_invocation_token", [])
+            .expect("drop index");
+        conn.execute("ALTER TABLE reviews DROP COLUMN invocation_token", [])
+            .expect("drop column");
+    }
+    assert!(!column_names(&path, "reviews").contains(&"invocation_token".to_string()));
+    let ledger = Ledger::open(&path).expect("reopen");
+    assert!(!ledger.guards_restored());
+    drop(ledger);
+    assert_eq!(user_version(&path), 8);
+    assert!(column_names(&path, "reviews").contains(&"invocation_token".to_string()));
+    let conn = Connection::open(&path).expect("open");
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'reviews_invocation_token'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("index");
+    assert!(sql.contains("invocation_token IS NOT NULL"), "{sql}");
+    drop(conn);
+    drop(Ledger::open(&path).expect("second open"));
+    assert_eq!(user_version(&path), 8);
+}
+
+#[test]
 fn v7_ledger_migrates_to_v8_with_payloads_unchanged() {
     let (_dir, path) = fresh_path();
     let event = r#"{"slug":"auth","title":"Add auth"}"#;
@@ -413,12 +446,15 @@ fn v7_ledger_migrates_to_v8_with_payloads_unchanged() {
     assert_eq!(stored_run.1, "paused");
     assert_eq!(stored_run.2, None);
     assert_eq!(stored_run.3, 0);
-    let stored_review: String = conn
-        .query_row("SELECT body FROM reviews WHERE id = 1", [], |row| {
-            row.get(0)
-        })
+    let stored_review: (String, Option<String>) = conn
+        .query_row(
+            "SELECT body, invocation_token FROM reviews WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
         .expect("review");
-    assert_eq!(stored_review, review);
+    assert_eq!(stored_review.0, review);
+    assert_eq!(stored_review.1, None);
     let stored_auth: (String, Option<String>, Option<String>) = conn
         .query_row(
             "SELECT authorized_by, method, evidence FROM release_authorizations WHERE id = 1",

@@ -3,8 +3,8 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use crate::error::Error;
 use crate::schema::{
     GUARD_MESSAGE, GUARD_NAMES, GUARDS, MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4,
-    MIGRATE_V5_TO_V6, MIGRATE_V6_TO_V7, MIGRATE_V7_TO_V8, ONE_LIVE_GATED_INDEX, SCHEMA,
-    SCHEMA_VERSION,
+    MIGRATE_V5_TO_V6, MIGRATE_V6_TO_V7, MIGRATE_V7_TO_V8, ONE_LIVE_GATED_INDEX,
+    REVIEW_INVOCATION_INDEX, SCHEMA, SCHEMA_VERSION,
 };
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
@@ -111,6 +111,7 @@ fn migrate_locked(conn: &Connection) -> Result<(), Error> {
         }
         conn.execute_batch(MIGRATE_V7_TO_V8)?;
         conn.execute_batch(GUARDS)?;
+        ensure_review_invocation_token(conn)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -137,6 +138,20 @@ pub(crate) fn ensure_one_live_gated(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
+/// Add `reviews.invocation_token` and its partial unique index.
+///
+/// `user_version` stays 8. A ledger already at schema 8 gets the column on
+/// the next read-write open, and the v7-to-v8 migration adds it too.
+pub(crate) fn ensure_review_invocation_token(conn: &Connection) -> Result<(), Error> {
+    if table_exists(conn, "reviews")? && !column_exists(conn, "reviews", "invocation_token")? {
+        conn.execute("ALTER TABLE reviews ADD COLUMN invocation_token TEXT", [])?;
+    }
+    if table_exists(conn, "reviews")? {
+        conn.execute_batch(REVIEW_INVOCATION_INDEX)?;
+    }
+    Ok(())
+}
+
 /// Recreate any missing schema-8 trigger. Returns whether one was missing.
 /// Also installs [`ONE_LIVE_GATED_INDEX`] so a ledger already at version 8
 /// gains it on the next read-write open.
@@ -146,6 +161,7 @@ pub(crate) fn ensure_guards(conn: &Connection) -> Result<bool, Error> {
         "guard SQL must raise {GUARD_MESSAGE}"
     );
     ensure_one_live_gated(conn)?;
+    ensure_review_invocation_token(conn)?;
     let mut missing = false;
     for name in GUARD_NAMES {
         if !trigger_exists(conn, name)? {

@@ -2925,19 +2925,25 @@ fn assert_private_invocation(raw: &str) {
         meta.file_type().is_dir() && !meta.file_type().is_symlink(),
         "{raw}"
     );
-    use std::os::unix::fs::PermissionsExt;
-    let mode = meta.permissions().mode();
-    assert_eq!(mode & 0o777, 0o700, "{parent:?} mode {mode:o}");
     let schema = parent.join("codex-schema.json");
-    let schema_mode = fs::symlink_metadata(&schema)
-        .unwrap_or_else(|err| panic!("{schema:?}: {err}"))
-        .permissions()
-        .mode();
-    assert_eq!(
-        schema_mode & 0o777,
-        0o600,
-        "{schema:?} mode {schema_mode:o}"
+    let schema_meta =
+        fs::symlink_metadata(&schema).unwrap_or_else(|err| panic!("{schema:?}: {err}"));
+    assert!(
+        schema_meta.is_file() && !schema_meta.file_type().is_symlink(),
+        "{schema:?}"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{parent:?} mode {mode:o}");
+        let schema_mode = schema_meta.permissions().mode();
+        assert_eq!(
+            schema_mode & 0o777,
+            0o600,
+            "{schema:?} mode {schema_mode:o}"
+        );
+    }
 }
 
 fn failure_streak(dir: &Path) -> i64 {
@@ -3148,4 +3154,465 @@ fn write_readonly_codex(path: &Path, fake: &Path) {
     let mut permissions = fs::metadata(path).expect("meta").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("chmod");
+}
+
+/// Claim refresh, task-done refresh, then the review refresh. Later updates
+/// belong to a replacement invocation.
+const REVIEW_GRAPHIFY_HOLD_FROM: &str = "3";
+
+fn spawn_graph_review(
+    dir: &Path,
+    probes: &Probes,
+    graph_hold: &Path,
+    codex_hold: Option<&Path>,
+    args: &[&str],
+    name: &str,
+) -> std::process::Child {
+    let mut cmd = relaybook(dir);
+    apply_probes(&mut cmd, probes);
+    cmd.env("RELAYBOOK_FAKE_GRAPHIFY", "hold");
+    cmd.env("RELAYBOOK_GRAPHIFY_HOLD", graph_hold);
+    cmd.env("RELAYBOOK_GRAPHIFY_HOLD_FROM", REVIEW_GRAPHIFY_HOLD_FROM);
+    cmd.env("GRAPHIFY_LOG", probes.log.join("graphify.log"));
+    if let Some(hold) = codex_hold {
+        cmd.env("RELAYBOOK_FAKE_KIND", "hold");
+        cmd.env("RELAYBOOK_CODEX_HOLD", hold);
+    }
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::from(
+        fs::File::create(probes.log.join(format!("{name}.out"))).expect("stdout"),
+    ));
+    cmd.stderr(std::process::Stdio::from(
+        fs::File::create(probes.log.join(format!("{name}.err"))).expect("stderr"),
+    ));
+    cmd.spawn().expect("spawn")
+}
+
+fn release_later_graph_holds(hold: &Path, from: i64) {
+    for seq in from..=8 {
+        let started = hold.join(format!("started-{seq}"));
+        let release = hold.join(format!("release-{seq}"));
+        if started.is_file() && !release.is_file() {
+            fs::write(&release, "go\n").expect("release graphify");
+        }
+    }
+}
+
+fn wait_for_child_releasing_graph(
+    child: &mut std::process::Child,
+    hold: &Path,
+    probes: &Probes,
+    name: &str,
+) {
+    let start = std::time::Instant::now();
+    loop {
+        release_later_graph_holds(hold, 4);
+        if child_exited(child, std::time::Duration::from_millis(50)) {
+            return;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(60) {
+            panic!(
+                "{name} did not finish\n{}\ngraphify:\n{}",
+                held_output(probes, name),
+                fs::read_to_string(probes.log.join("graphify.log")).unwrap_or_default()
+            );
+        }
+    }
+}
+
+fn report_rows(dir: &Path) -> Vec<(String, Option<String>)> {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    let mut stmt = conn
+        .prepare("SELECT body, verdict FROM reports ORDER BY id")
+        .expect("prepare");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("reports")
+}
+
+fn replace_done_report(dir: &Path, slug: &str, changed: &str) {
+    let head = head_sha(dir);
+    let mut ledger =
+        relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
+    ledger
+        .reopen_task(slug, "replaced during refresh")
+        .expect("reopen");
+    let claimed_head = head.clone();
+    ledger
+        .claim_task_anchored(slug, "cursor", None, move || Ok(Some(claimed_head)))
+        .expect("claim");
+    ledger
+        .finish_task(
+            slug,
+            Some(relaybook_core::Sections {
+                changed: vec![changed.to_string()],
+                verified: Vec::new(),
+                not_verified: Vec::new(),
+                deviations: Vec::new(),
+                review: Vec::new(),
+            }),
+            Some(&head),
+        )
+        .expect("finish");
+    drop(ledger);
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReviewIdentity {
+    id: i64,
+    report_id: Option<i64>,
+    started_at: String,
+    ledger_mark: String,
+}
+
+fn pending_reviews(dir: &Path) -> Vec<PendingReviewIdentity> {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, report_id, started_at, ledger_mark
+             FROM reviews WHERE verdict IS NULL ORDER BY id",
+        )
+        .expect("prepare");
+    stmt.query_map([], |row| {
+        Ok(PendingReviewIdentity {
+            id: row.get(0)?,
+            report_id: row.get(1)?,
+            started_at: row.get(2)?,
+            ledger_mark: row.get(3)?,
+        })
+    })
+    .expect("query")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("reviews")
+}
+
+fn retarget_mark(mark: &str, report_id: i64) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(mark).expect("mark");
+    value["reports"] = serde_json::json!(report_id);
+    serde_json::to_string(&value).expect("mark")
+}
+
+struct ReusedReview {
+    id: i64,
+    task_id: i64,
+    run_id: Option<i64>,
+    branch: String,
+    reviewer: String,
+    reviewer_override: i64,
+    base_sha: Option<String>,
+    commit_sha: String,
+    graph_sha: Option<String>,
+    mark: String,
+    started_at: String,
+}
+
+/// Delete the pending review and insert another row with the same id, a new
+/// report, and a ledger mark that still matches the ledger.
+fn reuse_review_id(dir: &Path, changed: &str) -> i64 {
+    let path = dir.join(".relaybook").join("ledger.db");
+    let conn = rusqlite::Connection::open(&path).expect("open");
+    conn.pragma_update(None, "foreign_keys", "ON").expect("fk");
+    let row = conn
+        .query_row(
+            "SELECT id, task_id, run_id, branch, reviewer, reviewer_override, base_sha,
+                    commit_sha, graph_sha, ledger_mark, started_at
+             FROM reviews WHERE verdict IS NULL ORDER BY id DESC LIMIT 1",
+            [],
+            |row| {
+                Ok(ReusedReview {
+                    id: row.get(0)?,
+                    task_id: row.get::<_, Option<i64>>(1)?.expect("task review"),
+                    run_id: row.get(2)?,
+                    branch: row.get(3)?,
+                    reviewer: row.get(4)?,
+                    reviewer_override: row.get(5)?,
+                    base_sha: row.get(6)?,
+                    commit_sha: row.get(7)?,
+                    graph_sha: row.get(8)?,
+                    mark: row.get(9)?,
+                    started_at: row.get(10)?,
+                })
+            },
+        )
+        .expect("pending review");
+    let ReusedReview {
+        id,
+        task_id,
+        run_id,
+        branch,
+        reviewer,
+        reviewer_override,
+        base_sha,
+        commit_sha,
+        graph_sha,
+        mark,
+        started_at,
+    } = row;
+    let body = format!(
+        "{{\"changed\":[\"{changed}\"],\"verified\":[],\"not_verified\":[],\"deviations\":[],\"review\":[]}}"
+    );
+    conn.execute(
+        "INSERT INTO reports (
+            task_id, kind, author, body, bytes, created_at, commit_sha
+         ) VALUES (?1, 'task', 'cursor', ?2, ?3, '2026-11-17T00:00:00.000Z', ?4)",
+        rusqlite::params![task_id, body, body.len() as i64, commit_sha],
+    )
+    .expect("replacement report");
+    let report_id = conn.last_insert_rowid();
+    let mark = retarget_mark(&mark, report_id);
+    let deleted = conn
+        .execute("DELETE FROM reviews WHERE id = ?1", [id])
+        .expect("delete review");
+    assert_eq!(deleted, 1);
+    conn.execute(
+        "INSERT INTO reviews (
+            id, scope, task_id, report_id, run_id, branch, reviewer, reviewer_override,
+            base_sha, commit_sha, graph_sha, ledger_mark, started_at
+         ) VALUES (?1, 'task', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        rusqlite::params![
+            id,
+            task_id,
+            report_id,
+            run_id,
+            branch,
+            reviewer,
+            reviewer_override,
+            base_sha,
+            commit_sha,
+            graph_sha,
+            mark,
+            started_at,
+        ],
+    )
+    .expect("reuse review id");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
+    report_id
+}
+
+#[test]
+fn report_replaced_during_graph_refresh_is_not_accepted() {
+    let repo = gated_repo();
+    commit_graphify_ignore(repo.path());
+    let probes = install_probes();
+    copy_fake(&probes.bin, "graphify");
+    let hold = probes.log.join("graphify-hold");
+    fs::create_dir_all(&hold).expect("hold");
+    let mut guard = HoldGuard {
+        hold: hold.clone(),
+        children: Vec::new(),
+    };
+    guard.children.push(spawn_graph_review(
+        repo.path(),
+        &probes,
+        &hold,
+        None,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "refresh",
+    ));
+    assert!(
+        wait_for_file(&hold.join("started-3"), std::time::Duration::from_secs(45)),
+        "review refresh did not block\n{}\n{}",
+        held_output(&probes, "refresh"),
+        fs::read_to_string(probes.log.join("graphify.log")).unwrap_or_default()
+    );
+    assert!(
+        pending_reviews(repo.path()).is_empty(),
+        "the review row existed before refresh returned: {:?}",
+        pending_reviews(repo.path())
+    );
+    replace_done_report(repo.path(), "work", "replacement-during-refresh");
+    fs::write(hold.join("release-3"), "go\n").expect("release");
+    wait_for_child_releasing_graph(&mut guard.children[0], &hold, &probes, "refresh");
+    let text = held_output(&probes, "refresh");
+    let rows = report_rows(repo.path());
+    assert!(
+        rows.iter().any(|(body, verdict)| {
+            body.contains("replacement-during-refresh") && verdict.is_none()
+        }),
+        "the replacement report was accepted\n{rows:?}\n{text}"
+    );
+    assert!(
+        rows.iter()
+            .all(|(_, verdict)| verdict.as_deref() != Some("accepted")),
+        "a report was accepted for the wrong handoff\n{rows:?}\n{text}"
+    );
+    assert!(
+        text.contains("report changed during graph refresh"),
+        "{text}"
+    );
+    assert!(bare_relaybook_refs(&repo.bare).is_empty(), "{text}");
+    assert!(!probes.log.join("gh.args").exists(), "{text}");
+}
+
+#[test]
+fn stale_review_preparer_cannot_replace_a_newer_pending_review() {
+    let repo = gated_repo();
+    commit_graphify_ignore(repo.path());
+    let probes = install_probes();
+    copy_fake(&probes.bin, "graphify");
+    let graph_hold = probes.log.join("graphify-hold");
+    let codex_hold = probes.log.join("codex-hold");
+    fs::create_dir_all(&graph_hold).expect("graph hold");
+    fs::create_dir_all(&codex_hold).expect("codex hold");
+    let mut guard = HoldGuard {
+        hold: graph_hold.clone(),
+        children: Vec::new(),
+    };
+    guard.children.push(spawn_graph_review(
+        repo.path(),
+        &probes,
+        &graph_hold,
+        Some(&codex_hold),
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "older",
+    ));
+    assert!(
+        wait_for_file(
+            &graph_hold.join("started-3"),
+            std::time::Duration::from_secs(45)
+        ),
+        "older review refresh did not block\n{}\n{}",
+        held_output(&probes, "older"),
+        fs::read_to_string(probes.log.join("graphify.log")).unwrap_or_default()
+    );
+    assert!(
+        pending_reviews(repo.path()).is_empty(),
+        "a review existed before the older preparer created one"
+    );
+    let stop = relaybook(repo.path())
+        .args(["run", "stop"])
+        .output()
+        .expect("stop");
+    let stop_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        !stop.status.success() && stop_text.contains("stopped"),
+        "{stop_text}"
+    );
+    guard.children.push(spawn_graph_review(
+        repo.path(),
+        &probes,
+        &graph_hold,
+        Some(&codex_hold),
+        &["run", "--resume"],
+        "newer",
+    ));
+    assert!(
+        wait_for_file(
+            &graph_hold.join("started-4"),
+            std::time::Duration::from_secs(45)
+        ),
+        "newer review refresh did not block\n{}\n{}",
+        held_output(&probes, "newer"),
+        fs::read_to_string(probes.log.join("graphify.log")).unwrap_or_default()
+    );
+    fs::write(graph_hold.join("release-4"), "go\n").expect("release newer");
+    assert!(
+        wait_for_file(
+            &codex_hold.join("started-1"),
+            std::time::Duration::from_secs(45)
+        ),
+        "newer invocation did not reach codex\n{}",
+        held_output(&probes, "newer")
+    );
+    let pending = pending_reviews(repo.path());
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let newer = pending[0].clone();
+    fs::write(graph_hold.join("release-3"), "go\n").expect("release older");
+    assert!(
+        child_exited(&mut guard.children[0], std::time::Duration::from_secs(20)),
+        "older preparer did not finish\n{}",
+        held_output(&probes, "older")
+    );
+    let older_text = held_output(&probes, "older");
+    assert_eq!(
+        pending_reviews(repo.path()),
+        vec![newer],
+        "the older preparer replaced the newer review\n{older_text}"
+    );
+    assert!(
+        older_text.contains("stale review invocation"),
+        "{older_text}"
+    );
+    assert!(
+        report_rows(repo.path())
+            .iter()
+            .all(|(_, verdict)| verdict.as_deref() != Some("accepted")),
+        "{:?}",
+        report_rows(repo.path())
+    );
+}
+
+#[test]
+fn reused_review_id_cannot_approve_a_different_report() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let hold = probes.log.join("codex-hold");
+    fs::create_dir_all(&hold).expect("hold");
+    let mut guard = HoldGuard {
+        hold: hold.clone(),
+        children: Vec::new(),
+    };
+    guard.children.push(spawn_held(
+        repo.path(),
+        &probes,
+        &hold,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "review",
+    ));
+    assert!(
+        wait_for_file(&hold.join("started-1"), std::time::Duration::from_secs(45)),
+        "codex did not start\n{}",
+        held_output(&probes, "review")
+    );
+    let before = pending_reviews(repo.path());
+    assert_eq!(before.len(), 1, "{before:?}");
+    reuse_review_id(repo.path(), "reused-review-report");
+    fs::write(
+        hold.join("release-1"),
+        "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}\n",
+    )
+    .expect("approve");
+    let started = std::time::Instant::now();
+    loop {
+        for seq in 2..=4 {
+            let slot = hold.join(format!("started-{seq}"));
+            let release = hold.join(format!("release-{seq}"));
+            if slot.is_file() && !release.is_file() {
+                fs::write(
+                    &release,
+                    "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"prd_covered\":true,\"gaps\":[]}}\n",
+                )
+                .expect("release later codex");
+            }
+        }
+        if child_exited(&mut guard.children[0], std::time::Duration::from_millis(50)) {
+            break;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            panic!("review did not finish\n{}", held_output(&probes, "review"));
+        }
+    }
+    let text = held_output(&probes, "review");
+    let rows = report_rows(repo.path());
+    assert!(
+        rows.iter()
+            .any(|(body, verdict)| body.contains("reused-review-report") && verdict.is_none()),
+        "a reused review id accepted a different report\n{rows:?}\n{text}"
+    );
+    assert!(
+        rows.iter()
+            .all(|(_, verdict)| verdict.as_deref() != Some("accepted")),
+        "{rows:?}\n{text}"
+    );
+    assert!(text.contains("stale review invocation"), "{text}");
+    assert_eq!(failure_streak(repo.path()), 0, "{text}");
 }

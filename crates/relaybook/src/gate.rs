@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use relaybook_core::{Error, Ledger, Review, ScopedTask, Status};
+use relaybook_core::{Error, Ledger, OwnedReviewExpect, Review, ScopedTask, Status};
 
 use crate::gitinfo;
 
@@ -426,6 +426,8 @@ pub(crate) fn review_record_release(
 /// Packet fields for one auto review. The runner records this review itself.
 pub(crate) struct PreparedReview {
     pub review_id: i64,
+    pub invocation_token: String,
+    pub run_generation: i64,
     pub slug: Option<String>,
     pub base_sha: Option<String>,
     pub commit_sha: String,
@@ -470,6 +472,14 @@ pub(crate) fn start_task_review(
             ));
         }
     }
+    let run = ledger.run_by_id(run_id)?;
+    let expect = OwnedReviewExpect {
+        generation: run.write_stamp,
+        stage: run.stage,
+        agent_calls: run.agent_calls + 1,
+        report_id: Some(report.id),
+        report_body: Some(report.body.clone()),
+    };
     let refresh = record_graph_refresh_for(ledger, cwd, "review", Some(slug), Some(run_id))?;
     ensure_gated_clean(&root)?;
     if gitinfo::verified_head(&root).as_deref() != Some(commit_sha.as_str()) {
@@ -492,9 +502,14 @@ pub(crate) fn start_task_review(
         &commit_sha,
         refresh.graph_sha.as_deref(),
         &fingerprint,
+        &expect,
     )?;
-    let report_body =
-        serde_json::from_str::<serde_json::Value>(&report.body).unwrap_or(serde_json::Value::Null);
+    let report_body = match started.report_body.as_deref() {
+        Some(body) => {
+            serde_json::from_str::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null)
+        }
+        None => serde_json::Value::Null,
+    };
     let range = base_sha
         .as_ref()
         .map(|base| format!("{base}..{commit_sha}"));
@@ -510,7 +525,9 @@ pub(crate) fn start_task_review(
         "graph_context": graph_context,
     });
     Ok(PreparedReview {
-        review_id: started.id,
+        review_id: started.review.id,
+        invocation_token: started.invocation_token,
+        run_generation: started.run_generation,
         slug: Some(slug.to_string()),
         base_sha,
         commit_sha,
@@ -532,6 +549,14 @@ pub(crate) fn start_release_review(
     }
     let checkout = release_checkout(ledger, cwd, "review start")?;
     ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    let run = ledger.run_by_id(run_id)?;
+    let expect = OwnedReviewExpect {
+        generation: run.write_stamp,
+        stage: run.stage,
+        agent_calls: run.agent_calls + 1,
+        report_id: None,
+        report_body: None,
+    };
     let refresh = record_graph_refresh_for(ledger, cwd, "release-review", None, Some(run_id))?;
     ensure_gated_clean(&checkout.root)?;
     if gitinfo::verified_head(&checkout.root).as_deref() != Some(checkout.range.head.as_str()) {
@@ -561,6 +586,7 @@ pub(crate) fn start_release_review(
         &commit_sha,
         refresh.graph_sha.as_deref(),
         &fingerprint,
+        &expect,
     )?;
     let range = format!("{base_sha}..{commit_sha}");
     let handoff = serde_json::json!({
@@ -575,7 +601,9 @@ pub(crate) fn start_release_review(
         "graph_context": graph_context,
     });
     Ok(PreparedReview {
-        review_id: started.id,
+        review_id: started.review.id,
+        invocation_token: started.invocation_token,
+        run_generation: started.run_generation,
         slug: None,
         base_sha: Some(base_sha),
         commit_sha,
@@ -608,6 +636,7 @@ pub(crate) fn record_owned_task_review(
     verdict: &str,
     text: &str,
     review_id: i64,
+    invocation_token: &str,
     run_generation: i64,
     advance: relaybook_core::OwnedRunAdvance,
 ) -> Result<Review, Error> {
@@ -637,6 +666,7 @@ pub(crate) fn record_owned_task_review(
         false,
         None,
         review_id,
+        invocation_token,
         run_generation,
         true,
         advance,
@@ -652,6 +682,7 @@ pub(crate) fn record_owned_release_review(
     verdict: &str,
     text: &str,
     review_id: i64,
+    invocation_token: &str,
     run_generation: i64,
     advance: relaybook_core::OwnedRunAdvance,
 ) -> Result<Review, Error> {
@@ -690,6 +721,7 @@ pub(crate) fn record_owned_release_review(
         false,
         Some(&commits),
         review_id,
+        invocation_token,
         run_generation,
         false,
         advance,

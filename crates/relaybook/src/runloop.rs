@@ -1400,9 +1400,19 @@ fn review_with_codex(
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(err) => {
+            if err.to_string() == relaybook_core::STALE_REVIEW_INVOCATION {
+                return Control::Return(fail(relaybook_core::STALE_REVIEW_INVOCATION));
+            }
             return Control::Return(halt(cwd, &mut ledger, &mut run, &err.to_string()));
         }
     };
+    let mut run = match load_live(&ledger, run_id) {
+        Ok(run) => run,
+        Err(err) => return Control::Return(fail(&err)),
+    };
+    if run.write_stamp != prepared.run_generation {
+        return Control::Return(fail(relaybook_core::STALE_REVIEW_INVOCATION));
+    }
     let packet = match review_packet(cwd, &prepared) {
         Ok(packet) => packet,
         Err(err) => return Control::Return(halt(cwd, &mut ledger, &mut run, &err)),
@@ -1430,11 +1440,8 @@ fn review_with_codex(
         .unwrap_or_else(|| "release".to_string());
     let commit_sha = prepared.commit_sha.clone();
     let review_id = prepared.review_id;
-    run.agent_calls += 1;
-    if let Err(err) = ledger.save_run(&mut run) {
-        return Control::Return(fail(&err.to_string()));
-    }
-    let generation = run.write_stamp;
+    let generation = prepared.run_generation;
+    let invocation_token = prepared.invocation_token.clone();
     let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
     let out = agents::codex_output_file(&root, run_id, review_id, generation);
     drop(ledger);
@@ -1451,8 +1458,18 @@ fn review_with_codex(
         &result_text(&result),
     );
     *transcript += 1;
-    let invocation =
-        |action| apply_codex_invocation(db, cwd, quiet, run_id, review_id, generation, action);
+    let invocation = |action| {
+        apply_codex_invocation(
+            db,
+            cwd,
+            quiet,
+            run_id,
+            review_id,
+            generation,
+            &invocation_token,
+            action,
+        )
+    };
     match &result {
         AgentResult::Unavailable { cli } => {
             close_live(session, cwd, run_id, quiet, elapsed, &result, "unavailable");
@@ -1511,6 +1528,7 @@ fn review_with_codex(
             &verdict,
             &body,
             review_id,
+            &invocation_token,
             generation,
             advance.clone(),
         ),
@@ -1521,6 +1539,7 @@ fn review_with_codex(
             &verdict,
             &body,
             review_id,
+            &invocation_token,
             generation,
             advance.clone(),
         ),
@@ -1670,6 +1689,7 @@ fn recover_accepted_task(
     Ok(Some(Control::Stay))
 }
 
+#[allow(clippy::too_many_arguments)] // invocation identity stays with the caller
 fn apply_codex_invocation(
     db: &Path,
     cwd: &Path,
@@ -1677,13 +1697,20 @@ fn apply_codex_invocation(
     run_id: i64,
     review_id: i64,
     generation: i64,
+    invocation_token: &str,
     action: relaybook_core::ReviewInvocationAction,
 ) -> RunOutput {
     let mut ledger = match Ledger::open(db) {
         Ok(ledger) => ledger,
         Err(err) => return fail(&err.to_string()),
     };
-    match relaybook_core::apply_review_invocation(&mut ledger, review_id, generation, action) {
+    match relaybook_core::apply_review_invocation(
+        &mut ledger,
+        review_id,
+        invocation_token,
+        generation,
+        action,
+    ) {
         Ok(relaybook_core::ReviewInvocationOutcome::Stale) => {
             fail(relaybook_core::STALE_REVIEW_INVOCATION)
         }
