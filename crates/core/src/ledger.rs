@@ -1194,14 +1194,20 @@ impl Ledger {
             reviewer_override,
             release_commits,
             false,
+            None,
             revalidate,
         )
     }
 
-    /// Same as [`Self::record_review_with`] when the pending review belongs to
-    /// the live gated run that owns the scope. Manual callers stay on
-    /// [`Self::record_review_with`], which still refuses that run.
-    #[allow(clippy::too_many_arguments)] // record_review_with, plus the owner gate
+    /// Same as [`Self::record_review_with`] for one review row the caller started.
+    ///
+    /// `review_id` is that row. `run_generation` is the run's `write_stamp`
+    /// when Codex was launched. Both are checked again inside the write
+    /// transaction. A newer pending review, or a run that has been saved
+    /// since the launch, is [`STALE_REVIEW_INVOCATION`] and is not updated.
+    /// When `accept_approved_task` is set, an approved task verdict also
+    /// accepts that task's report in the same transaction.
+    #[allow(clippy::too_many_arguments)] // record_review_with, plus the invocation
     pub fn record_owned_review(
         &mut self,
         scope: &str,
@@ -1214,6 +1220,9 @@ impl Ledger {
         body: &str,
         reviewer_override: bool,
         release_commits: Option<&[String]>,
+        review_id: i64,
+        run_generation: i64,
+        accept_approved_task: bool,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Review, Error> {
         self.record_review_inner(
@@ -1228,6 +1237,11 @@ impl Ledger {
             reviewer_override,
             release_commits,
             true,
+            Some(OwnedInvocation {
+                review_id,
+                run_generation,
+                accept_approved_task,
+            }),
             revalidate,
         )
     }
@@ -1246,6 +1260,7 @@ impl Ledger {
         reviewer_override: bool,
         release_commits: Option<&[String]>,
         allow_owner: bool,
+        invocation: Option<OwnedInvocation>,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Review, Error> {
         let scope = review_scope(scope)?;
@@ -1259,19 +1274,20 @@ impl Ledger {
             return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
         }
         self.transaction(|conn| {
-            if allow_owner {
-                let task_id_now = scoped_task_id(conn, scope, task.as_deref())?;
-                let pending_id = pending_review_id(conn, scope, task_id_now)?;
-                let pending = load_review(conn, pending_id)?;
-                if !owner_matches(conn, scope, task.as_deref(), pending.run_id)? {
-                    refuse_live_ownership(conn, scope, task.as_deref())?;
-                }
+            let id = if allow_owner {
+                let Some(bound) = invocation.as_ref() else {
+                    return Err(Error::InvalidSetting(
+                        "owned review requires an invocation".to_string(),
+                    ));
+                };
+                owned_review_id(conn, bound, scope, task.as_deref())?
             } else {
                 refuse_live_ownership(conn, scope, task.as_deref())?;
-            }
-            let task_id = scoped_task_id(conn, scope, task.as_deref())?;
-            let id = pending_review_id(conn, scope, task_id)?;
+                let task_id = scoped_task_id(conn, scope, task.as_deref())?;
+                pending_review_id(conn, scope, task_id)?
+            };
             let review = load_review(conn, id)?;
+            let owner_run = review.run_id;
             if review.commit_sha != head {
                 return Err(Error::InvalidSetting(
                     "reviewer changed the repository".to_string(),
@@ -1294,11 +1310,19 @@ impl Ledger {
                 accepted_in_scope(conn, commits)?;
             }
             let recorded_at = now(conn)?;
-            conn.execute(
-                "UPDATE reviews
-                 SET reviewer = ?1, reviewer_override = ?2, verdict = ?3,
-                     body = ?4, bytes = ?5, recorded_at = ?6
-                 WHERE id = ?7",
+            let bound_update = invocation.is_some();
+            let updated = conn.execute(
+                if bound_update {
+                    "UPDATE reviews
+                     SET reviewer = ?1, reviewer_override = ?2, verdict = ?3,
+                         body = ?4, bytes = ?5, recorded_at = ?6
+                     WHERE id = ?7 AND verdict IS NULL"
+                } else {
+                    "UPDATE reviews
+                     SET reviewer = ?1, reviewer_override = ?2, verdict = ?3,
+                         body = ?4, bytes = ?5, recorded_at = ?6
+                     WHERE id = ?7"
+                },
                 params![
                     reviewer,
                     i64::from(reviewer_override),
@@ -1309,6 +1333,9 @@ impl Ledger {
                     id,
                 ],
             )?;
+            if bound_update && updated != 1 {
+                return Err(stale_review());
+            }
             if scope == "task"
                 && verdict == "changes_requested"
                 && let Some(slug) = task.as_deref()
@@ -1319,6 +1346,21 @@ impl Ledger {
                 }
             }
             revalidate()?;
+            if let Some(bound) = invocation.as_ref()
+                && bound.accept_approved_task
+                && scope == "task"
+                && verdict == "approved"
+            {
+                let Some(slug) = task.as_deref() else {
+                    return Err(Error::InvalidSetting(
+                        "task is required for a task review".to_string(),
+                    ));
+                };
+                let Some(owner_run) = owner_run else {
+                    return Err(stale_review());
+                };
+                accept_bound_task(conn, slug, &head, id, owner_run, bound.run_generation)?;
+            }
             load_review(conn, id)
         })
     }
@@ -1942,6 +1984,22 @@ impl Ledger {
 }
 
 const LIVE_RUN_OWNS: &str = "a gated run owns this; use relaybook approve / run --resume";
+
+/// Returned when a Codex result is no longer the review that was started.
+///
+/// The run was saved again, or that pending row was replaced. Recording it
+/// would approve a different review.
+pub const STALE_REVIEW_INVOCATION: &str = "stale review invocation";
+
+struct OwnedInvocation {
+    review_id: i64,
+    run_generation: i64,
+    accept_approved_task: bool,
+}
+
+fn stale_review() -> Error {
+    Error::InvalidSetting(STALE_REVIEW_INVOCATION.to_string())
+}
 
 fn refuse_live_gated_run(conn: &Connection) -> Result<(), Error> {
     if crate::runs::live_gated(conn)?.is_empty() {
@@ -2720,6 +2778,73 @@ fn latest_task_report_id(conn: &Connection, task_id: i64) -> Result<Option<i64>,
         )
         .optional()?;
     Ok(id)
+}
+
+fn owned_review_id(
+    conn: &Connection,
+    bound: &OwnedInvocation,
+    scope: &str,
+    task: Option<&str>,
+) -> Result<i64, Error> {
+    let review = match load_review(conn, bound.review_id) {
+        Ok(review) => review,
+        Err(Error::Sqlite(rusqlite::Error::QueryReturnedNoRows)) => return Err(stale_review()),
+        Err(err) => return Err(err),
+    };
+    if review.verdict.is_some() || review.scope != scope {
+        return Err(stale_review());
+    }
+    let task_id = scoped_task_id(conn, scope, task)?;
+    if review.task_id != task_id {
+        return Err(stale_review());
+    }
+    let Some(run_id) = review.run_id else {
+        return Err(stale_review());
+    };
+    let stamp = run_write_stamp(conn, run_id)?.ok_or_else(stale_review)?;
+    if stamp != bound.run_generation || !owner_matches(conn, scope, task, Some(run_id))? {
+        return Err(stale_review());
+    }
+    Ok(review.id)
+}
+
+fn accept_bound_task(
+    conn: &Connection,
+    slug: &str,
+    head: &str,
+    review_id: i64,
+    run_id: i64,
+    generation: i64,
+) -> Result<(), Error> {
+    let stamp = run_write_stamp(conn, run_id)?.ok_or_else(stale_review)?;
+    if stamp != generation {
+        return Err(stale_review());
+    }
+    let task = load_task(conn, slug)?;
+    if latest_review_id(conn, "task", Some(task.id))? != Some(review_id) {
+        return Err(stale_review());
+    }
+    if !approved_task_review_at(conn, task.id, head)? {
+        return Err(Error::InvalidSetting(
+            "no approved review at HEAD".to_string(),
+        ));
+    }
+    if task.status != Status::Done {
+        return Err(Error::NotDone);
+    }
+    accept_unreviewed(conn, slug, Some(run_id))?;
+    Ok(())
+}
+
+fn run_write_stamp(conn: &Connection, id: i64) -> Result<Option<i64>, Error> {
+    let stamp = conn
+        .query_row(
+            "SELECT write_stamp FROM runs WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(stamp)
 }
 
 fn pending_review_id(conn: &Connection, scope: &str, task_id: Option<i64>) -> Result<i64, Error> {

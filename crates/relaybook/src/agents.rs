@@ -276,6 +276,16 @@ pub(crate) enum CodexSandbox {
     Isolated,
 }
 
+const TASK_BODY_KEYS: &[&str] = &["findings", "security", "tests_checked", "not_checked"];
+const RELEASE_BODY_KEYS: &[&str] = &[
+    "findings",
+    "security",
+    "tests_checked",
+    "not_checked",
+    "prd_covered",
+    "gaps",
+];
+
 pub(crate) fn review_input_too_large(prompt: &str, packet: &str) -> bool {
     packet.len() > REVIEW_PACKET_LIMIT
         || prompt
@@ -311,9 +321,42 @@ pub(crate) fn codex_args(
     args
 }
 
-/// One JSON object `{"verdict":"approved"|"changes-requested","body":{...}}`.
-/// Trailing values are rejected. The body text is what `review_body` checks.
-pub(crate) fn parse_codex_verdict(text: &str) -> Result<(String, String), String> {
+/// `-o` path for one review. The directory is outside `root` so an isolated
+/// reviewer can create the file when the repository is read-only.
+pub(crate) fn codex_output_file(
+    root: &Path,
+    run_id: i64,
+    review_id: i64,
+    generation: i64,
+) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let name = format!(
+        "relaybook-codex-{run_id}-{review_id}-{generation}-{}-{nanos}",
+        std::process::id()
+    );
+    let mut base = std::env::temp_dir();
+    if path_is_inside(root, &base.join(&name)) {
+        base = PathBuf::from("/tmp");
+    }
+    base.join(name).join("codex-last.md")
+}
+
+fn path_is_inside(root: &Path, path: &Path) -> bool {
+    let Ok(root) = std::path::absolute(root) else {
+        return false;
+    };
+    let Ok(path) = std::path::absolute(path) else {
+        return false;
+    };
+    path.starts_with(root)
+}
+
+/// One JSON object matching the task or release schema. Extra outer properties
+/// are rejected. The body text is what `review_body` checks again.
+pub(crate) fn parse_codex_verdict(text: &str, release: bool) -> Result<(String, String), String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("codex output is empty".to_string());
@@ -323,20 +366,71 @@ pub(crate) fn parse_codex_verdict(text: &str) -> Result<(String, String), String
     let Some(object) = value.as_object() else {
         return Err("codex output is not one JSON object".to_string());
     };
+    if object.len() != 2 || !object.contains_key("verdict") || !object.contains_key("body") {
+        return Err("codex output does not match the schema".to_string());
+    }
     let verdict = object
         .get("verdict")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "codex output is missing verdict".to_string())?;
+        .ok_or_else(|| "codex output has an invalid verdict".to_string())?;
     if verdict != "approved" && verdict != "changes-requested" {
         return Err("codex output has an invalid verdict".to_string());
     }
     let body = object
         .get("body")
-        .filter(|item| item.is_object())
+        .and_then(serde_json::Value::as_object)
         .ok_or_else(|| "codex output is missing body".to_string())?;
-    let body =
-        serde_json::to_string(body).map_err(|_| "codex output body is not JSON".to_string())?;
+    let keys = if release {
+        RELEASE_BODY_KEYS
+    } else {
+        TASK_BODY_KEYS
+    };
+    for key in keys {
+        if !body.contains_key(*key) {
+            return Err(format!("codex output is missing {key}"));
+        }
+    }
+    let body = serde_json::to_string(object.get("body").expect("body"))
+        .map_err(|_| "codex output body is not JSON".to_string())?;
     Ok((verdict.to_string(), body))
+}
+
+fn prepare_codex_output(out: &Path, schema: &Path, schema_text: &str) -> Result<(), String> {
+    let Some(parent) = out.parent() else {
+        return Err("codex output has no directory".to_string());
+    };
+    if parent == std::env::temp_dir() {
+        return Err("codex output directory is the temp root".to_string());
+    }
+    create_shared_dir(parent)?;
+    std::fs::write(schema, schema_text).map_err(|err| err.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o777))
+            .map_err(|err| err.to_string())?;
+        std::fs::set_permissions(schema, std::fs::Permissions::from_mode(0o644))
+            .map_err(|err| err.to_string())?;
+    }
+    let _ = std::fs::remove_file(out);
+    Ok(())
+}
+
+fn create_shared_dir(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o777)
+            .create(path)
+            .map_err(|err| err.to_string())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path).map_err(|err| err.to_string())?;
+    }
+    Ok(())
 }
 
 /// Run Codex and return the `-o` file only when the process exits 0 and that
@@ -359,25 +453,15 @@ pub(crate) fn call_codex(
         };
     };
     let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    if let Some(parent) = out.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        return AgentResult::Failed {
-            output: err.to_string(),
-        };
-    }
     let schema = out.with_file_name("codex-schema.json");
     let schema_text = if release {
         RELEASE_CODEX_SCHEMA
     } else {
         TASK_CODEX_SCHEMA
     };
-    if let Err(err) = std::fs::write(&schema, schema_text) {
-        return AgentResult::Failed {
-            output: err.to_string(),
-        };
+    if let Err(err) = prepare_codex_output(out, &schema, schema_text) {
+        return AgentResult::Failed { output: err };
     }
-    let _ = std::fs::remove_file(out);
     let args = codex_args(&root, &schema, out, prompt, sandbox);
     if let Some(flag) = forbidden_codex_arg(&args) {
         return AgentResult::Failed {
@@ -734,7 +818,8 @@ mod tests {
 
     use super::{
         AccountKind, Accounts, AgentResult, CodexSandbox, account_line, classify, claude_account,
-        codex_args, forbidden_codex_arg, parse_codex_verdict, review_input_too_large,
+        codex_args, codex_output_file, forbidden_codex_arg, parse_codex_verdict, path_is_inside,
+        review_input_too_large,
     };
 
     #[test]
@@ -844,20 +929,54 @@ mod tests {
     #[test]
     fn codex_verdict_must_be_one_json_object() {
         let (verdict, body) = parse_codex_verdict(
-            "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[]}}\n",
+            "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}\n",
+            false,
         )
         .expect("object");
         assert_eq!(verdict, "approved");
         assert!(body.contains("findings"));
-        assert!(parse_codex_verdict("").is_err());
-        assert!(parse_codex_verdict("   ").is_err());
-        assert!(parse_codex_verdict("not json").is_err());
-        assert!(parse_codex_verdict("[]").is_err());
+        assert!(parse_codex_verdict("", false).is_err());
+        assert!(parse_codex_verdict("   ", false).is_err());
+        assert!(parse_codex_verdict("not json", false).is_err());
+        assert!(parse_codex_verdict("[]", false).is_err());
         assert!(
-            parse_codex_verdict("{\"verdict\":\"approved\"}{\"verdict\":\"approved\"}").is_err()
+            parse_codex_verdict(
+                "{\"verdict\":\"approved\"}{\"verdict\":\"approved\"}",
+                false
+            )
+            .is_err()
         );
-        assert!(parse_codex_verdict("{\"verdict\":\"approved\",\"body\":[]}").is_err());
-        assert!(parse_codex_verdict("{\"verdict\":\"yes\",\"body\":{}}").is_err());
+        assert!(parse_codex_verdict("{\"verdict\":\"approved\",\"body\":[]}", false).is_err());
+        assert!(parse_codex_verdict("{\"verdict\":\"yes\",\"body\":{}}", false).is_err());
+        assert!(
+            parse_codex_verdict(
+                "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[]},\"injected\":true}",
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_codex_verdict(
+                "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[]}}",
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_codex_verdict(
+                "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}",
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_output_file_stays_outside_the_repository() {
+        let root = std::env::temp_dir().join("relaybook-repo-not-temp");
+        let out = codex_output_file(&root, 4, 9, 2);
+        assert!(out.ends_with("codex-last.md"));
+        assert!(!path_is_inside(&root, &out), "{out:?} is inside {root:?}");
     }
 
     #[test]

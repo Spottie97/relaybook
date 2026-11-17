@@ -281,7 +281,12 @@ fn codex(args: &[String]) {
     }
     let mut packet = String::new();
     let _ = std::io::stdin().read_to_string(&mut packet);
-    let _ = packet;
+    if let Ok(log) = env::var("LOG") {
+        append(
+            &PathBuf::from(log).join("codex.stdin").display().to_string(),
+            &packet,
+        );
+    }
     let out = flag_value(args, "-o").or_else(|| flag_value(args, "--output-last-message"));
     match kind().as_str() {
         "edit" => {
@@ -315,6 +320,43 @@ fn codex(args: &[String]) {
             write_out(out.as_deref(), "not json\n");
             return;
         }
+        "schema" => {
+            let text = verdict_json(args, "approved");
+            let text = text.trim_end();
+            let Some(text) = text.strip_suffix('}') else {
+                write_out(out.as_deref(), "not json\n");
+                return;
+            };
+            write_out(out.as_deref(), &format!("{text},\"injected\":true}}\n"));
+            return;
+        }
+        "hold" => {
+            let Some(dir) = env::var("RELAYBOOK_CODEX_HOLD").ok() else {
+                eprintln!("RELAYBOOK_CODEX_HOLD is unset");
+                std::process::exit(99);
+            };
+            let seq = claim_hold_slot(&dir);
+            if seq == 0 {
+                eprintln!("codex hold slot failed");
+                std::process::exit(98);
+            }
+            let root = PathBuf::from(&dir);
+            let _ = fs::write(
+                root.join(format!("started-{seq}")),
+                out.clone().unwrap_or_default(),
+            );
+            let release = root.join(format!("release-{seq}"));
+            for _ in 0..1600 {
+                if release.is_file() {
+                    let text = fs::read_to_string(&release).unwrap_or_default();
+                    write_out(out.as_deref(), &text);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("codex hold timed out");
+            std::process::exit(98);
+        }
         "empty" | "fail" => {
             write_out(out.as_deref(), "");
             std::process::exit(1);
@@ -333,6 +375,23 @@ fn codex(args: &[String]) {
         _ => {}
     }
     write_out(out.as_deref(), &verdict_json(args, "approved"));
+}
+
+fn claim_hold_slot(dir: &str) -> i64 {
+    let root = PathBuf::from(dir);
+    let _ = fs::create_dir_all(&root);
+    for n in 1..100 {
+        let path = root.join(format!("claim-{n}"));
+        if OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .is_ok()
+        {
+            return n;
+        }
+    }
+    0
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {

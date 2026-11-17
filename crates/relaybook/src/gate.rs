@@ -77,6 +77,18 @@ pub(crate) fn record_graph_refresh(
     step: &str,
     task: Option<&str>,
 ) -> Result<GraphRefresh, Error> {
+    record_graph_refresh_for(ledger, cwd, step, task, None)
+}
+
+/// Like [`record_graph_refresh`]. `run_id` is stored on the audit row when set,
+/// and otherwise the `RELAYBOOK_RUN_ID` environment value is used.
+pub(crate) fn record_graph_refresh_for(
+    ledger: &mut Ledger,
+    cwd: &Path,
+    step: &str,
+    task: Option<&str>,
+    run_id: Option<i64>,
+) -> Result<GraphRefresh, Error> {
     if ledger.settings()?.workflow != "gated" {
         return Err(Error::InvalidSetting(
             "graph refresh requires workflow=gated".to_string(),
@@ -92,7 +104,8 @@ pub(crate) fn record_graph_refresh(
         GraphOutcome::Failed(reason) => ("failed", Some(reason), None),
         GraphOutcome::Built => ("built", None, Some(head.clone())),
     };
-    ledger.record_graph_build(step, task, env_run_id(), &head, status, detail.as_deref())?;
+    let run_id = run_id.or_else(env_run_id);
+    ledger.record_graph_build(step, task, run_id, &head, status, detail.as_deref())?;
     Ok(GraphRefresh {
         commit_sha: head,
         graph_sha,
@@ -412,14 +425,16 @@ pub(crate) fn review_record_release(
 
 /// Packet fields for one auto review. The runner records this review itself.
 pub(crate) struct PreparedReview {
+    pub review_id: i64,
     pub slug: Option<String>,
     pub base_sha: Option<String>,
     pub commit_sha: String,
     pub handoff: serde_json::Value,
 }
 
-/// Start the owning run's task review without refreshing the graph.
-/// Manual `review start` still refuses a live run and still refreshes.
+/// Start the owning run's task review and refresh the graph.
+/// Manual `review start` still refuses a live run. A failed refresh is recorded
+/// and does not stop the review.
 pub(crate) fn start_task_review(
     ledger: &mut Ledger,
     cwd: &Path,
@@ -455,12 +470,19 @@ pub(crate) fn start_task_review(
             ));
         }
     }
+    let refresh = record_graph_refresh_for(ledger, cwd, "review", Some(slug), Some(run_id))?;
     ensure_gated_clean(&root)?;
+    if gitinfo::verified_head(&root).as_deref() != Some(commit_sha.as_str()) {
+        return Err(Error::InvalidSetting(
+            "HEAD changed during graph refresh".to_string(),
+        ));
+    }
     let fingerprint = crate::git::worktree_fingerprint(&root).map_err(Error::InvalidSetting)?;
     let branch = gitinfo::branch(&root)
         .ok_or_else(|| Error::InvalidSetting("review start requires a branch".to_string()))?;
     let base_sha = report.base_sha.clone();
-    ledger.start_owned_review(
+    let graph_context = review_graph_context(&root, &refresh, base_sha.as_deref(), &commit_sha);
+    let started = ledger.start_owned_review(
         "task",
         Some(slug),
         Some(run_id),
@@ -468,7 +490,7 @@ pub(crate) fn start_task_review(
         "codex",
         base_sha.as_deref(),
         &commit_sha,
-        None,
+        refresh.graph_sha.as_deref(),
         &fingerprint,
     )?;
     let report_body =
@@ -481,13 +503,14 @@ pub(crate) fn start_task_review(
         "base_sha": base_sha,
         "commit_sha": commit_sha,
         "range": range,
-        "graph_sha": serde_json::Value::Null,
-        "graph_status": "skipped",
-        "detail": crate::graphify::NO_GRAPH,
+        "graph_sha": refresh.graph_sha,
+        "graph_status": refresh.status,
+        "detail": refresh.detail,
         "report": report_body,
-        "graph_context": crate::graphify::NO_GRAPH,
+        "graph_context": graph_context,
     });
     Ok(PreparedReview {
+        review_id: started.id,
         slug: Some(slug.to_string()),
         base_sha,
         commit_sha,
@@ -495,7 +518,8 @@ pub(crate) fn start_task_review(
     })
 }
 
-/// Start the owning run's release review without refreshing the graph.
+/// Start the owning run's release review and refresh the graph.
+/// A failed refresh is recorded and does not stop the review.
 pub(crate) fn start_release_review(
     ledger: &mut Ledger,
     cwd: &Path,
@@ -508,18 +532,26 @@ pub(crate) fn start_release_review(
     }
     let checkout = release_checkout(ledger, cwd, "review start")?;
     ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    let refresh = record_graph_refresh_for(ledger, cwd, "release-review", None, Some(run_id))?;
     ensure_gated_clean(&checkout.root)?;
     if gitinfo::verified_head(&checkout.root).as_deref() != Some(checkout.range.head.as_str()) {
         return Err(Error::InvalidSetting(
-            "HEAD changed during review start".to_string(),
+            "HEAD changed during graph refresh".to_string(),
         ));
     }
+    ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
     let fingerprint =
         crate::git::worktree_fingerprint(&checkout.root).map_err(Error::InvalidSetting)?;
     let accepted = ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
     let base_sha = checkout.range.base.clone();
     let commit_sha = checkout.range.head.clone();
-    ledger.start_owned_review(
+    let graph_context = review_graph_context(
+        &checkout.root,
+        &refresh,
+        Some(base_sha.as_str()),
+        &commit_sha,
+    );
+    let started = ledger.start_owned_review(
         "release",
         None,
         Some(run_id),
@@ -527,7 +559,7 @@ pub(crate) fn start_release_review(
         "codex",
         Some(base_sha.as_str()),
         &commit_sha,
-        None,
+        refresh.graph_sha.as_deref(),
         &fingerprint,
     )?;
     let range = format!("{base_sha}..{commit_sha}");
@@ -536,13 +568,14 @@ pub(crate) fn start_release_review(
         "base_sha": base_sha,
         "commit_sha": commit_sha,
         "range": range,
-        "graph_sha": serde_json::Value::Null,
-        "graph_status": "skipped",
-        "detail": crate::graphify::NO_GRAPH,
+        "graph_sha": refresh.graph_sha,
+        "graph_status": refresh.status,
+        "detail": refresh.detail,
         "tasks": accepted,
-        "graph_context": crate::graphify::NO_GRAPH,
+        "graph_context": graph_context,
     });
     Ok(PreparedReview {
+        review_id: started.id,
         slug: None,
         base_sha: Some(base_sha),
         commit_sha,
@@ -550,6 +583,23 @@ pub(crate) fn start_release_review(
     })
 }
 
+fn review_graph_context(
+    root: &Path,
+    refresh: &GraphRefresh,
+    base: Option<&str>,
+    commit: &str,
+) -> String {
+    if refresh.status == "built" {
+        match base {
+            Some(base) => crate::graphify::graph_context(root, base, commit),
+            None => crate::graphify::NO_GRAPH.to_string(),
+        }
+    } else {
+        crate::graphify::NO_GRAPH.to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // record fields plus the invocation that owns them
 pub(crate) fn record_owned_task_review(
     ledger: &mut Ledger,
     cwd: &Path,
@@ -557,6 +607,8 @@ pub(crate) fn record_owned_task_review(
     sha: &str,
     verdict: &str,
     text: &str,
+    review_id: i64,
+    run_generation: i64,
 ) -> Result<Review, Error> {
     if ledger.settings()?.workflow != "gated" {
         return Err(Error::InvalidSetting(
@@ -583,6 +635,9 @@ pub(crate) fn record_owned_task_review(
         text,
         false,
         None,
+        review_id,
+        run_generation,
+        true,
         move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
     )
 }
@@ -593,6 +648,8 @@ pub(crate) fn record_owned_release_review(
     sha: &str,
     verdict: &str,
     text: &str,
+    review_id: i64,
+    run_generation: i64,
 ) -> Result<Review, Error> {
     if ledger.settings()?.workflow != "gated" {
         return Err(Error::InvalidSetting(
@@ -628,6 +685,9 @@ pub(crate) fn record_owned_release_review(
         text,
         false,
         Some(&commits),
+        review_id,
+        run_generation,
+        false,
         move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
     )
 }

@@ -1401,15 +1401,14 @@ fn review_with_codex(
         .clone()
         .unwrap_or_else(|| "release".to_string());
     let commit_sha = prepared.commit_sha.clone();
-    let out = cwd
-        .join(".relaybook")
-        .join("runs")
-        .join(run_id.to_string())
-        .join("codex-last.md");
+    let review_id = prepared.review_id;
     run.agent_calls += 1;
     if let Err(err) = ledger.save_run(&mut run) {
         return Control::Return(fail(&err.to_string()));
     }
+    let generation = run.write_stamp;
+    let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let out = agents::codex_output_file(&root, run_id, review_id, generation);
     drop(ledger);
     let live = live_session(session, cwd, run_id, quiet);
     live.begin(&format!("● Reviewing {label} (codex)"));
@@ -1440,7 +1439,7 @@ fn review_with_codex(
         close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
         return Control::Return(bump_failure(db, cwd, quiet, run_id));
     }
-    let (verdict, body) = match agents::parse_codex_verdict(&result_text(&result)) {
+    let (verdict, body) = match agents::parse_codex_verdict(&result_text(&result), release) {
         Ok(parsed) => parsed,
         Err(_) => {
             close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
@@ -1463,14 +1462,25 @@ fn review_with_codex(
             &commit_sha,
             &verdict,
             &body,
+            review_id,
+            generation,
         ),
-        CodexScope::Release => {
-            crate::gate::record_owned_release_review(&mut ledger, cwd, &commit_sha, &verdict, &body)
-        }
+        CodexScope::Release => crate::gate::record_owned_release_review(
+            &mut ledger,
+            cwd,
+            &commit_sha,
+            &verdict,
+            &body,
+            review_id,
+            generation,
+        ),
     };
-    if recorded.is_err() {
+    if let Err(err) = recorded {
         close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
         drop(ledger);
+        if err.to_string() == relaybook_core::STALE_REVIEW_INVOCATION {
+            return Control::Return(fail(relaybook_core::STALE_REVIEW_INVOCATION));
+        }
         return Control::Return(bump_failure(db, cwd, quiet, run_id));
     }
     if release && verdict != "approved" {
@@ -1481,16 +1491,6 @@ fn review_with_codex(
             &mut run,
             "release review requested changes",
         ));
-    }
-    if let CodexScope::Task(slug) = &scope
-        && verdict == "approved"
-        && let Err(_err) = ledger.accept_owned_gated_report(slug, &commit_sha, run_id, || {
-            crate::gate::recheck_gated_completion(cwd, &commit_sha)
-        })
-    {
-        close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
-        drop(ledger);
-        return Control::Return(bump_failure(db, cwd, quiet, run_id));
     }
     let report_verdict = match &scope {
         CodexScope::Task(slug) => ledger

@@ -2302,3 +2302,516 @@ fn classic_run_never_calls_codex() {
     );
     assert!(!probes.log.join("codex.args").exists());
 }
+
+#[test]
+fn stale_codex_result_does_not_approve_the_replacement_review() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let hold = probes.log.join("hold");
+    fs::create_dir_all(&hold).expect("hold");
+    let mut guard = HoldGuard {
+        hold: hold.clone(),
+        children: Vec::new(),
+    };
+    guard.children.push(spawn_held(
+        repo.path(),
+        &probes,
+        &hold,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "first",
+    ));
+    assert!(
+        wait_for_file(&hold.join("started-1"), std::time::Duration::from_secs(45)),
+        "codex did not start the first review\n{}",
+        held_output(&probes, "first")
+    );
+    let head = head_sha(repo.path());
+    let stop = relaybook(repo.path())
+        .args(["run", "stop"])
+        .output()
+        .expect("stop");
+    let stop_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        !stop.status.success() && stop_text.contains("stopped"),
+        "{stop_text}"
+    );
+    let decision = relaybook(repo.path())
+        .args([
+            "decision",
+            "log",
+            "work",
+            "--why",
+            "replacement handoff",
+            "--by",
+            "cursor",
+        ])
+        .output()
+        .expect("decision");
+    assert!(
+        decision.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&decision.stdout),
+        String::from_utf8_lossy(&decision.stderr)
+    );
+    let conn = rusqlite::Connection::open(repo.path().join(".relaybook").join("ledger.db"))
+        .expect("ledger");
+    let changed = conn
+        .execute(
+            "UPDATE reports SET body = ?1 WHERE kind = 'task'",
+            [r#"{"changed":["replacement-handoff"],"verified":[],"not_verified":[],"deviations":[],"review":[]}"#],
+        )
+        .expect("update report");
+    assert_eq!(changed, 1);
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
+    drop(conn);
+    assert_eq!(head_sha(repo.path()), head, "the handoff change moved HEAD");
+
+    guard.children.push(spawn_held(
+        repo.path(),
+        &probes,
+        &hold,
+        &["run", "--resume"],
+        "second",
+    ));
+    assert!(
+        wait_for_file(&hold.join("started-2"), std::time::Duration::from_secs(45)),
+        "resume did not start a replacement review\n{}",
+        held_output(&probes, "second")
+    );
+    let first_out = fs::read_to_string(hold.join("started-1")).expect("started-1");
+    let second_out = fs::read_to_string(hold.join("started-2")).expect("started-2");
+    assert_ne!(
+        first_out.trim(),
+        second_out.trim(),
+        "invocations share an output file"
+    );
+    assert!(
+        output_is_outside(repo.path(), &first_out),
+        "first output is inside the repository: {first_out}"
+    );
+    assert!(
+        output_is_outside(repo.path(), &second_out),
+        "replacement output is inside the repository: {second_out}"
+    );
+    fs::write(
+        hold.join("release-1"),
+        r#"{"verdict":"approved","body":{"findings":[],"security":[],"tests_checked":[],"not_checked":[],"token":"kestrel-stale"}}"#,
+    )
+    .expect("release");
+    assert!(
+        child_exited(&mut guard.children[0], std::time::Duration::from_secs(20)),
+        "first review did not finish\n{}",
+        held_output(&probes, "first")
+    );
+    let finished = held_output(&probes, "first");
+    assert!(finished.contains("stale review invocation"), "{finished}");
+    let reviews = review_text(repo.path());
+    assert!(
+        reviews.iter().any(|(verdict, _)| verdict.is_none()),
+        "{reviews:?}"
+    );
+    assert!(
+        reviews.iter().all(|(verdict, body)| {
+            verdict.is_none() && !body.as_deref().unwrap_or("").contains("kestrel-stale")
+        }),
+        "{reviews:?}"
+    );
+    assert!(
+        report_verdicts(repo.path())
+            .iter()
+            .all(|verdict| verdict.is_none()),
+        "{:?}",
+        report_verdicts(repo.path())
+    );
+    assert_eq!(head_sha(repo.path()), head);
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+    assert!(!probes.log.join("gh.args").exists());
+    let stdin = fs::read_to_string(probes.log.join("codex.stdin")).unwrap_or_default();
+    assert!(
+        stdin.contains("replacement-handoff"),
+        "replacement review did not see the changed handoff:\n{stdin}"
+    );
+    let row = run_row(repo.path());
+    assert_eq!(row.status, "active", "{} {}", row.stage, row.status);
+    assert_eq!(row.stage, "review");
+}
+
+#[cfg(unix)]
+#[test]
+fn isolated_codex_writes_outside_a_read_only_repository() {
+    // User namespaces and bind mounts return EPERM here. Clearing the
+    // repository write bits for the Codex process is the same constraint:
+    // an `-o` path inside the worktree cannot be created.
+    let repo = gated_repo();
+    relaybook(repo.path())
+        .args(["config", "set", "codex_sandbox", "isolated"])
+        .assert()
+        .success();
+    let probes = install_probes();
+    write_readonly_codex(
+        &probes.bin.join("codex"),
+        &probes._root.path().join("fakes").join("codex"),
+    );
+    let output = run_probed(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    assert!(
+        !repo.path().join("codex-ro-probe").exists(),
+        "the repository was writable during review"
+    );
+    let reviews = stored_reviews(repo.path());
+    assert!(
+        reviews
+            .iter()
+            .any(|review| review.scope == "task" && review.verdict.as_deref() == Some("approved")),
+        "{reviews:?}"
+    );
+    let lines = codex_lines(&probes.log);
+    let mut outputs = Vec::new();
+    for line in lines.lines().filter(|line| line.starts_with("exec ")) {
+        assert_codex_argv(line, false);
+        outputs.push(output_flag(line));
+    }
+    assert!(outputs.len() >= 2, "{lines}");
+    for path in &outputs {
+        assert!(
+            output_is_outside(repo.path(), path),
+            "{path} is inside the repository"
+        );
+        let file = PathBuf::from(path);
+        let parent = file.parent().expect("output directory");
+        use std::os::unix::fs::PermissionsExt;
+        let dir_mode = fs::metadata(parent).expect("dir").permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o777, "{parent:?}");
+        let schema = parent.join("codex-schema.json");
+        let schema_mode = fs::metadata(&schema).expect("schema").permissions().mode() & 0o777;
+        assert_eq!(schema_mode, 0o644, "{schema:?}");
+        assert!(file.is_file(), "codex did not create {path}");
+    }
+}
+
+#[test]
+fn codex_extra_property_never_approves_or_accepts() {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let output = run_probed_kind(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "schema",
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{text}{err}");
+    assert!(
+        text.contains("two consecutive agent failures"),
+        "{text}{err}"
+    );
+    assert!(
+        report_verdicts(repo.path())
+            .iter()
+            .all(|verdict| verdict.is_none()),
+        "{:?}",
+        report_verdicts(repo.path())
+    );
+    let reviews = stored_reviews(repo.path());
+    assert!(
+        reviews.iter().all(|review| review.verdict.is_none()),
+        "{reviews:?}"
+    );
+    assert!(!probes.log.join("gh.args").exists());
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+}
+
+#[test]
+fn gated_auto_review_records_task_and_release_graph_refresh() {
+    let repo = gated_repo();
+    commit_graphify_ignore(repo.path());
+    let probes = install_probes();
+    copy_fake(&probes.bin, "graphify");
+    let log = probes.log.join("graphify.log");
+    let output = run_with_graphify(repo.path(), &probes, &log, "graph");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    let head = head_sha(repo.path());
+    let run_id = latest_run_id(repo.path());
+    let builds = graph_builds(repo.path());
+    assert!(builds.iter().all(|row| row.step != "plan"), "{builds:?}");
+    for step in ["review", "release-review"] {
+        let row = builds
+            .iter()
+            .find(|row| row.step == step)
+            .unwrap_or_else(|| panic!("missing {step}: {builds:?}"));
+        assert_eq!(row.status, "built", "{builds:?}");
+        assert_eq!(row.commit_sha, head, "{builds:?}");
+        assert_eq!(row.run_id, Some(run_id), "{builds:?}");
+    }
+    let reviews = review_graphs(repo.path());
+    for scope in ["task", "release"] {
+        let row = reviews
+            .iter()
+            .find(|row| row.0 == scope && row.2.as_deref() == Some("approved"))
+            .unwrap_or_else(|| panic!("missing approved {scope}: {reviews:?}"));
+        assert_eq!(row.1.as_deref(), Some(head.as_str()), "{reviews:?}");
+    }
+    let stdin = fs::read_to_string(probes.log.join("codex.stdin")).unwrap_or_default();
+    assert!(stdin.contains(&head), "{stdin}");
+    assert!(stdin.contains("\"graph_status\": \"built\""), "{stdin}");
+    let trace = fs::read_to_string(&log).unwrap_or_default();
+    assert!(trace.matches("update .").count() >= 2, "{trace}");
+    assert!(!trace.contains("extract"), "{trace}");
+}
+
+#[test]
+fn gated_auto_review_continues_when_graph_refresh_fails() {
+    let repo = gated_repo();
+    commit_graphify_ignore(repo.path());
+    let probes = install_probes();
+    copy_fake(&probes.bin, "graphify");
+    let log = probes.log.join("graphify.log");
+    let output = run_with_graphify(repo.path(), &probes, &log, "fail");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    let run_id = latest_run_id(repo.path());
+    let builds = graph_builds(repo.path());
+    for step in ["review", "release-review"] {
+        let row = builds
+            .iter()
+            .find(|row| row.step == step)
+            .unwrap_or_else(|| panic!("missing {step}: {builds:?}"));
+        assert_eq!(row.status, "failed", "{builds:?}");
+        assert_eq!(row.run_id, Some(run_id), "{builds:?}");
+    }
+    let reviews = review_graphs(repo.path());
+    assert!(
+        reviews.iter().all(|(_, graph_sha, _)| graph_sha.is_none()),
+        "{reviews:?}"
+    );
+    assert!(
+        reviews
+            .iter()
+            .any(|row| row.2.as_deref() == Some("approved")),
+        "{reviews:?}"
+    );
+    let stdin = fs::read_to_string(probes.log.join("codex.stdin")).unwrap_or_default();
+    assert!(stdin.contains("\"graph_status\": \"failed\""), "{stdin}");
+    assert!(stdin.contains("no graph"), "{stdin}");
+    let trace = fs::read_to_string(&log).unwrap_or_default();
+    assert!(trace.contains("update ."), "{trace}");
+    let row = run_row(repo.path());
+    assert_eq!(row.stage, "gate_release", "{}", row.status);
+    assert_eq!(row.status, "waiting");
+    assert!(
+        report_verdicts(repo.path())
+            .iter()
+            .any(|verdict| verdict.as_deref() == Some("accepted")),
+        "{:?}",
+        report_verdicts(repo.path())
+    );
+    assert!(bare_relaybook_refs(&repo.bare).is_empty());
+    assert!(!probes.log.join("gh.args").exists());
+}
+
+struct HoldGuard {
+    hold: PathBuf,
+    children: Vec<std::process::Child>,
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        for n in 1..=8 {
+            let _ = fs::write(self.hold.join(format!("release-{n}")), "{}\n");
+        }
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn spawn_held(
+    dir: &Path,
+    probes: &Probes,
+    hold: &Path,
+    args: &[&str],
+    name: &str,
+) -> std::process::Child {
+    let mut cmd = relaybook(dir);
+    apply_probes(&mut cmd, probes);
+    cmd.env("RELAYBOOK_FAKE_KIND", "hold");
+    cmd.env("RELAYBOOK_CODEX_HOLD", hold);
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::from(
+        fs::File::create(probes.log.join(format!("{name}.out"))).expect("stdout"),
+    ));
+    cmd.stderr(std::process::Stdio::from(
+        fs::File::create(probes.log.join(format!("{name}.err"))).expect("stderr"),
+    ));
+    cmd.spawn().expect("spawn")
+}
+
+fn held_output(probes: &Probes, name: &str) -> String {
+    let out = fs::read_to_string(probes.log.join(format!("{name}.out"))).unwrap_or_default();
+    let err = fs::read_to_string(probes.log.join(format!("{name}.err"))).unwrap_or_default();
+    format!("{out}{err}")
+}
+
+fn wait_for_file(path: &Path, limit: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < limit {
+        if path.is_file() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    path.is_file()
+}
+
+fn child_exited(child: &mut std::process::Child, limit: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if start.elapsed() < limit => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn output_is_outside(root: &Path, raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return false;
+    }
+    let path = Path::new(raw);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let Ok(path) = std::path::absolute(&path) else {
+        return false;
+    };
+    !path.starts_with(root)
+}
+
+fn output_flag(line: &str) -> String {
+    let args: Vec<&str> = line.split_whitespace().collect();
+    let index = args
+        .iter()
+        .position(|arg| *arg == "-o")
+        .unwrap_or_else(|| panic!("no -o in {line}"));
+    args.get(index + 1)
+        .unwrap_or_else(|| panic!("no -o path in {line}"))
+        .to_string()
+}
+
+fn review_text(dir: &Path) -> Vec<(Option<String>, Option<String>)> {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    let mut stmt = conn
+        .prepare("SELECT verdict, body FROM reviews ORDER BY id")
+        .expect("prepare");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("reviews")
+}
+
+fn commit_graphify_ignore(dir: &Path) {
+    let path = dir.join(".gitignore");
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    if text.contains("graphify-out/") {
+        return;
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("graphify-out/\n");
+    fs::write(&path, text).expect("gitignore");
+    git(dir, &["add", ".gitignore"]);
+    git(dir, &["commit", "-m", "ignore graphify-out"]);
+}
+
+fn run_with_graphify(dir: &Path, probes: &Probes, log: &Path, kind: &str) -> std::process::Output {
+    let mut cmd = relaybook(dir);
+    apply_probes(&mut cmd, probes);
+    cmd.env("GRAPHIFY_LOG", log);
+    cmd.env("RELAYBOOK_FAKE_GRAPHIFY", kind);
+    cmd.args(["run", "--prd", "prd.md", "--gates", "none"]);
+    cmd.output().expect("run")
+}
+
+#[derive(Debug)]
+struct GraphBuildRow {
+    step: String,
+    status: String,
+    commit_sha: String,
+    run_id: Option<i64>,
+}
+
+fn graph_builds(dir: &Path) -> Vec<GraphBuildRow> {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    let mut stmt = conn
+        .prepare("SELECT step, status, commit_sha, run_id FROM graph_builds ORDER BY id")
+        .expect("prepare");
+    stmt.query_map([], |row| {
+        Ok(GraphBuildRow {
+            step: row.get(0)?,
+            status: row.get(1)?,
+            commit_sha: row.get(2)?,
+            run_id: row.get(3)?,
+        })
+    })
+    .expect("query")
+    .collect::<Result<Vec<_>, _>>()
+    .expect("builds")
+}
+
+fn latest_run_id(dir: &Path) -> i64 {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    conn.query_row("SELECT id FROM runs ORDER BY id DESC LIMIT 1", [], |row| {
+        row.get(0)
+    })
+    .expect("run id")
+}
+
+fn review_graphs(dir: &Path) -> Vec<(String, Option<String>, Option<String>)> {
+    let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
+    let mut stmt = conn
+        .prepare("SELECT scope, graph_sha, verdict FROM reviews ORDER BY id")
+        .expect("prepare");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("reviews")
+}
+
+#[cfg(unix)]
+fn write_readonly_codex(path: &Path, fake: &Path) {
+    let fake = fake.display();
+    let script = format!(
+        "#!/bin/sh\nif [ -z \"$RELAYBOOK_TRACE_LOG\" ]; then echo \"RELAYBOOK_TRACE_LOG is unset\" >&2; exit 99; fi\nprintf '%s\\n' \"codex $*\" >> \"$RELAYBOOK_TRACE_LOG\"\nif [ \"$1\" = \"login\" ]; then\n  exec '{fake}' \"$@\"\nfi\nrepo=$(pwd)\nrestore() {{ chmod -R u+w \"$repo\" 2>/dev/null || true; }}\ntrap restore EXIT\nchmod -R a-w \"$repo\" || exit 93\nif touch \"$repo/codex-ro-probe\" 2>/dev/null; then\n  echo \"repository was writable during review\" >&2\n  exit 92\nfi\n'{fake}' \"$@\"\nstatus=$?\nrestore\ntrap - EXIT\nexit \"$status\"\n"
+    );
+    fs::write(path, script).expect("wrapper");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = fs::metadata(path).expect("meta").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod");
+}

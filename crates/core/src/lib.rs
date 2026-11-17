@@ -16,7 +16,7 @@ mod settings;
 pub use error::Error;
 pub use ledger::{
     Absorb, AnchoredClaim, ClaimAnchor, GraphBuild, Ledger, ReleaseAuthorization, RemoteCheck,
-    RemoteCheckDraft, Review, ScopedTask, TaskReport,
+    RemoteCheckDraft, Review, STALE_REVIEW_INVOCATION, ScopedTask, TaskReport,
 };
 pub use legacy::{LegacyMove, migrate_legacy_ledger};
 pub use model::{
