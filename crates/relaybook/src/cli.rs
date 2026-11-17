@@ -13,6 +13,7 @@ use crate::picker::{self, Pick};
 use crate::render;
 use crate::runloop;
 use crate::setup;
+use crate::signoff;
 use crate::uninstall;
 
 pub(crate) fn execute() -> ExitCode {
@@ -1134,12 +1135,12 @@ fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
     {
         return Err(invalid_setting(message));
     }
-    confirm_release()?;
+    confirm_release(sha)?;
     let checkout = gate::prepare_authorize(&ledger, cwd, sha)?;
     match gate::screen_publish(&mut ledger, &checkout.root, "authorize")? {
         gate::PublishScreen::Present(message) => return Err(invalid_setting(message)),
         gate::PublishScreen::Unknown { check_id, .. } => {
-            confirm_without_remote()?;
+            confirm_without_remote(sha)?;
             ledger.set_remote_check_override(check_id)?;
         }
         gate::PublishScreen::Clear => {}
@@ -1147,6 +1148,7 @@ fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
     let root = checkout.root.clone();
     let sha_owned = sha.to_string();
     let commits = checkout.range.commits.clone();
+    let (method, evidence) = signoff_record(&ledger, &checkout.root, sha)?;
     let authorization = ledger.authorize_release_with(
         &checkout.branch,
         sha,
@@ -1154,36 +1156,47 @@ fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
         "maintainer",
         gate::env_run_id(),
         Some(&commits),
+        Some(method),
+        evidence.as_deref(),
         move || gate::recheck_release_authorize(&root, &sha_owned),
     )?;
     json_outcome(authorization, render::line(&format!("authorized {sha}")))
 }
 
-fn confirm_without_remote() -> Result<(), Fail> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(invalid_setting(
-            "proceeding without remote verification requires confirmation at a TTY",
-        ));
-    }
-    match uninstall::confirm("Proceed without remote verification?") {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(invalid_setting(
-            "proceeding without remote verification was not confirmed",
-        )),
-        Err(message) => Err(invalid_setting(message)),
-    }
+fn confirm_without_remote(sha: &str) -> Result<(), Fail> {
+    signoff::confirm(&signoff::Challenge {
+        ask: "Proceed without remote verification?",
+        verb: "offline",
+        token: signoff::token_from_sha(sha)?,
+        missing_tty: "proceeding without remote verification requires confirmation at a TTY",
+        declined: "proceeding without remote verification was not confirmed",
+    })?;
+    Ok(())
 }
 
-fn confirm_release() -> Result<(), Fail> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(invalid_setting(
-            "release authorize requires confirmation at a TTY",
-        ));
-    }
-    match uninstall::confirm("Authorize this release?") {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(invalid_setting("release was not confirmed")),
-        Err(message) => Err(invalid_setting(message)),
+fn confirm_release(sha: &str) -> Result<(), Fail> {
+    signoff::confirm(&signoff::Challenge {
+        ask: "Authorize this release?",
+        verb: "authorize",
+        token: signoff::token_from_sha(sha)?,
+        missing_tty: "release authorize requires confirmation at a TTY",
+        declined: "release was not confirmed",
+    })?;
+    Ok(())
+}
+
+fn signoff_record(
+    ledger: &Ledger,
+    root: &std::path::Path,
+    sha: &str,
+) -> Result<(&'static str, Option<String>), Fail> {
+    if ledger.settings()?.signoff == "signed-tag" {
+        Ok((
+            signoff::METHOD_SIGNED,
+            Some(signoff::verify_signoff_tag(root, sha)?),
+        ))
+    } else {
+        Ok((signoff::METHOD_TYPED, None))
     }
 }
 
@@ -1506,52 +1519,89 @@ fn show_config(cwd: &Path) -> Result<Outcome, Fail> {
     json_outcome(settings.clone(), relaybook_core::format_config(&settings))
 }
 
-fn confirm_leave_gated() -> Result<(), Fail> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(invalid_setting(
-            "leaving workflow=gated requires confirmation at a TTY",
-        ));
-    }
-    match uninstall::confirm("Leave gated workflow?") {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(invalid_setting("leaving workflow=gated was not confirmed")),
-        Err(message) => Err(invalid_setting(message)),
-    }
+fn confirm_leave_gated(cwd: &Path) -> Result<(), Fail> {
+    signoff::confirm(&signoff::Challenge {
+        ask: "Leave gated workflow?",
+        verb: "classic",
+        token: signoff::confirmation_token(cwd),
+        missing_tty: "leaving workflow=gated requires confirmation at a TTY",
+        declined: "leaving workflow=gated was not confirmed",
+    })?;
+    Ok(())
 }
 
-fn workflow_leave_confirmed(ledger: &Ledger, key: &str, value: &str) -> Result<bool, Fail> {
+fn workflow_leave_confirmed(
+    ledger: &Ledger,
+    cwd: &Path,
+    key: &str,
+    value: &str,
+) -> Result<bool, Fail> {
     // `settings::set` trims before it validates and stores the value.
     if key != "workflow" || value.trim() != "classic" || ledger.settings()?.workflow != "gated" {
         return Ok(false);
     }
-    confirm_leave_gated()?;
+    confirm_leave_gated(cwd)?;
     Ok(true)
 }
 
-fn remote_local_confirmed(ledger: &Ledger, key: &str, value: &str) -> Result<bool, Fail> {
+fn remote_local_confirmed(
+    ledger: &Ledger,
+    cwd: &Path,
+    key: &str,
+    value: &str,
+) -> Result<bool, Fail> {
     if key != "remote_check"
         || value.trim() != "local"
         || ledger.settings()?.remote_check == "local"
     {
         return Ok(false);
     }
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(invalid_setting(
-            "remote_check=local requires confirmation at a TTY",
-        ));
+    signoff::confirm(&signoff::Challenge {
+        ask: "Set remote_check=local?",
+        verb: "local",
+        token: signoff::confirmation_token(cwd),
+        missing_tty: "remote_check=local requires confirmation at a TTY",
+        declined: "remote_check=local was not confirmed",
+    })?;
+    Ok(true)
+}
+
+fn signoff_change_confirmed(
+    ledger: &Ledger,
+    cwd: &Path,
+    key: &str,
+    value: &str,
+) -> Result<bool, Fail> {
+    if key != "signoff" {
+        return Ok(false);
     }
-    match uninstall::confirm("Set remote_check=local?") {
-        Ok(true) => Ok(true),
-        Ok(false) => Err(invalid_setting("remote_check=local was not confirmed")),
-        Err(message) => Err(invalid_setting(message)),
+    let next = value.trim();
+    if next != "typed" && next != "signed-tag" {
+        return Ok(false);
     }
+    if ledger.settings()?.signoff == next {
+        return Ok(false);
+    }
+    signoff::confirm(&signoff::Challenge {
+        ask: "Change signoff?",
+        verb: "signoff",
+        token: signoff::confirmation_token(cwd),
+        missing_tty: "changing signoff requires confirmation at a TTY",
+        declined: "signoff change was not confirmed",
+    })?;
+    Ok(true)
 }
 
 fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let leave_confirmed = workflow_leave_confirmed(&ledger, key, value)?;
-    let remote_confirmed = remote_local_confirmed(&ledger, key, value)?;
-    let settings = ledger.set_setting_with(key, value, leave_confirmed || remote_confirmed)?;
+    let leave_confirmed = workflow_leave_confirmed(&ledger, cwd, key, value)?;
+    let remote_confirmed = remote_local_confirmed(&ledger, cwd, key, value)?;
+    let signoff_confirmed = signoff_change_confirmed(&ledger, cwd, key, value)?;
+    let settings = ledger.set_setting_with(
+        key,
+        value,
+        leave_confirmed || remote_confirmed || signoff_confirmed,
+    )?;
     let shown = match key {
         "est_cost_cap_usd" => settings
             .est_cost_cap_usd
@@ -1562,6 +1612,7 @@ fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
         "reviewer" => settings.reviewer.clone(),
         "workflow" => settings.workflow.clone(),
         "remote_check" => settings.remote_check.clone(),
+        "signoff" => settings.signoff.clone(),
         "max_cycles" => settings.max_cycles.to_string(),
         "max_reopens_per_task" => settings.max_reopens_per_task.to_string(),
         "max_agent_calls" => settings.max_agent_calls.to_string(),

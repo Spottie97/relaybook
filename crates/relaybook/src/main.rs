@@ -23,6 +23,7 @@ mod remote;
 mod render;
 mod runloop;
 mod setup;
+mod signoff;
 mod stream;
 mod uninstall;
 mod workflow;

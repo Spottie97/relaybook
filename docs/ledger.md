@@ -37,11 +37,11 @@ Schema version is `PRAGMA user_version` 8. A new ledger is created at that versi
 | `task_deps` | Dependency links |
 | `events` | Append-only history |
 | `reports` | Task reports and cross-task notes. Not events. Nullable `commit_sha`, `base_sha`, and `graph_sha` |
-| `settings` | Mode, gates, reviewer, workflow, remote_check, and limits. `reviewer`, `workflow`, and `remote_check` are rows in this table |
+| `settings` | Mode, gates, reviewer, workflow, remote_check, signoff, and limits. `reviewer`, `workflow`, `remote_check`, and `signoff` are rows in this table. `signoff` defaults to `typed` |
 | `runs` | One auto-mode run: PRD, branch, stage, cycle, cost estimate, status. Nullable `workflow`. `write_stamp` starts at 0 and advances on each save |
 | `reviews` | Task and release reviews. `verdict` is null until recorded. Scope is `task` or `release` |
 | `graph_builds` | One graph refresh: step, commit, and status `built`, `skipped`, or `failed` |
-| `release_authorizations` | Maintainer sign-off for one commit. `run_id` is null in manual mode. Nullable `method` and `evidence` |
+| `release_authorizations` | Maintainer sign-off for one commit. `run_id` is null in manual mode. `method` is `tty-typed` or `tty-typed+signed-tag` when `relaybook release authorize` records the row, and null if a caller stores the row without that ceremony. `tty-typed` is a deliberate typed confirmation at a terminal; not proof of a human. `evidence` is null for `tty-typed`. For `tty-typed+signed-tag` it holds the tag name `relaybook-signoff/<sha12>`, the tag object SHA, and one verifier line |
 | `remote_checks` | One gated publish check. `status` is `absent`, `present`, `unknown`, or `local`. `override` is 1 on the authorization check that proceeded without a successful remote query. `review record` and `release authorize` write a row. `release status` reads the latest row |
 
 Event kinds are `task_created`, `claimed`, `progress`, `decision`, `status_changed`, `dependency_changed`, `task_renamed`, and `run_linked`. A progress event is unique per task and commit. A null commit, from a directory that is not a git checkout, is not covered, so those reports append.

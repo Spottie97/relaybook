@@ -3026,7 +3026,7 @@ fn slash_remote_tracking_ref_at_older_sha_refuses_in_local_mode() {
     let switched = answer_prompts(
         dir.path(),
         &["config", "set", "remote_check", "local"],
-        &["y\n"],
+        &[PromptAnswer::Phrase],
     );
     assert!(switched.success, "{}", switched.output);
     assert_failure(
@@ -3440,7 +3440,7 @@ fn release_authorize_offline_needs_second_confirmation() {
     let declined = answer_prompts(
         dir.path(),
         &["release", "authorize", "--sha", &head],
-        &["y\n", "n\n"],
+        &[PromptAnswer::Phrase, PromptAnswer::Text("n\n")],
     );
     assert!(
         !declined.success,
@@ -3460,7 +3460,7 @@ fn release_authorize_offline_needs_second_confirmation() {
     let accepted = answer_prompts(
         dir.path(),
         &["release", "authorize", "--sha", &head],
-        &["y\n", "y\n"],
+        &[PromptAnswer::Phrase, PromptAnswer::Phrase],
     );
     assert!(
         accepted.success,
@@ -3526,7 +3526,7 @@ fn remote_check_local_requires_terminal() {
     let declined = answer_prompts(
         plain.path(),
         &["config", "set", "remote_check", "local"],
-        &["n\n"],
+        &[PromptAnswer::Text("n\n")],
     );
     assert!(!declined.success, "{}", declined.output);
     assert!(
@@ -3538,7 +3538,7 @@ fn remote_check_local_requires_terminal() {
     let accepted = answer_prompts(
         plain.path(),
         &["config", "set", "remote_check", " local "],
-        &["y\n"],
+        &[PromptAnswer::Phrase],
     );
     assert!(accepted.success, "{}", accepted.output);
     run(plain.path(), ["config"])
@@ -3577,7 +3577,7 @@ fn remote_check_local_requires_terminal() {
     let switched = answer_prompts(
         dir.path(),
         &["config", "set", "remote_check", "local"],
-        &["y\n"],
+        &[PromptAnswer::Phrase],
     );
     assert!(switched.success, "{}", switched.output);
     let recorded = data_of(
@@ -3846,6 +3846,394 @@ fn commit_after_release_review_invalidates_signoff() {
         &relay_output(dir.path(), &["release", "authorize", "--sha", &next]),
         "no approved release review",
     );
+    assert_eq!(authorizations(dir.path()), vec![head]);
+}
+
+#[test]
+fn release_authorize_rejects_y_and_accepts_typed_sha() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    let phrase = format!("authorize {}", &head[..12]);
+    let rejected = answer_prompts(
+        dir.path(),
+        &["release", "authorize", "--sha", &head],
+        &[PromptAnswer::Text("y\n")],
+    );
+    assert!(!rejected.success, "{}", rejected.output);
+    assert!(
+        rejected.output.contains(&format!("Type {phrase}")),
+        "{}",
+        rejected.output
+    );
+    assert!(
+        rejected
+            .output
+            .contains("deliberate typed confirmation at a terminal; not proof of a human"),
+        "{}",
+        rejected.output
+    );
+    assert!(
+        rejected.output.contains("release was not confirmed"),
+        "{}",
+        rejected.output
+    );
+    assert!(authorizations(dir.path()).is_empty());
+
+    let accepted = authorize_at_tty(dir.path(), &fake, None, &head);
+    assert!(
+        accepted.success,
+        "code {} {}",
+        accepted.code, accepted.output
+    );
+    let signed = data_of(dir.path(), &["release", "status", "--json"]);
+    assert_eq!(signed["authorization"]["commit_sha"], json!(head));
+    assert_eq!(signed["authorization"]["method"], json!("tty-typed"));
+    assert!(signed["authorization"]["evidence"].is_null(), "{signed}");
+    assert_eq!(authorizations(dir.path()), vec![head]);
+}
+
+#[test]
+fn release_authorize_rejects_expired_challenge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    let expired = answer_prompts_in(
+        dir.path(),
+        &["release", "authorize", "--sha", &head],
+        &[PromptAnswer::Phrase],
+        &[("RELAYBOOK_SIGNOFF_TIMEOUT_SECS", "0")],
+        Duration::from_secs(1),
+    );
+    assert!(!expired.success, "{}", expired.output);
+    assert!(
+        expired.output.contains("confirmation challenge expired"),
+        "{}",
+        expired.output
+    );
+    assert!(
+        !expired.output.contains("release was not confirmed"),
+        "{}",
+        expired.output
+    );
+    assert!(authorizations(dir.path()).is_empty());
+}
+
+#[test]
+fn release_authorize_requires_stdout_tty() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    let shell = posix_shell();
+    let probe = pty_run(
+        dir.path(),
+        &shell,
+        &[
+            "-c",
+            "if [ -t 0 ]; then echo stdin-tty; else echo stdin-not; fi",
+        ],
+    );
+    assert!(
+        probe.success && probe.output.contains("stdin-tty"),
+        "code {} {}",
+        probe.code,
+        probe.output
+    );
+
+    let logs = tempfile::tempdir().expect("logs");
+    let stdout_log = logs.path().join("stdout.txt");
+    let stderr_log = logs.path().join("stderr.txt");
+    let run = pty_run(
+        dir.path(),
+        &shell,
+        &[
+            "-c",
+            "\"$1\" release authorize --sha \"$2\" > \"$3\" 2> \"$4\"",
+            "sh",
+            env!("CARGO_BIN_EXE_relaybook"),
+            &head,
+            stdout_log.to_str().expect("utf8 stdout log"),
+            stderr_log.to_str().expect("utf8 stderr log"),
+        ],
+    );
+    let stderr = fs::read_to_string(&stderr_log).unwrap_or_default();
+    assert!(!run.success, "code {} {}\n{stderr}", run.code, run.output);
+    assert!(
+        stderr.contains("release authorize requires confirmation at a TTY"),
+        "pty {}\nstderr {stderr}",
+        run.output
+    );
+    assert!(authorizations(dir.path()).is_empty());
+}
+
+#[test]
+fn claude_override_and_leaving_gated_use_typed_challenge() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = prepare_gated_review(dir.path(), &fake);
+    let phrase = format!("claude {}", &head[..12]);
+    let rejected = answer_prompts(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "claude",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ],
+        &[PromptAnswer::Text("y\n")],
+    );
+    assert!(!rejected.success, "{}", rejected.output);
+    assert!(
+        rejected.output.contains("Record this review as claude?"),
+        "{}",
+        rejected.output
+    );
+    assert!(
+        rejected.output.contains(&format!("Type {phrase}")),
+        "{}",
+        rejected.output
+    );
+    assert!(
+        rejected.output.contains("claude review was not confirmed"),
+        "{}",
+        rejected.output
+    );
+    assert_eq!(task_reviews(dir.path())[0].1, None);
+
+    let accepted = answer_prompts(
+        dir.path(),
+        &[
+            "review",
+            "record",
+            "auth",
+            "--by",
+            "claude",
+            "--sha",
+            &head,
+            "--verdict",
+            "approved",
+            "--text",
+            TASK_REVIEW_TEXT,
+        ],
+        &[PromptAnswer::Phrase],
+    );
+    assert!(accepted.success, "{}", accepted.output);
+    let reviews = task_reviews(dir.path());
+    assert_eq!(reviews[0].0, "claude");
+    assert_eq!(reviews[0].1.as_deref(), Some("approved"));
+    assert_eq!(reviews[0].2, 1);
+
+    let gated = tempfile::tempdir().expect("tempdir");
+    git_repo(gated.path());
+    run(gated.path(), ["init"]).assert().success();
+    run(gated.path(), ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    run(gated.path(), ["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+    let tip = git(gated.path(), &["rev-parse", "HEAD"]);
+    let leave = format!("classic {}", &tip[..12]);
+    let declined = answer_prompts(
+        gated.path(),
+        &["config", "set", "workflow", "classic"],
+        &[PromptAnswer::Text("y\n")],
+    );
+    assert!(!declined.success, "{}", declined.output);
+    assert!(
+        declined.output.contains("Leave gated workflow?"),
+        "{}",
+        declined.output
+    );
+    assert!(
+        declined.output.contains(&format!("Type {leave}")),
+        "{}",
+        declined.output
+    );
+    assert!(
+        declined
+            .output
+            .contains("leaving workflow=gated was not confirmed"),
+        "{}",
+        declined.output
+    );
+    assert_eq!(
+        json_data(gated.path(), ["config", "--json"])["workflow"],
+        json!("gated")
+    );
+    let switched = answer_prompts(
+        gated.path(),
+        &["config", "set", "workflow", "classic"],
+        &[PromptAnswer::Phrase],
+    );
+    assert!(switched.success, "{}", switched.output);
+    assert_eq!(
+        json_data(gated.path(), ["config", "--json"])["workflow"],
+        json!("classic")
+    );
+}
+
+#[test]
+fn signed_tag_mode_rejects_missing_unsigned_or_wrong_commit_tag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    let denied = command(dir.path())
+        .stdin(Stdio::null())
+        .args(["config", "set", "signoff", "signed-tag"])
+        .output()
+        .expect("output");
+    assert_failure(&denied, "changing signoff requires confirmation at a TTY");
+    assert_eq!(
+        json_data(dir.path(), ["config", "--json"])["signoff"],
+        json!("typed")
+    );
+    run(dir.path(), ["config", "set", "signoff", "sometimes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid signoff: sometimes"));
+
+    let typed = answer_prompts(
+        dir.path(),
+        &["config", "set", "signoff", "signed-tag"],
+        &[PromptAnswer::Text("y\n")],
+    );
+    assert!(!typed.success, "{}", typed.output);
+    assert!(
+        typed.output.contains("signoff change was not confirmed"),
+        "{}",
+        typed.output
+    );
+    let phrase = format!("signoff {}", &head[..12]);
+    assert!(
+        typed.output.contains(&format!("Type {phrase}")),
+        "{}",
+        typed.output
+    );
+    let switched = answer_prompts(
+        dir.path(),
+        &["config", "set", "signoff", "signed-tag"],
+        &[PromptAnswer::Phrase],
+    );
+    assert!(switched.success, "{}", switched.output);
+    command(dir.path())
+        .stdin(Stdio::null())
+        .args(["config", "set", "signoff", "signed-tag"])
+        .assert()
+        .success()
+        .stdout("signoff signed-tag\n");
+
+    let missing = answer_prompts(
+        dir.path(),
+        &["release", "authorize", "--sha", &head],
+        &[PromptAnswer::Phrase],
+    );
+    assert!(!missing.success, "{}", missing.output);
+    assert!(missing.output.contains("is missing"), "{}", missing.output);
+    assert!(authorizations(dir.path()).is_empty());
+
+    git(
+        dir.path(),
+        &["config", "user.email", "relaybook@example.com"],
+    );
+    git(dir.path(), &["config", "user.name", "Relaybook"]);
+    let tag = format!("relaybook-signoff/{}", &head[..12]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "tag.gpgsign=false",
+            "tag",
+            "-a",
+            "-m",
+            "unsigned",
+            &tag,
+        ],
+    );
+    let unsigned = answer_prompts(
+        dir.path(),
+        &["release", "authorize", "--sha", &head],
+        &[PromptAnswer::Phrase],
+    );
+    assert!(!unsigned.success, "{}", unsigned.output);
+    assert!(
+        unsigned.output.contains("is not a valid signature"),
+        "{}",
+        unsigned.output
+    );
+    assert!(authorizations(dir.path()).is_empty());
+
+    git(dir.path(), &["tag", "-d", &tag]);
+    let parent = git(dir.path(), &["rev-parse", "HEAD^"]);
+    git(
+        dir.path(),
+        &[
+            "-c",
+            "tag.gpgsign=false",
+            "tag",
+            "-a",
+            "-m",
+            "wrong",
+            &tag,
+            &parent,
+        ],
+    );
+    let wrong = answer_prompts(
+        dir.path(),
+        &["release", "authorize", "--sha", &head],
+        &[PromptAnswer::Phrase],
+    );
+    assert!(!wrong.success, "{}", wrong.output);
+    assert!(
+        wrong.output.contains("does not point at HEAD"),
+        "{}",
+        wrong.output
+    );
+    assert!(authorizations(dir.path()).is_empty());
+}
+
+#[test]
+fn signed_tag_mode_accepts_valid_signature() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fake = GraphifyFake::install();
+    let head = release_reviewed(dir.path(), &fake);
+    let _keys = install_ssh_signing(dir.path());
+    let switched = answer_prompts(
+        dir.path(),
+        &["config", "set", "signoff", "signed-tag"],
+        &[PromptAnswer::Phrase],
+    );
+    assert!(switched.success, "{}", switched.output);
+    let tag = format!("relaybook-signoff/{}", &head[..12]);
+    git(dir.path(), &["tag", "-s", "-m", "signoff", &tag]);
+    let tags = git(dir.path(), &["tag", "--list"]);
+    let authorized = authorize_at_tty(dir.path(), &fake, None, &head);
+    assert!(
+        authorized.success,
+        "code {} {}",
+        authorized.code, authorized.output
+    );
+    assert_eq!(git(dir.path(), &["tag", "--list"]), tags);
+    let object = git(dir.path(), &["rev-parse", &format!("refs/tags/{tag}")]);
+    let signed = data_of(dir.path(), &["release", "status", "--json"]);
+    assert_eq!(
+        signed["authorization"]["method"],
+        json!("tty-typed+signed-tag")
+    );
+    let evidence = signed["authorization"]["evidence"]
+        .as_str()
+        .expect("evidence");
+    assert!(evidence.contains(&format!("tag {tag}")), "{evidence}");
+    assert!(evidence.contains(&format!("object {object}")), "{evidence}");
+    assert!(evidence.contains("verifier "), "{evidence}");
+    assert!(evidence.contains("Good"), "{evidence}");
     assert_eq!(authorizations(dir.path()), vec![head]);
 }
 
@@ -5207,8 +5595,10 @@ fn authorize_at_tty(dir: &Path, fake: &GraphifyFake, log: Option<&Path>, sha: &s
                 Ok(0) => break,
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
-                    if !sent && buf.windows(5).any(|window| window == b"[y/N]") {
-                        let _ = writer.write_all(b"y\n");
+                    let phrases = typed_phrases(&buf);
+                    if !sent && !phrases.is_empty() {
+                        let phrase = format!("{}\n", phrases[0]);
+                        let _ = writer.write_all(phrase.as_bytes());
                         let _ = writer.flush();
                         sent = true;
                     }
@@ -5242,7 +5632,157 @@ fn authorize_at_tty(dir: &Path, fake: &GraphifyFake, log: Option<&Path>, sha: &s
     }
 }
 
-fn answer_prompts(dir: &Path, args: &[&str], answers: &[&str]) -> PtyOutput {
+fn typed_phrases(buf: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(buf);
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if !text.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+        .into_iter()
+        .filter_map(|line| {
+            line.strip_prefix("Type ")
+                .filter(|phrase| !phrase.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn posix_shell() -> PathBuf {
+    if cfg!(windows) {
+        let git_bash = PathBuf::from(r"C:\Program Files\Git\bin\sh.exe");
+        if git_bash.is_file() {
+            return git_bash;
+        }
+    }
+    PathBuf::from("sh")
+}
+
+fn pty_run(dir: &Path, program: &Path, args: &[&str]) -> PtyOutput {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    use portable_pty::{
+        Child as PtyChild, ChildKiller, CommandBuilder, PtySize, native_pty_system,
+    };
+
+    let system = native_pty_system();
+    let pair = system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("pty");
+    let mut cmd = CommandBuilder::new(program);
+    for arg in args {
+        cmd.arg(*arg);
+    }
+    cmd.cwd(dir);
+    cmd.env_remove("GIT_DIR");
+    cmd.env_remove("GIT_WORK_TREE");
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("reader");
+    let (send, recv) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 1024];
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(count) => buf.extend_from_slice(&tmp[..count]),
+                Err(_) => break,
+            }
+        }
+        let _ = send.send(buf);
+    });
+    let started = Instant::now();
+    let status = loop {
+        match PtyChild::try_wait(child.as_mut()) {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(20) => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = ChildKiller::kill(child.as_mut());
+                panic!("timed out waiting for pty command");
+            }
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    };
+    let buf = recv
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    PtyOutput {
+        success: status.success(),
+        code: status.exit_code(),
+        output: String::from_utf8_lossy(&buf).into_owned(),
+    }
+}
+
+fn install_ssh_signing(repo: &Path) -> tempfile::TempDir {
+    let keys = tempfile::tempdir().expect("keys");
+    let private = keys.path().join("id_ed25519");
+    let status = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+        .arg(&private)
+        .status()
+        .expect("ssh-keygen");
+    assert!(status.success(), "ssh-keygen");
+    let public = fs::read_to_string(private.with_extension("pub")).expect("pub");
+    let allowed = keys.path().join("allowed_signers");
+    fs::write(
+        &allowed,
+        format!("relaybook@example.com namespaces=\"git\" {}", public.trim()),
+    )
+    .expect("allowed");
+    git(repo, &["config", "user.email", "relaybook@example.com"]);
+    git(repo, &["config", "user.name", "Relaybook"]);
+    git(repo, &["config", "commit.gpgsign", "false"]);
+    git(repo, &["config", "tag.gpgsign", "false"]);
+    git(repo, &["config", "gpg.format", "ssh"]);
+    git(
+        repo,
+        &[
+            "config",
+            "user.signingkey",
+            private
+                .with_extension("pub")
+                .to_str()
+                .expect("utf8 signing key"),
+        ],
+    );
+    git(
+        repo,
+        &[
+            "config",
+            "gpg.ssh.allowedSignersFile",
+            allowed.to_str().expect("utf8 allowed signers"),
+        ],
+    );
+    keys
+}
+
+#[derive(Clone, Copy)]
+enum PromptAnswer {
+    Phrase,
+    Text(&'static str),
+}
+
+fn answer_prompts(dir: &Path, args: &[&str], answers: &[PromptAnswer]) -> PtyOutput {
+    answer_prompts_in(dir, args, answers, &[], Duration::ZERO)
+}
+
+fn answer_prompts_in(
+    dir: &Path,
+    args: &[&str],
+    answers: &[PromptAnswer],
+    env: &[(&str, &str)],
+    delay: Duration,
+) -> PtyOutput {
     use std::io::{Read, Write};
     use std::sync::mpsc;
 
@@ -5266,12 +5806,15 @@ fn answer_prompts(dir: &Path, args: &[&str], answers: &[&str]) -> PtyOutput {
     cmd.cwd(dir);
     cmd.env_remove("GIT_DIR");
     cmd.env_remove("GIT_WORK_TREE");
+    for (key, value) in env {
+        cmd.env(*key, *value);
+    }
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().expect("reader");
     let mut writer = pair.master.take_writer().expect("writer");
     let (send, recv) = mpsc::channel();
-    let answers: Vec<String> = answers.iter().map(|answer| (*answer).to_string()).collect();
+    let answers = answers.to_vec();
     thread::spawn(move || {
         let mut buf = Vec::new();
         let mut tmp = [0_u8; 1024];
@@ -5281,9 +5824,16 @@ fn answer_prompts(dir: &Path, args: &[&str], answers: &[&str]) -> PtyOutput {
                 Ok(0) => break,
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
-                    let prompts = buf.windows(5).filter(|window| *window == b"[y/N]").count();
-                    while sent < answers.len() && prompts > sent {
-                        let _ = writer.write_all(answers[sent].as_bytes());
+                    let phrases = typed_phrases(&buf);
+                    while sent < answers.len() && phrases.len() > sent {
+                        if !delay.is_zero() {
+                            thread::sleep(delay);
+                        }
+                        let line = match answers[sent] {
+                            PromptAnswer::Phrase => format!("{}\n", phrases[sent]),
+                            PromptAnswer::Text(text) => text.to_string(),
+                        };
+                        let _ = writer.write_all(line.as_bytes());
                         let _ = writer.flush();
                         sent += 1;
                     }
@@ -5359,14 +5909,21 @@ fn authorize_and_insert_during_second_prompt(dir: &Path, sha: &str) -> PtyOutput
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
                     let text = String::from_utf8_lossy(&buf);
-                    if stage == 0 && text.contains("Authorize this release?") {
-                        let _ = writer.write_all(b"y\n");
+                    let phrases = typed_phrases(&buf);
+                    if stage == 0 && text.contains("Authorize this release?") && !phrases.is_empty()
+                    {
+                        let line = format!("{}\n", phrases[0]);
+                        let _ = writer.write_all(line.as_bytes());
                         let _ = writer.flush();
                         stage = 1;
-                    } else if stage == 1 && text.contains("Proceed without remote verification?") {
+                    } else if stage == 1
+                        && text.contains("Proceed without remote verification?")
+                        && phrases.len() >= 2
+                    {
                         let id = insert_concurrent_remote_check(&ledger_dir);
                         let _ = inserted_tx.send(id);
-                        let _ = writer.write_all(b"y\n");
+                        let line = format!("{}\n", phrases[1]);
+                        let _ = writer.write_all(line.as_bytes());
                         let _ = writer.flush();
                         stage = 2;
                     }

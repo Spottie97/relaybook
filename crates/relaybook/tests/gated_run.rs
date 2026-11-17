@@ -371,7 +371,7 @@ fn leaving_gated_requires_terminal_confirmation() {
     assert_eq!(setting(dir.path(), "workflow"), json!("gated"));
     assert_eq!(setting(dir.path(), "reviewer"), json!("codex"));
 
-    let declined = answer_at_tty(dir.path(), &["config", "set", "workflow", "classic"], "n\n");
+    let declined = answer_at_tty(dir.path(), &["config", "set", "workflow", "classic"], false);
     assert!(!declined.success, "{}", declined.output);
     assert_eq!(declined.code, 1, "{}", declined.output);
     assert!(
@@ -388,7 +388,7 @@ fn leaving_gated_requires_terminal_confirmation() {
     );
     assert_eq!(setting(dir.path(), "workflow"), json!("gated"));
 
-    let accepted = answer_at_tty(dir.path(), &["config", "set", "workflow", "classic"], "y\n");
+    let accepted = answer_at_tty(dir.path(), &["config", "set", "workflow", "classic"], true);
     assert!(accepted.success, "{}", accepted.output);
     assert!(
         accepted.output.contains("workflow classic"),
@@ -432,7 +432,7 @@ fn leaving_gated_rejects_padded_classic_without_a_tty() {
     let accepted = answer_at_tty(
         dir.path(),
         &["config", "set", "workflow", " classic "],
-        "y\n",
+        true,
     );
     assert!(accepted.success, "{}", accepted.output);
     assert!(
@@ -487,7 +487,24 @@ struct PtyOutput {
     output: String,
 }
 
-fn answer_at_tty(dir: &Path, args: &[&str], answer: &str) -> PtyOutput {
+fn typed_phrases(buf: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(buf);
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if !text.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+        .into_iter()
+        .filter_map(|line| {
+            line.strip_prefix("Type ")
+                .filter(|phrase| !phrase.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+fn answer_at_tty(dir: &Path, args: &[&str], accept: bool) -> PtyOutput {
     use std::io::{Read, Write};
     use std::sync::mpsc;
     use std::thread;
@@ -518,7 +535,6 @@ fn answer_at_tty(dir: &Path, args: &[&str], answer: &str) -> PtyOutput {
     let mut reader = pair.master.try_clone_reader().expect("reader");
     let mut writer = pair.master.take_writer().expect("writer");
     let (send, recv) = mpsc::channel();
-    let answer = answer.to_string();
     thread::spawn(move || {
         let mut buf = Vec::new();
         let mut tmp = [0_u8; 1024];
@@ -528,8 +544,14 @@ fn answer_at_tty(dir: &Path, args: &[&str], answer: &str) -> PtyOutput {
                 Ok(0) => break,
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
-                    if !sent && buf.windows(5).any(|window| window == b"[y/N]") {
-                        let _ = writer.write_all(answer.as_bytes());
+                    let phrases = typed_phrases(&buf);
+                    if !sent && !phrases.is_empty() {
+                        let line = if accept {
+                            format!("{}\n", phrases[0])
+                        } else {
+                            "n\n".to_string()
+                        };
+                        let _ = writer.write_all(line.as_bytes());
                         let _ = writer.flush();
                         sent = true;
                     }

@@ -276,7 +276,7 @@ pub(crate) fn review_record_task(
     // cleanliness, and the fingerprint are read again after it returns.
     // Inside the write transaction only the local half runs, immediately
     // before commit.
-    let reviewer_override = reviewer_override(&configured, by)?;
+    let reviewer_override = reviewer_override(&configured, by, sha)?;
     require_gated_clean_tree(cwd, ledger)?;
     require_unpublished(ledger, &root, "review")?;
     let head = gitinfo::verified_head(&root).ok_or_else(|| {
@@ -379,7 +379,7 @@ pub(crate) fn review_record_release(
         return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
     }
     ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
-    let reviewer_override = reviewer_override(&configured, by)?;
+    let reviewer_override = reviewer_override(&configured, by, sha)?;
     let checkout = release_checkout(ledger, cwd, "review record")?;
     require_unpublished(ledger, &checkout.root, "release-review")?;
     if sha != checkout.range.head {
@@ -567,13 +567,13 @@ fn require_named_branch(root: &Path, action: &str) -> Result<String, Error> {
     }
 }
 
-fn reviewer_override(configured: &str, by: &str) -> Result<bool, Error> {
+fn reviewer_override(configured: &str, by: &str, sha: &str) -> Result<bool, Error> {
     let by = by.trim();
     if by == configured {
         return Ok(false);
     }
     if by == "claude" {
-        confirm_claude_review()?;
+        confirm_claude_review(sha)?;
         return Ok(true);
     }
     Err(Error::InvalidSetting(format!(
@@ -581,19 +581,14 @@ fn reviewer_override(configured: &str, by: &str) -> Result<bool, Error> {
     )))
 }
 
-fn confirm_claude_review() -> Result<(), Error> {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        return Err(Error::InvalidSetting(
-            "claude review requires confirmation at a TTY".to_string(),
-        ));
-    }
-    match crate::uninstall::confirm("Record this review as claude?") {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(Error::InvalidSetting(
-            "claude review was not confirmed".to_string(),
-        )),
-        Err(message) => Err(Error::InvalidSetting(message)),
-    }
+fn confirm_claude_review(sha: &str) -> Result<(), Error> {
+    crate::signoff::confirm(&crate::signoff::Challenge {
+        ask: "Record this review as claude?",
+        verb: "claude",
+        token: crate::signoff::token_from_sha(sha)?,
+        missing_tty: "claude review requires confirmation at a TTY",
+        declined: "claude review was not confirmed",
+    })
 }
 
 fn graph_dirty(cwd: &Path) -> Result<Option<Vec<String>>, Error> {

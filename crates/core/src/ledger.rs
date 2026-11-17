@@ -126,7 +126,8 @@ pub struct ScopedTask {
     pub base_sha: Option<String>,
 }
 
-/// One row of `release_authorizations`.
+/// One row of `release_authorizations`. `method` and `evidence` are null when
+/// a caller records the row without the CLI sign-off ceremony.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReleaseAuthorization {
     pub id: i64,
@@ -136,6 +137,8 @@ pub struct ReleaseAuthorization {
     pub review_id: i64,
     pub authorized_by: String,
     pub created_at: String,
+    pub method: Option<String>,
+    pub evidence: Option<String>,
 }
 
 /// One `remote_checks` insert. `status` is `absent`, `present`, `unknown`, or `local`.
@@ -635,9 +638,9 @@ impl Ledger {
     /// Writes a setting in one immediate transaction.
     ///
     /// `terminal_confirmed` allows `workflow` to change from `gated` to
-    /// `classic`, and `remote_check` to change to `local`. The stored value
-    /// is the trimmed one `settings::set` keeps, and that comparison runs
-    /// inside the write transaction.
+    /// `classic`, `remote_check` to change to `local`, and `signoff` to
+    /// change. The stored value is the trimmed one `settings::set` keeps,
+    /// and that comparison runs inside the write transaction.
     pub fn set_setting_with(
         &mut self,
         key: &str,
@@ -647,6 +650,7 @@ impl Ledger {
         self.transaction(|conn| {
             authorize_workflow_change(conn, key, value, terminal_confirmed)?;
             authorize_remote_check_change(conn, key, value, terminal_confirmed)?;
+            authorize_signoff_change(conn, key, value, terminal_confirmed)?;
             crate::settings::set(conn, key, value)
         })
     }
@@ -1201,6 +1205,8 @@ impl Ledger {
 
     /// Record sign-off. `sha` must equal `head`, and the latest release review
     /// at that commit must be approved. TTY confirmation stays with the CLI.
+    /// `method` is null here; the CLI passes `tty-typed` or
+    /// `tty-typed+signed-tag`.
     pub fn authorize_release(
         &mut self,
         branch: &str,
@@ -1209,13 +1215,24 @@ impl Ledger {
         authorized_by: &str,
         run_id: Option<i64>,
     ) -> Result<ReleaseAuthorization, Error> {
-        self.authorize_release_with(branch, sha, head, authorized_by, run_id, None, || Ok(()))
+        self.authorize_release_with(
+            branch,
+            sha,
+            head,
+            authorized_by,
+            run_id,
+            None,
+            None,
+            None,
+            || Ok(()),
+        )
     }
 
     /// Same as [`Self::authorize_release`]. `release_commits` is the release
     /// range; when set, every in-scope task must be accepted and no task may
-    /// be claimed. `revalidate` runs inside the write transaction after the
-    /// row is inserted and before commit.
+    /// be claimed. `method` is `tty-typed` with no evidence, or
+    /// `tty-typed+signed-tag` with evidence. `revalidate` runs inside the
+    /// write transaction after the row is inserted and before commit.
     #[allow(clippy::too_many_arguments)] // sha, head, the range, and the recheck are distinct
     pub fn authorize_release_with(
         &mut self,
@@ -1225,6 +1242,8 @@ impl Ledger {
         authorized_by: &str,
         run_id: Option<i64>,
         release_commits: Option<&[String]>,
+        method: Option<&str>,
+        evidence: Option<&str>,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<ReleaseAuthorization, Error> {
         let branch = required_text("branch", branch)?;
@@ -1234,6 +1253,7 @@ impl Ledger {
         if sha != head {
             return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
         }
+        let (method, evidence) = checked_signoff(method, evidence)?;
         self.transaction(|conn| {
             if let Some(commits) = release_commits {
                 accepted_in_scope(conn, commits)?;
@@ -1249,9 +1269,19 @@ impl Ledger {
             let created_at = now(conn)?;
             conn.execute(
                 "INSERT INTO release_authorizations (
-                    run_id, branch, commit_sha, review_id, authorized_by, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![run_id, branch, sha, review_id, authorized_by, created_at],
+                    run_id, branch, commit_sha, review_id, authorized_by, created_at,
+                    method, evidence
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    run_id,
+                    branch,
+                    sha,
+                    review_id,
+                    authorized_by,
+                    created_at,
+                    method,
+                    evidence
+                ],
             )?;
             revalidate()?;
             load_authorization(conn, conn.last_insert_rowid())
@@ -1685,6 +1715,42 @@ fn authorize_workflow_change(
         ));
     }
     Ok(())
+}
+
+fn checked_signoff(
+    method: Option<&str>,
+    evidence: Option<&str>,
+) -> Result<(Option<String>, Option<String>), Error> {
+    match (method, evidence) {
+        (None, None) => Ok((None, None)),
+        (Some("tty-typed"), None) => Ok((Some("tty-typed".to_string()), None)),
+        (Some("tty-typed+signed-tag"), Some(evidence)) if !evidence.trim().is_empty() => Ok((
+            Some("tty-typed+signed-tag".to_string()),
+            Some(evidence.to_string()),
+        )),
+        _ => Err(Error::InvalidSetting("invalid sign-off method".to_string())),
+    }
+}
+
+fn authorize_signoff_change(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+    terminal_confirmed: bool,
+) -> Result<(), Error> {
+    if key != "signoff" || terminal_confirmed {
+        return Ok(());
+    }
+    let next = value.trim();
+    if next != "typed" && next != "signed-tag" {
+        return Ok(());
+    }
+    if crate::settings::load(conn)?.signoff == next {
+        return Ok(());
+    }
+    Err(Error::InvalidSetting(
+        "changing signoff requires confirmation at a TTY".to_string(),
+    ))
 }
 
 fn authorize_remote_check_change(
@@ -2572,7 +2638,8 @@ fn load_graph_build(conn: &Connection, id: i64) -> Result<GraphBuild, Error> {
 fn load_authorization(conn: &Connection, id: i64) -> Result<ReleaseAuthorization, Error> {
     let row = conn
         .query_row(
-            "SELECT id, run_id, branch, commit_sha, review_id, authorized_by, created_at
+            "SELECT id, run_id, branch, commit_sha, review_id, authorized_by, created_at,
+                    method, evidence
              FROM release_authorizations WHERE id = ?1",
             params![id],
             |row| {
@@ -2584,6 +2651,8 @@ fn load_authorization(conn: &Connection, id: i64) -> Result<ReleaseAuthorization
                     review_id: row.get(4)?,
                     authorized_by: row.get(5)?,
                     created_at: row.get(6)?,
+                    method: row.get(7)?,
+                    evidence: row.get(8)?,
                 })
             },
         )
