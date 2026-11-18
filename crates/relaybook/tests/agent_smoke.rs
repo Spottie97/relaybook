@@ -1,8 +1,9 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 fn script_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/agent-smoke.sh")
@@ -246,4 +247,295 @@ clear_git_repo_env
         fs::read("/etc/gitconfig").ok() == system_before,
         "system gitconfig was modified"
     );
+}
+
+const FAKE_CODEX: &str = r#"#!/bin/sh
+mode=${SMOKE_CODEX_MODE:-ok}
+log=${SMOKE_CODEX_LOG:-}
+rc=${SMOKE_CODEX_RC:-1}
+err=${SMOKE_CODEX_ERR:-codex failed}
+verdict=${SMOKE_CODEX_VERDICT:-}
+valid='{"verdict":"approved","body":{"findings":"none","security":"none","tests_checked":"none","not_checked":"none"}}'
+
+if [ "${1:-}" = "login" ]; then
+  exit 0
+fi
+if [ "${1:-}" = "--version" ]; then
+  printf '%s\n' "codex-cli 0.169.0"
+  exit 0
+fi
+if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
+  printf '%s\n' "--ephemeral --output-schema --color --sandbox read-only"
+  exit 0
+fi
+
+if [ -n "$log" ]; then
+  printf '%s\n' "$*" >> "$log"
+fi
+cat >/dev/null || true
+
+out=
+repo=
+prev=
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    out=$arg
+  fi
+  if [ "$prev" = "-C" ]; then
+    repo=$arg
+  fi
+  prev=$arg
+done
+has_schema=0
+for arg in "$@"; do
+  if [ "$arg" = "--output-schema" ]; then
+    has_schema=1
+  fi
+done
+
+if [ "$has_schema" -eq 1 ]; then
+  case "$mode" in
+    missing)
+      exit 0
+      ;;
+    payload)
+      printf '%s' "$verdict" > "$out"
+      exit 0
+      ;;
+    fail)
+      if [ "${SMOKE_CODEX_WRITE_VALID:-}" = 1 ]; then
+        printf '%s\n' "$valid" > "$out"
+      fi
+      printf '%s\n' "$err" >&2
+      exit "$rc"
+      ;;
+    review_write)
+      printf '%s\n' "$valid" > "$out"
+      printf '%s\n' written > "$repo/codex-wrote.txt"
+      exit 0
+      ;;
+    *)
+      if [ -n "$verdict" ]; then
+        printf '%s' "$verdict" > "$out"
+      else
+        printf '%s\n' "$valid" > "$out"
+      fi
+      exit 0
+      ;;
+  esac
+fi
+
+case "$mode" in
+  probe_write)
+    printf '%s\n' written > "$repo/codex-wrote.txt"
+    exit 0
+    ;;
+  probe_dirty)
+    printf '%s\n' dirty >> "$repo/src-main.rs"
+    exit 0
+    ;;
+  probe_fail)
+    printf '%s\n' "sandbox probe crashed" >&2
+    exit "$rc"
+    ;;
+  fail)
+    printf '%s\n' "$err" >&2
+    exit "$rc"
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+"#;
+
+fn run_codex_smoke(mode: &str, extra: &[(&str, &str)]) -> (Output, String) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let bin = root.path().join("bin");
+    fs::create_dir(&bin).expect("bin");
+    let codex = bin.join("codex");
+    fs::write(&codex, FAKE_CODEX).expect("fake codex");
+    let mut perms = fs::metadata(&codex).expect("meta").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&codex, perms).expect("chmod");
+    let log = root.path().join("codex.log");
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut command = Command::new("sh");
+    command
+        .env("RELAYBOOK_SMOKE_LIB", "1")
+        .env("SCRIPT", script_path())
+        .env("SMOKE_CODEX_MODE", mode)
+        .env("SMOKE_CODEX_LOG", &log)
+        .env_remove("SMOKE_CODEX_RC")
+        .env_remove("SMOKE_CODEX_ERR")
+        .env_remove("SMOKE_CODEX_VERDICT")
+        .env_remove("SMOKE_CODEX_WRITE_VALID")
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .arg("-c")
+        .arg("set -eu\n. \"$SCRIPT\"\nsmoke_codex\n");
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    let output = command.output().expect("sh");
+    let logged = fs::read_to_string(&log).unwrap_or_default();
+    (output, logged)
+}
+
+fn assert_codex_smoke_failed(mode: &str, output: &Output, needle: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "{mode}: smoke passed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("schema-valid verdict"),
+        "{mode}: reported success\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(needle),
+        "{mode}: missing {needle}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn codex_smoke_fails_on_nonzero_exec() {
+    for (mode, extra, needle) in [
+        (
+            "fail",
+            vec![
+                ("SMOKE_CODEX_RC", "1"),
+                ("SMOKE_CODEX_ERR", "ERROR: usage limit reached"),
+            ],
+            "codex review exec failed (rc 1)",
+        ),
+        (
+            "fail",
+            vec![
+                ("SMOKE_CODEX_RC", "1"),
+                ("SMOKE_CODEX_ERR", "connection refused"),
+                ("SMOKE_CODEX_WRITE_VALID", "1"),
+            ],
+            "codex review exec failed (rc 1)",
+        ),
+        (
+            "fail",
+            vec![
+                ("SMOKE_CODEX_RC", "139"),
+                ("SMOKE_CODEX_ERR", "codex crashed"),
+            ],
+            "codex review exec failed (rc 139)",
+        ),
+    ] {
+        let (output, _) = run_codex_smoke(mode, &extra);
+        assert_codex_smoke_failed(mode, &output, needle);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let err = extra
+            .iter()
+            .find(|(key, _)| *key == "SMOKE_CODEX_ERR")
+            .map(|(_, value)| *value)
+            .unwrap_or("");
+        assert!(
+            stderr.contains(err),
+            "{mode}: dropped codex diagnostics\nstderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn codex_smoke_fails_when_verdict_missing() {
+    let (output, _) = run_codex_smoke("missing", &[]);
+    assert_codex_smoke_failed("missing", &output, "codex review verdict is missing");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("verdict file missing"),
+        "missing: dropped missing-verdict evidence\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn codex_smoke_fails_when_verdict_not_schema_valid() {
+    let payloads = [
+        "",
+        "   \n",
+        "not-json",
+        "{\"verdict\":\"approved\"}",
+        "{\"verdict\":\"approved\",\"body\":{\"findings\":\"none\"}}",
+        "{\"verdict\":\"yes\",\"body\":{\"findings\":\"none\",\"security\":\"none\",\"tests_checked\":\"none\",\"not_checked\":\"none\"}}",
+        "{\"verdict\":\"approved\",\"body\":{\"findings\":\"none\",\"security\":\"none\",\"tests_checked\":\"none\",\"not_checked\":\"none\"},\"extra\":true}",
+        "{\"verdict\":\"approved\",\"body\":{\"findings\":\"none\",\"security\":\"none\",\"tests_checked\":\"none\",\"not_checked\":\"none\"}}{\"verdict\":\"approved\"}",
+        "[]",
+        "{\"verdict\":\"approved\",\"body\":[]}",
+    ];
+    for payload in payloads {
+        let (output, _) = run_codex_smoke("payload", &[("SMOKE_CODEX_VERDICT", payload)]);
+        assert_codex_smoke_failed(
+            "payload",
+            &output,
+            "codex review verdict is not schema-valid",
+        );
+    }
+}
+
+#[test]
+fn codex_smoke_fails_when_sandbox_probe_does_not_hold() {
+    for (mode, needle) in [
+        ("probe_write", "codex read-only wrote codex-wrote.txt"),
+        ("probe_dirty", "codex read-only changed the worktree"),
+        ("probe_fail", "codex sandbox probe failed"),
+        ("review_write", "codex read-only wrote codex-wrote.txt"),
+    ] {
+        let (output, _) = run_codex_smoke(mode, &[]);
+        assert_codex_smoke_failed(mode, &output, needle);
+    }
+}
+
+#[test]
+fn codex_smoke_accepts_valid_verdict_and_separate_denial() {
+    let verdicts = [
+        "",
+        r#"{"verdict":"approved","body":{"findings":"none","security":"none","tests_checked":"none","not_checked":"none"}}"#,
+        r#"{"verdict":"changes-requested","body":{"findings":[],"security":[],"tests_checked":[],"not_checked":[],"token":"kestrel"}}"#,
+    ];
+    for verdict in verdicts {
+        let (output, log) = run_codex_smoke("ok", &[("SMOKE_CODEX_VERDICT", verdict)]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "verdict {verdict}: smoke failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("schema-valid verdict"),
+            "verdict {verdict}: missing success line\nstdout:\n{stdout}"
+        );
+        let execs: Vec<_> = log
+            .lines()
+            .filter(|line| line.starts_with("exec "))
+            .collect();
+        assert_eq!(
+            execs.len(),
+            2,
+            "verdict {verdict}: review and denial were not separate\nlog:\n{log}"
+        );
+        assert!(
+            execs[0].contains("--output-schema"),
+            "review argv lost --output-schema: {}",
+            execs[0]
+        );
+        assert!(
+            !execs[0].contains("codex-wrote.txt"),
+            "review prompt still asks for a write: {}",
+            execs[0]
+        );
+        assert!(
+            execs[1].contains("codex-wrote.txt"),
+            "denial probe did not ask for the write: {}",
+            execs[1]
+        );
+        assert!(
+            !execs[1].contains("--output-schema"),
+            "denial probe was schema-gated: {}",
+            execs[1]
+        );
+    }
 }

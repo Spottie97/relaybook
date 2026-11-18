@@ -1,11 +1,12 @@
 #!/bin/sh
 # Manual smoke test. Not part of CI.
 # Needs a signed-in claude, the Cursor CLI, a signed-in codex, and a real
-# graphify on PATH. Also needs git, timeout, and sqlite3 3.45.1.
+# graphify on PATH. Also needs git, timeout, python3, and sqlite3 3.45.1.
 # One run: real-graphify checks in a throwaway repo, schema 8 against a
-# 0.3.3 build, real git ls-remote, a real read-only Codex exec, then the
+# 0.3.3 build, real git ls-remote, a real read-only Codex review (exit 0
+# and a schema-valid verdict) plus a separate write-denial probe, then the
 # three plain prompts from agent-onboarding-eval. The unit tests use a
-# stand-in graphify and do not run these smoke bodies.
+# stand-in graphify and do not run the full script.
 #
 # The graphify phase clears GIT_DIR, GIT_WORK_TREE, and GIT_INDEX_FILE and
 # uses a temporary HOME, so it does not operate on another repository or
@@ -388,9 +389,12 @@ smoke_ls_remote() {
   echo "ls-remote: real git, push URL rewrite, and relaybook publish check ok"
 }
 
-# Real codex exec with the read-only argv Relaybook uses. The worktree must
-# stay unchanged. A schema-invalid answer can exit non-zero; a rejected flag,
-# a timeout, or a new file cannot.
+# Real codex exec with the read-only argv Relaybook uses.
+# The review exec must exit 0 and leave one nonempty schema-valid verdict.
+# The write denial is a second exec: it must exit 0, must not create
+# codex-wrote.txt, and must leave the worktree unchanged. A non-zero exit,
+# a missing or invalid verdict, a timeout, or a new file fails. Diagnostics
+# are printed before the temporary directory is removed.
 smoke_codex() {
   if ! command -v codex >/dev/null 2>&1; then
     echo "codex: not on PATH" >&2
@@ -398,6 +402,10 @@ smoke_codex() {
   fi
   if ! command -v timeout >/dev/null 2>&1; then
     echo "timeout is not on PATH" >&2
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is not on PATH" >&2
     exit 1
   fi
   if ! codex login status </dev/null >/dev/null 2>&1; then
@@ -415,6 +423,7 @@ smoke_codex() {
   codex_repo=$smoke_tmp/repo
   codex_schema=$smoke_tmp/codex-schema.json
   codex_out=$smoke_tmp/codex-last.md
+  probe_out=$smoke_tmp/codex-probe.md
   mkdir -p "$codex_repo"
   init_throwaway "$codex_repo" ""
   printf 'fn main() {}\n' > "$codex_repo/src-main.rs"
@@ -442,39 +451,111 @@ smoke_codex() {
   }
 }
 EOF
+  cat >"$smoke_tmp/check_verdict.py" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    raw = open(path, encoding="utf-8").read()
+except OSError:
+    raise SystemExit(1)
+text = raw.strip()
+if not text:
+    raise SystemExit(1)
+try:
+    value = json.loads(text)
+except json.JSONDecodeError:
+    raise SystemExit(1)
+if not isinstance(value, dict) or set(value) != {"verdict", "body"}:
+    raise SystemExit(1)
+verdict = value["verdict"]
+if verdict not in ("approved", "changes-requested"):
+    raise SystemExit(1)
+body = value["body"]
+if not isinstance(body, dict):
+    raise SystemExit(1)
+for key in ("findings", "security", "tests_checked", "not_checked"):
+    if key not in body:
+        raise SystemExit(1)
+PY
   printf '%s\n' "packet: leave the repository unchanged" >"$smoke_tmp/packet.txt"
-  codex_prompt="Create a file named codex-wrote.txt in the working directory containing the word written. Then answer with the output schema only: verdict approved, and body findings, security, tests_checked, and not_checked each the string none."
+  codex_prompt="Answer with the output schema only: verdict approved, and body findings, security, tests_checked, and not_checked each the string none. Leave the repository unchanged."
+  probe_prompt="Create a file named codex-wrote.txt in the working directory containing the word written."
   codex_rc=0
   (
     clear_git_repo_env
     cd "$codex_repo" || exit 1
     timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" --output-schema "$codex_schema" -o "$codex_out" "$codex_prompt" <"$smoke_tmp/packet.txt"
   ) >"$smoke_tmp/codex.out" 2>"$smoke_tmp/codex.err" || codex_rc=$?
-  if [ "$codex_rc" -eq 124 ]; then
-    echo "codex exec timed out" >&2
-    cat "$smoke_tmp/codex.out" "$smoke_tmp/codex.err" >&2
-    exit 1
+  if [ "$codex_rc" -ne 0 ]; then
+    if [ "$codex_rc" -eq 124 ]; then
+      codex_fail "codex review exec timed out" "$codex_out"
+    fi
+    if grep -F -q "unexpected argument" "$smoke_tmp/codex.err" || grep -F -q "unexpected argument" "$smoke_tmp/codex.out" || grep -F -q "unrecognized" "$smoke_tmp/codex.err" || grep -F -q "invalid value" "$smoke_tmp/codex.err"; then
+      codex_fail "codex rejected the review argv" "$codex_out"
+    fi
+    codex_fail "codex review exec failed (rc $codex_rc)" "$codex_out"
   fi
-  if grep -F -q "unexpected argument" "$smoke_tmp/codex.err" || grep -F -q "unexpected argument" "$smoke_tmp/codex.out" || grep -F -q "unrecognized" "$smoke_tmp/codex.err" || grep -F -q "invalid value" "$smoke_tmp/codex.err"; then
-    echo "codex rejected the review argv" >&2
-    cat "$smoke_tmp/codex.out" "$smoke_tmp/codex.err" >&2
-    exit 1
+  if [ ! -f "$codex_out" ]; then
+    codex_fail "codex review verdict is missing" "$codex_out"
   fi
-  if [ -e "$codex_repo/codex-wrote.txt" ]; then
-    echo "codex read-only wrote codex-wrote.txt" >&2
-    exit 1
+  verdict_rc=0
+  python3 "$smoke_tmp/check_verdict.py" "$codex_out" || verdict_rc=$?
+  if [ "$verdict_rc" -ne 0 ]; then
+    codex_fail "codex review verdict is not schema-valid" "$codex_out"
   fi
-  after=$(run_in_repo "$codex_repo" "" git status --porcelain)
-  if [ "$before" != "$after" ]; then
-    echo "codex read-only changed the worktree" >&2
-    printf 'before: %s\n' "$before" >&2
-    printf 'after: %s\n' "$after" >&2
-    exit 1
+  codex_assert_clean "$codex_out"
+  codex_rc=0
+  (
+    clear_git_repo_env
+    cd "$codex_repo" || exit 1
+    timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" -o "$probe_out" "$probe_prompt" </dev/null
+  ) >"$smoke_tmp/codex.out" 2>"$smoke_tmp/codex.err" || codex_rc=$?
+  if [ "$codex_rc" -ne 0 ]; then
+    if [ "$codex_rc" -eq 124 ]; then
+      codex_fail "codex sandbox probe timed out" "$probe_out"
+    fi
+    codex_fail "codex sandbox probe failed (rc $codex_rc)" "$probe_out"
   fi
+  codex_assert_clean "$probe_out"
   codex_version=$(codex --version 2>&1 | awk 'NR==1 { print; exit }')
   rm -rf "$smoke_tmp"
   smoke_tmp=
-  echo "codex: $codex_version read-only left the repository unchanged (rc $codex_rc)"
+  echo "codex: $codex_version read-only left the repository unchanged and recorded a schema-valid verdict"
+}
+
+codex_fail() {
+  echo "$1" >&2
+  if [ -f "$smoke_tmp/codex.out" ]; then
+    cat "$smoke_tmp/codex.out" >&2
+  fi
+  if [ -f "$smoke_tmp/codex.err" ]; then
+    cat "$smoke_tmp/codex.err" >&2
+  fi
+  if [ -n "${2-}" ]; then
+    if [ -f "$2" ]; then
+      echo "--- verdict ---" >&2
+      cat "$2" >&2
+    else
+      echo "verdict file missing: $2" >&2
+    fi
+  fi
+  rm -rf "$smoke_tmp"
+  smoke_tmp=
+  exit 1
+}
+
+codex_assert_clean() {
+  if [ -e "$codex_repo/codex-wrote.txt" ]; then
+    codex_fail "codex read-only wrote codex-wrote.txt" "$1"
+  fi
+  after=$(run_in_repo "$codex_repo" "" git status --porcelain)
+  if [ "$before" != "$after" ]; then
+    printf 'before: %s\n' "$before" >&2
+    printf 'after: %s\n' "$after" >&2
+    codex_fail "codex read-only changed the worktree" "$1"
+  fi
 }
 
 if [ "${RELAYBOOK_SMOKE_LIB:-}" = 1 ]; then
