@@ -15,10 +15,11 @@ mod settings;
 
 pub use error::Error;
 pub use ledger::{
-    Absorb, AnchoredClaim, ClaimAnchor, GraphBuild, Ledger, OwnedReviewExpect, OwnedReviewSnapshot,
-    OwnedRunAdvance, REPORT_CHANGED_DURING_REFRESH, ReleaseAuthorization, RemoteCheck,
-    RemoteCheckDraft, Review, ReviewInvocationAction, ReviewInvocationOutcome,
-    STALE_REVIEW_INVOCATION, ScopedTask, TaskReport, apply_review_invocation,
+    Absorb, AnchoredClaim, ClaimAnchor, GraphBuild, LEDGER_CHANGED_DURING_REVIEW, Ledger,
+    OwnedReviewExpect, OwnedReviewSnapshot, OwnedRunAdvance, REPORT_CHANGED_DURING_REFRESH,
+    ReleaseAuthorization, RemoteCheck, RemoteCheckDraft, Review, ReviewInvocationAction,
+    ReviewInvocationOutcome, STALE_REVIEW_INVOCATION, ScopedTask, TaskReport,
+    apply_review_invocation,
 };
 pub use legacy::{LegacyMove, migrate_legacy_ledger};
 pub use model::{

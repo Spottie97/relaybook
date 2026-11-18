@@ -1287,7 +1287,15 @@ fn gated_snap(cwd: &Path, run_branch: &str) -> Result<GatedSnap, String> {
 /// reasons `shared_guard_gated` already uses. Any other ref change names the
 /// first ref in sorted order.
 fn guard_reviewer(cwd: &Path, before: &GatedSnap) -> Result<(), String> {
-    let after = gated_snap(cwd, &before.run_branch)?;
+    let after = match gated_snap(cwd, &before.run_branch) {
+        Ok(after) => after,
+        // The before snapshot succeeded. A hooks read that fails only after
+        // Codex ran is a change we will not approve.
+        Err(err) if err.starts_with("hooks:") => {
+            return Err("reviewer changed hooks".to_string());
+        }
+        Err(err) => return Err(err),
+    };
     if after.snap.head != before.snap.head || after.snap.branch != before.snap.branch {
         return Err("reviewer moved HEAD".to_string());
     }
@@ -1368,16 +1376,119 @@ fn git_path_bytes(cwd: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
+const HOOK_SYMLINK_HOPS: u32 = 8;
+const HOOK_FILE_BYTES: u64 = 1_048_576;
+
+struct HookChain {
+    paths: Vec<PathBuf>,
+    #[cfg(unix)]
+    ids: Vec<(u64, u64)>,
+}
+
+fn hook_read(path: &Path, err: &std::io::Error) -> String {
+    format!("hooks: read {}: {err}", path.display())
+}
+
+fn lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn file_id(meta: &fs::Metadata) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// Record `path` on `chain`. A repeated inode or lexical path is a cycle.
+///
+/// On Unix every successful call pushes one inode. [`pop_hook`] pops it.
+fn note_hook(chain: &mut HookChain, meta: &fs::Metadata, path: &Path) -> Result<(), String> {
+    let id = file_id(meta);
+    #[cfg(unix)]
+    if let Some(id) = id
+        && chain.ids.contains(&id)
+    {
+        return Err("hooks: symlink cycle".to_string());
+    }
+    let key = lexical_path(path);
+    if chain.paths.iter().any(|seen| seen == &key) {
+        return Err("hooks: symlink cycle".to_string());
+    }
+    #[cfg(unix)]
+    if let Some(id) = id {
+        chain.ids.push(id);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = id;
+    }
+    chain.paths.push(key);
+    Ok(())
+}
+
+fn pop_hook(chain: &mut HookChain) {
+    chain.paths.pop();
+    #[cfg(unix)]
+    {
+        chain.ids.pop();
+    }
+}
+
+fn resolve_hook_link(link: &Path, target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        match link.parent() {
+            Some(parent) => parent.join(target),
+            None => target.to_path_buf(),
+        }
+    }
+}
+
 fn hooks_fingerprint(cwd: &Path) -> Result<String, String> {
     let path = git_file(cwd, "hooks")?;
     let mut body = Vec::new();
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // The hooks directory itself may be a link. Record that link, then
+            // list the directory `read_dir` follows. Entry symlinks are separate.
+            body.extend_from_slice(&permission_token(&meta).to_le_bytes());
+            body.push(b'l');
+            let target = fs::read_link(&path).map_err(|err| hook_read(&path, &err))?;
+            body.extend_from_slice(target.to_string_lossy().as_bytes());
+            body.push(0);
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(hook_read(&path, &err)),
+    }
     append_hooks(&path, &mut body, 0)?;
     Ok(fnv1a(&body))
 }
 
 fn append_hooks(dir: &Path, body: &mut Vec<u8>, depth: u32) -> Result<(), String> {
     if depth > 32 {
-        return Err("hooks directory is too deep".to_string());
+        return Err("hooks: directory is too deep".to_string());
     }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -1385,12 +1496,12 @@ fn append_hooks(dir: &Path, body: &mut Vec<u8>, depth: u32) -> Result<(), String
             body.extend_from_slice(b"missing");
             return Ok(());
         }
-        Err(err) => return Err(format!("read {}: {err}", dir.display())),
+        Err(err) => return Err(hook_read(dir, &err)),
     };
     body.extend_from_slice(b"present\0");
     let mut items = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|err| format!("read {}: {err}", dir.display()))?;
+        let entry = entry.map_err(|err| hook_read(dir, &err))?;
         items.push(entry);
     }
     items.sort_by_key(|entry| entry.file_name());
@@ -1399,27 +1510,89 @@ fn append_hooks(dir: &Path, body: &mut Vec<u8>, depth: u32) -> Result<(), String
         let name = entry.file_name();
         body.extend_from_slice(name.to_string_lossy().as_bytes());
         body.push(0);
-        let meta =
-            fs::symlink_metadata(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        let meta = fs::symlink_metadata(&path).map_err(|err| hook_read(&path, &err))?;
         body.extend_from_slice(&permission_token(&meta).to_le_bytes());
         let file_type = meta.file_type();
         if file_type.is_symlink() {
             body.push(b'l');
-            let target =
-                fs::read_link(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+            let target = fs::read_link(&path).map_err(|err| hook_read(&path, &err))?;
             body.extend_from_slice(target.to_string_lossy().as_bytes());
+            let mut chain = HookChain {
+                paths: Vec::new(),
+                #[cfg(unix)]
+                ids: Vec::new(),
+            };
+            note_hook(&mut chain, &meta, &path)?;
+            let followed = follow_hook_target(&path, &target, body, 0, &mut chain);
+            pop_hook(&mut chain);
+            followed?;
         } else if file_type.is_dir() {
             body.push(b'd');
             append_hooks(&path, body, depth + 1)?;
         } else if file_type.is_file() {
             body.push(b'f');
-            let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
-            body.extend_from_slice(&bytes);
+            append_regular_hook(&path, &meta, body)?;
         } else {
             body.push(b'o');
         }
         body.push(0);
     }
+    Ok(())
+}
+
+fn follow_hook_target(
+    link: &Path,
+    target: &Path,
+    body: &mut Vec<u8>,
+    hops: u32,
+    chain: &mut HookChain,
+) -> Result<(), String> {
+    if hops >= HOOK_SYMLINK_HOPS {
+        return Err("hooks: symlink chain is too long".to_string());
+    }
+    let next = resolve_hook_link(link, target);
+    let meta = fs::symlink_metadata(&next).map_err(|err| hook_read(&next, &err))?;
+    note_hook(chain, &meta, &next)?;
+    let result = record_followed_hook(&next, &meta, body, hops, chain);
+    pop_hook(chain);
+    result
+}
+
+fn record_followed_hook(
+    path: &Path,
+    meta: &fs::Metadata,
+    body: &mut Vec<u8>,
+    hops: u32,
+    chain: &mut HookChain,
+) -> Result<(), String> {
+    body.extend_from_slice(&permission_token(meta).to_le_bytes());
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        body.push(b'l');
+        let nested = fs::read_link(path).map_err(|err| hook_read(path, &err))?;
+        body.extend_from_slice(nested.to_string_lossy().as_bytes());
+        follow_hook_target(path, &nested, body, hops + 1, chain)
+    } else if file_type.is_file() {
+        append_regular_hook(path, meta, body)
+    } else if file_type.is_dir() {
+        Err("hooks: symlink target is a directory".to_string())
+    } else {
+        // A fifo or device would block or never end. Do not read it.
+        body.push(b'o');
+        Ok(())
+    }
+}
+
+fn append_regular_hook(path: &Path, meta: &fs::Metadata, body: &mut Vec<u8>) -> Result<(), String> {
+    if meta.len() > HOOK_FILE_BYTES {
+        return Err("hooks: target is too large".to_string());
+    }
+    let bytes = fs::read(path).map_err(|err| hook_read(path, &err))?;
+    if bytes.len() as u64 > HOOK_FILE_BYTES {
+        return Err("hooks: target is too large".to_string());
+    }
+    body.push(b'f');
+    body.extend_from_slice(&bytes);
     Ok(())
 }
 
@@ -1751,7 +1924,7 @@ fn review_with_codex(
         if message == relaybook_core::STALE_REVIEW_INVOCATION {
             return Control::Return(fail(relaybook_core::STALE_REVIEW_INVOCATION));
         }
-        if message == "ledger changed during review" {
+        if message == relaybook_core::LEDGER_CHANGED_DURING_REVIEW {
             return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Halt {
                 reason: message,
             }));
@@ -2385,5 +2558,77 @@ mod tests {
         assert_eq!(older.stage, "release_review");
         assert_eq!(newer.status, "active");
         assert_eq!(newer.stage, "publish");
+    }
+
+    #[cfg(unix)]
+    fn init_hooks(work: &Path) -> std::path::PathBuf {
+        git(work, &["init", "-b", "main"]);
+        let hooks = work.join(".git/hooks");
+        fs::create_dir_all(&hooks).expect("hooks");
+        hooks
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hooks_fingerprint_includes_symlink_target_bytes_and_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let root = tempfile::tempdir().expect("temp");
+        let work = root.path();
+        let hooks = init_hooks(work);
+        let target = work.join(".git/shared-pre-commit");
+        fs::write(&target, b"#!/bin/sh\necho one\n").expect("target");
+        symlink("../shared-pre-commit", hooks.join("pre-commit")).expect("symlink");
+        let before = super::hooks_fingerprint(work).expect("fingerprint");
+        fs::write(&target, b"#!/bin/sh\necho two\n").expect("rewrite");
+        let edited = super::hooks_fingerprint(work).expect("fingerprint");
+        assert_ne!(
+            before, edited,
+            "target bytes did not change the fingerprint"
+        );
+        fs::write(&target, b"#!/bin/sh\necho one\n").expect("restore");
+        let restored = super::hooks_fingerprint(work).expect("fingerprint");
+        assert_eq!(before, restored);
+        let mut permissions = fs::symlink_metadata(&target).expect("meta").permissions();
+        permissions.set_mode(permissions.mode() ^ 0o111);
+        fs::set_permissions(&target, permissions).expect("chmod");
+        let chmodded = super::hooks_fingerprint(work).expect("fingerprint");
+        assert_ne!(
+            restored, chmodded,
+            "target mode did not change the fingerprint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hooks_fingerprint_rejects_a_symlink_cycle() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp");
+        let work = root.path();
+        let hooks = init_hooks(work);
+        symlink("b", hooks.join("a")).expect("a");
+        symlink("a", hooks.join("b")).expect("b");
+        let err = super::hooks_fingerprint(work).expect_err("cycle");
+        assert!(err.starts_with("hooks:"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hooks_fingerprint_rejects_a_directory_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temp");
+        let work = root.path();
+        let hooks = init_hooks(work);
+        let outside = work.join("hookdir");
+        fs::create_dir_all(&outside).expect("dir");
+        fs::write(outside.join("pre-commit"), b"#!/bin/sh\n").expect("script");
+        symlink("../../hookdir", hooks.join("linked")).expect("symlink");
+        let err = super::hooks_fingerprint(work).expect_err("directory symlink");
+        assert!(
+            err.starts_with("hooks:") && err.contains("directory"),
+            "{err}"
+        );
     }
 }

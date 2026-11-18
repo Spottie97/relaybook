@@ -1383,7 +1383,7 @@ impl Ledger {
             }
             if capture_mark(conn)? != stored_mark {
                 return Err(Error::InvalidSetting(
-                    "ledger changed during review".to_string(),
+                    LEDGER_CHANGED_DURING_REVIEW.to_string(),
                 ));
             }
             if scope == "release"
@@ -2082,6 +2082,12 @@ const LIVE_RUN_OWNS: &str = "a gated run owns this; use relaybook approve / run 
 /// would approve a different review.
 pub const STALE_REVIEW_INVOCATION: &str = "stale review invocation";
 
+/// Stop reason when the mark stored for a review no longer matches.
+///
+/// The mark is the maximum id of `events`, `reports`, `decisions`, and
+/// `steps`, plus the latest `tasks.updated_at`. It is not every database write.
+pub const LEDGER_CHANGED_DURING_REVIEW: &str = "ledger changed during review";
+
 /// The task report read before graph refresh is not the report still stored.
 pub const REPORT_CHANGED_DURING_REFRESH: &str = "report changed during graph refresh";
 
@@ -2140,7 +2146,10 @@ pub enum ReviewInvocationOutcome {
 /// Check the invocation and apply `action` in one write.
 ///
 /// A review that is no longer pending, or a run whose `write_stamp` has moved,
-/// is left unchanged. A waiting checkpoint is also left unchanged.
+/// is left unchanged. A waiting checkpoint is left unchanged unless the run
+/// stops. When the ledger mark stored on this review no longer matches, the
+/// run stops with [`LEDGER_CHANGED_DURING_REVIEW`] and the caller does not
+/// retry, pause, or record a verdict.
 pub fn apply_review_invocation(
     ledger: &mut Ledger,
     review_id: i64,
@@ -2161,6 +2170,16 @@ pub fn apply_review_invocation(
         if run.write_stamp != run_generation || !invocation_run_is_live(&run) {
             return Ok(ReviewInvocationOutcome::Stale);
         }
+        // The mark is the one stored when this review started. Check it before
+        // any failure, pause, or halt is applied, so a mutation cannot become
+        // the next review's baseline.
+        let action = if review_ledger_mark_changed(conn, &review)? {
+            ReviewInvocationAction::Halt {
+                reason: LEDGER_CHANGED_DURING_REVIEW.to_string(),
+            }
+        } else {
+            action
+        };
         let settings = crate::settings::load(conn)?;
         if run.workflow.as_deref().unwrap_or("classic") != settings.workflow {
             run.status = "stopped".to_string();
@@ -2207,6 +2226,11 @@ pub fn apply_review_invocation(
             run: Box::new(run),
         })
     })
+}
+
+fn review_ledger_mark_changed(conn: &Connection, review: &Review) -> Result<bool, Error> {
+    let (stored, _) = decode_mark(&review.ledger_mark)?;
+    Ok(capture_mark(conn)? != stored)
 }
 
 fn review_invocation_current(

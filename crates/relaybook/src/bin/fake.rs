@@ -321,6 +321,10 @@ fn codex(args: &[String]) {
             let _ = fs::create_dir_all(".git/hooks");
             let _ = fs::write(".git/hooks/pre-commit", "#!/bin/sh\n");
         }
+        "hook-target" => {
+            // Edit the file a hook symlink points at. Leave the link unchanged.
+            let _ = fs::write(".git/shared-pre-commit", "#!/bin/sh\necho changed\n");
+        }
         "ledger" => {
             relay(&[
                 "decision",
@@ -331,6 +335,32 @@ fn codex(args: &[String]) {
                 "--by",
                 "codex",
             ]);
+        }
+        "ledger-fail" => {
+            relay(&[
+                "decision",
+                "log",
+                "work",
+                "--why",
+                "reviewer wrote",
+                "--by",
+                "codex",
+            ]);
+            write_out(out.as_deref(), "");
+            std::process::exit(1);
+        }
+        "ledger-garbage" => {
+            relay(&[
+                "decision",
+                "log",
+                "work",
+                "--why",
+                "reviewer wrote",
+                "--by",
+                "codex",
+            ]);
+            write_out(out.as_deref(), "not json\n");
+            return;
         }
         "garbage" => {
             write_out(out.as_deref(), "not json\n");

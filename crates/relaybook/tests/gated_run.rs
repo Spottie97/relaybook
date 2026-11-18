@@ -2298,6 +2298,148 @@ fn reviewer_edit_branch_or_ledger_write_halts() {
     }
 }
 
+fn assert_ledger_mutation_halts_without_retry(kind: &str) {
+    let repo = gated_repo();
+    let probes = install_probes();
+    let mut cmd = relaybook(repo.path());
+    apply_probes(&mut cmd, &probes);
+    cmd.env("RELAYBOOK_FAKE_KIND", kind);
+    cmd.env("RELAYBOOK_FAKE_REVIEWER_ONLY", "1");
+    cmd.args(["run", "--prd", "prd.md", "--gates", "none"]);
+    let output = cmd.output().expect("run");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{kind}: {text}");
+    assert!(
+        text.contains("ledger changed during review"),
+        "{kind}: {text}"
+    );
+    assert!(
+        !text.contains("two consecutive"),
+        "{kind} retried the failure: {text}"
+    );
+    assert_eq!(
+        codex_exec_count(&probes.log),
+        1,
+        "{kind} invoked codex more than once:\n{}",
+        codex_lines(&probes.log)
+    );
+    assert_eq!(failure_streak(repo.path()), 0, "{kind}: {text}");
+    let row = run_row(repo.path());
+    assert_eq!(row.status, "stopped", "{kind}: {text}");
+    assert_eq!(
+        row.stop_reason.as_deref(),
+        Some("ledger changed during review"),
+        "{kind}: {text}"
+    );
+    let reviews = stored_reviews(repo.path());
+    assert!(
+        !reviews.is_empty() && reviews.iter().all(|review| review.verdict.is_none()),
+        "{kind}: {reviews:?}\n{text}"
+    );
+    assert!(
+        report_verdicts(repo.path())
+            .iter()
+            .all(|verdict| verdict.is_none()),
+        "{kind}: {:?}",
+        report_verdicts(repo.path())
+    );
+    assert!(
+        bare_relaybook_refs(&repo.bare).is_empty(),
+        "{kind} pushed: {}",
+        bare_relaybook_refs(&repo.bare)
+    );
+    assert!(!probes.log.join("gh.args").exists(), "{kind} opened a pr");
+}
+
+#[test]
+fn ledger_mutation_plus_failure_halts_without_retry() {
+    assert_ledger_mutation_halts_without_retry("ledger-fail");
+}
+
+#[test]
+fn ledger_mutation_plus_malformed_output_halts_without_retry() {
+    assert_ledger_mutation_halts_without_retry("ledger-garbage");
+}
+
+#[cfg(unix)]
+#[test]
+fn reviewer_symlink_hook_target_edit_halts() {
+    let repo = gated_repo();
+    let hooks = repo.path().join(".git/hooks");
+    fs::create_dir_all(&hooks).expect("hooks");
+    let target = repo.path().join(".git/shared-pre-commit");
+    fs::write(&target, "#!/bin/sh\necho original\n").expect("target");
+    std::os::unix::fs::symlink("../shared-pre-commit", hooks.join("pre-commit")).expect("symlink");
+    let probes = install_probes();
+    let mut cmd = relaybook(repo.path());
+    apply_probes(&mut cmd, &probes);
+    cmd.env("RELAYBOOK_FAKE_KIND", "hook-target");
+    cmd.env("RELAYBOOK_FAKE_REVIEWER_ONLY", "1");
+    cmd.args(["run", "--prd", "prd.md", "--gates", "none"]);
+    let output = cmd.output().expect("run");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(1), "{text}");
+    assert!(text.contains("reviewer changed hooks"), "{text}");
+    assert_eq!(
+        codex_exec_count(&probes.log),
+        1,
+        "{}",
+        codex_lines(&probes.log)
+    );
+    let row = run_row(repo.path());
+    assert_eq!(row.status, "stopped", "{text}");
+    assert_eq!(
+        row.stop_reason.as_deref(),
+        Some("reviewer changed hooks"),
+        "{text}"
+    );
+    let reviews = stored_reviews(repo.path());
+    assert!(
+        !reviews.is_empty() && reviews.iter().all(|review| review.verdict.is_none()),
+        "{reviews:?}\n{text}"
+    );
+    assert!(
+        bare_relaybook_refs(&repo.bare).is_empty(),
+        "pushed: {}",
+        bare_relaybook_refs(&repo.bare)
+    );
+    assert!(!probes.log.join("gh.args").exists());
+    let link = fs::read_link(hooks.join("pre-commit")).expect("link");
+    assert_eq!(link, PathBuf::from("../shared-pre-commit"));
+}
+
+#[test]
+fn auto_mode_docs_qualify_snapshot_and_ledger_mark() {
+    let docs =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/auto-mode.md"))
+            .expect("docs");
+    assert!(
+        !docs.contains("a hooks change, a tag, a push, or a ledger write"),
+        "snapshot coverage is overstated"
+    );
+    assert!(
+        docs.contains("does not see a push that left no local ref change"),
+        "{docs}"
+    );
+    assert!(docs.contains("It is not every database write"), "{docs}");
+    assert!(
+        docs.contains("maximum id of events, reports, decisions, and steps"),
+        "{docs}"
+    );
+    assert!(
+        docs.contains("does not count the failure or retry"),
+        "{docs}"
+    );
+}
+
 #[test]
 fn codex_oversized_packet_halts_before_exec() {
     let repo = gated_repo();
