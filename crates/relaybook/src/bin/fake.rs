@@ -334,38 +334,64 @@ fn claude_reviewer(args: &[String]) {
         }
         "wrong-model" => {
             let result = verdict_json(args, "approved");
+            // Captured envelope model from claude-envelope-evidence.md. No top-level model.
             println!(
                 "{}",
-                serde_json::json!({
-                    "type": "result",
-                    "result": result.trim(),
-                    "model": "claude-haiku-0",
-                })
+                claude_envelope(result.trim(), &[("claude-opus-5-5", "claude-opus-5-5")])
             );
         }
         "changes" => {
             let result = verdict_json(args, "changes-requested");
             println!(
                 "{}",
-                serde_json::json!({
-                    "type": "result",
-                    "result": result.trim(),
-                    "model": "claude-sonnet-5-5",
-                })
+                claude_envelope(result.trim(), &[("claude-sonnet-5-5", "claude-sonnet-5-5")])
             );
         }
         _ => {
             let result = verdict_json(args, "approved");
             println!(
                 "{}",
-                serde_json::json!({
-                    "type": "result",
-                    "result": result.trim(),
-                    "model": "claude-sonnet-5-5",
-                })
+                claude_envelope(result.trim(), &[("claude-sonnet-5-5", "claude-sonnet-5-5")])
             );
         }
     }
+}
+
+/// JSON envelope shape from claude-envelope-evidence.md (Claude Code 2.1.325).
+/// That capture has no top-level `model`. It used `claude-opus-5-5`. A real
+/// Sonnet envelope has not been captured; the pinned id is substituted here.
+fn claude_envelope(result: &str, usage: &[(&str, &str)]) -> String {
+    let mut model_usage = serde_json::Map::new();
+    for (key, canonical) in usage {
+        model_usage.insert(
+            (*key).to_string(),
+            serde_json::json!({
+                "inputTokens": 44,
+                "outputTokens": 32677,
+                "cacheReadInputTokens": 1461950,
+                "cacheCreationInputTokens": 110819,
+                "webSearchRequests": 0,
+                "costUSD": 1.832658,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 128000,
+                "thinkingTokens": 20638,
+                "cacheCreationEphemeral5mInputTokens": 0,
+                "cacheCreationEphemeral1hInputTokens": 110819,
+                "canonicalModel": canonical,
+                "provider": "firstParty",
+                "costBasis": "list"
+            }),
+        );
+    }
+    serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "permission_denials": [],
+        "result": result,
+        "modelUsage": model_usage,
+    })
+    .to_string()
 }
 
 fn codex(args: &[String]) {

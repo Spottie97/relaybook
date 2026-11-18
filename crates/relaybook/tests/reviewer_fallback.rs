@@ -804,20 +804,11 @@ fn report_replaced_during_sonnet_review_is_not_accepted() {
         "sonnet did not start\n{}",
         held_output(&probes, "held")
     );
-    let changed = db(repo.path())
-        .execute(
-            "UPDATE tasks SET updated_at = '2099-01-01T00:00:00.000Z' WHERE slug = 'work'",
-            [],
-        )
-        .expect("replace");
-    assert_eq!(changed, 1);
+    replace_done_report(repo.path(), "work", "replacement-during-sonnet");
     fs::write(hold.join("release-1"), "go\n").expect("release");
     let _ = wait_child(&mut child, Duration::from_secs(30));
     let text = held_output(&probes, "held");
-    assert!(
-        text.contains("ledger changed during review") || text.contains("stale review invocation"),
-        "{text}"
-    );
+    assert!(text.contains("ledger changed during review"), "{text}");
     let approved: i64 = db(repo.path())
         .query_row(
             "SELECT COUNT(*) FROM reviews WHERE reviewer = 'claude' AND verdict = 'approved'",
@@ -826,6 +817,62 @@ fn report_replaced_during_sonnet_review_is_not_accepted() {
         )
         .unwrap_or(0);
     assert_eq!(approved, 0, "{text}");
+    let reports = report_rows(repo.path());
+    assert!(
+        reports.iter().any(|(body, verdict)| {
+            body.contains("replacement-during-sonnet") && verdict.is_none()
+        }),
+        "the replacement report was accepted\n{reports:?}\n{text}"
+    );
+    assert!(
+        reports
+            .iter()
+            .all(|(_, verdict)| verdict.as_deref() != Some("accepted")),
+        "a report was accepted\n{reports:?}\n{text}"
+    );
+}
+
+fn report_rows(dir: &Path) -> Vec<(String, Option<String>)> {
+    let conn = db(dir);
+    let mut stmt = conn
+        .prepare("SELECT body, verdict FROM reports ORDER BY id")
+        .expect("prepare");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("reports")
+}
+
+/// Reopen and complete the task while a review is in progress, the same path
+/// the R10 report-replacement tests use.
+fn replace_done_report(dir: &Path, slug: &str, changed: &str) {
+    let head = head_sha(dir);
+    let mut ledger =
+        relaybook_core::Ledger::open(&dir.join(".relaybook").join("ledger.db")).expect("ledger");
+    ledger
+        .reopen_task(slug, "replaced during review")
+        .expect("reopen");
+    let claimed_head = head.clone();
+    ledger
+        .claim_task_anchored(slug, "cursor", None, move || Ok(Some(claimed_head)))
+        .expect("claim");
+    ledger
+        .finish_task(
+            slug,
+            Some(relaybook_core::Sections {
+                changed: vec![changed.to_string()],
+                verified: Vec::new(),
+                not_verified: Vec::new(),
+                deviations: Vec::new(),
+                review: Vec::new(),
+            }),
+            Some(&head),
+        )
+        .expect("finish");
+    drop(ledger);
+    db(dir)
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .expect("checkpoint");
 }
 
 fn run_state(dir: &Path) -> (i64, String, String, String) {

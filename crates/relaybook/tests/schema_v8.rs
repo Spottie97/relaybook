@@ -175,3 +175,49 @@ fn raise_message_reaches_the_user() {
 fn fs_write_seed(dir: &Path) {
     std::fs::write(dir.join("README.md"), "seed\n").expect("readme");
 }
+
+#[test]
+fn restoring_only_the_rereview_trigger_reports_ledger_guard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    git(dir.path(), &["init", "-b", "main"]);
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    run(dir.path(), ["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+    let db = dir.path().join(".relaybook").join("ledger.db");
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute("DROP TRIGGER relaybook_guard_rereview_authorize", [])
+            .expect("drop");
+        let others: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'trigger' AND name LIKE 'relaybook_guard_%'
+                   AND name != 'relaybook_guard_rereview_authorize'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert!(others >= 5, "other guards were dropped too: {others}");
+    }
+    let output = json_output(dir.path(), &["task", "list", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("json");
+    assert_eq!(envelope["ok"], json!(true));
+    assert_eq!(envelope["data"]["ledger_guard"], json!("restored"));
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'trigger' AND name = 'relaybook_guard_rereview_authorize'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("trigger restored");
+        assert!(sql.contains("selected.run_id"), "{sql}");
+    }
+}

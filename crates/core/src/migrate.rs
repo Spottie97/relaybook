@@ -340,8 +340,10 @@ fn pause_before_adding_invocation_token(conn: &Connection) {
 }
 
 /// Recreate any missing schema-8 trigger. Returns whether one was missing.
-/// Also installs [`ONE_LIVE_GATED_INDEX`] so a ledger already at version 8
-/// gains it on the next read-write open.
+/// A missing or outdated `relaybook_guard_rereview_authorize` counts, so a
+/// gated open reports `ledger_guard` `restored` when that trigger alone was
+/// replaced. Also installs [`ONE_LIVE_GATED_INDEX`] so a ledger already at
+/// version 8 gains it on the next read-write open.
 pub(crate) fn ensure_guards(conn: &Connection) -> Result<bool, Error> {
     debug_assert!(
         GUARDS.contains(GUARD_MESSAGE),
@@ -349,18 +351,19 @@ pub(crate) fn ensure_guards(conn: &Connection) -> Result<bool, Error> {
     );
     ensure_one_live_gated(conn)?;
     ensure_review_invocation_token(conn)?;
+    let rereview_current = rereview_trigger_current(conn)?;
     ensure_reviewer_fallback(conn)?;
-    let mut missing = false;
+    let mut guard_missing = false;
     for name in GUARD_NAMES {
         if !trigger_exists(conn, name)? {
-            missing = true;
+            guard_missing = true;
             break;
         }
     }
-    if missing {
+    if guard_missing {
         conn.execute_batch(GUARDS)?;
     }
-    Ok(missing)
+    Ok(guard_missing || !rereview_current)
 }
 
 fn trigger_exists(conn: &Connection, name: &str) -> Result<bool, Error> {

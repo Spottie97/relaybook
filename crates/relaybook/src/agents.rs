@@ -309,8 +309,17 @@ const CODEX_LIMIT_SIGNATURES: &[(&str, &str)] = &[
 /// `codex --version` lines this build will treat as a usage limit.
 const CODEX_VERIFIED_VERSIONS: &[&str] = &["codex-cli 0.169.0"];
 
-/// Stderr phrases that stay on the ordinary failure path even if a limit phrase is also present.
-const CODEX_ORDINARY_SIGNATURES: &[&str] = &["401", "input_too_large", "Not logged in"];
+/// Phrases on an `ERROR: ` line that keep the failure ordinary.
+/// `exceeded retry limit` is the plain-429 line from V3 E2. `unexpected status`
+/// is the 401 line from that same capture. They veto on every remaining
+/// `ERROR: ` line, not only the last one.
+const CODEX_ORDINARY_SIGNATURES: &[&str] = &[
+    "401",
+    "input_too_large",
+    "Not logged in",
+    "exceeded retry limit",
+    "unexpected status",
+];
 
 /// Read-only tools the Sonnet reviewer is allowed to name.
 const SONNET_REVIEW_TOOLS: &str = "Read,Grep,Glob";
@@ -576,62 +585,118 @@ fn write_private_schema(schema: &Path, schema_text: &str) -> Result<(), String> 
     Ok(())
 }
 
-fn read_codex_output(out: &Path, share_user: Option<&str>) -> Result<String, String> {
+struct ValidatedOutput {
+    len: u64,
+    /// Opened regular file. `None` when the path is missing. Callers that
+    /// classify a failed exit drop this without reading.
+    file: Option<std::fs::File>,
+}
+
+/// Parent directory of `-o`, without following a symlink.
+fn codex_output_dir(out: &Path) -> Result<std::fs::Metadata, String> {
+    let Some(parent) = out.parent() else {
+        return Err("codex output has no directory".to_string());
+    };
+    let parent_meta = std::fs::symlink_metadata(parent).map_err(|err| err.to_string())?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        return Err("codex output directory is not a real directory".to_string());
+    }
     #[cfg(unix)]
     {
-        use std::io::Read;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-        let Some(parent) = out.parent() else {
-            return Err("codex output has no directory".to_string());
-        };
-        let parent_meta = std::fs::symlink_metadata(parent).map_err(|err| err.to_string())?;
-        if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
-            return Err("codex output directory is not a real directory".to_string());
-        }
+        use std::os::unix::fs::PermissionsExt;
         if parent_meta.permissions().mode() & 0o007 != 0 {
             return Err("codex output directory is world-accessible".to_string());
         }
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(o_nofollow())
-            .open(out)
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    "codex output is missing".to_string()
-                } else {
-                    "codex output is not a regular file".to_string()
-                }
-            })?;
-        let meta = file.metadata().map_err(|err| err.to_string())?;
-        if !meta.is_file() {
+    }
+    Ok(parent_meta)
+}
+
+/// Metadata for `-o`. A symlink or other non-regular file is rejected before
+/// it is opened. A regular file is opened with the same ownership checks as a
+/// successful read. Nothing reads the bytes.
+fn validated_codex_output(out: &Path, share_user: Option<&str>) -> Result<ValidatedOutput, String> {
+    let parent_meta = codex_output_dir(out)?;
+    match std::fs::symlink_metadata(out) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ValidatedOutput { len: 0, file: None });
+        }
+        Err(err) => return Err(err.to_string()),
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
             return Err("codex output is not a regular file".to_string());
         }
-        if !output_uid_allowed(meta.uid(), parent_meta.uid(), share_user) {
-            return Err("codex output is not owned by the review invocation".to_string());
-        }
-        let mut text = String::new();
-        file.read_to_string(&mut text)
-            .map_err(|err| err.to_string())?;
-        if text.trim().is_empty() {
-            return Err("codex output is empty".to_string());
-        }
-        Ok(text)
+        Ok(_) => {}
     }
-    #[cfg(not(unix))]
+    open_regular_codex_output(out, &parent_meta, share_user)
+}
+
+#[cfg(unix)]
+fn open_regular_codex_output(
+    out: &Path,
+    parent_meta: &std::fs::Metadata,
+    share_user: Option<&str>,
+) -> Result<ValidatedOutput, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(o_nofollow())
+        .open(out)
     {
-        let _ = share_user;
-        let text = std::fs::read_to_string(out).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                "codex output is missing".to_string()
-            } else {
-                err.to_string()
-            }
-        })?;
-        if text.trim().is_empty() {
-            return Err("codex output is empty".to_string());
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ValidatedOutput { len: 0, file: None });
         }
-        Ok(text)
+        Err(_) => return Err("codex output is not a regular file".to_string()),
+    };
+    let meta = file.metadata().map_err(|err| err.to_string())?;
+    if !meta.is_file() {
+        return Err("codex output is not a regular file".to_string());
     }
+    if !output_uid_allowed(meta.uid(), parent_meta.uid(), share_user) {
+        return Err("codex output is not owned by the review invocation".to_string());
+    }
+    Ok(ValidatedOutput {
+        len: meta.len(),
+        file: Some(file),
+    })
+}
+
+#[cfg(not(unix))]
+fn open_regular_codex_output(
+    out: &Path,
+    parent_meta: &std::fs::Metadata,
+    share_user: Option<&str>,
+) -> Result<ValidatedOutput, String> {
+    let _ = (parent_meta, share_user);
+    let file = match std::fs::File::open(out) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ValidatedOutput { len: 0, file: None });
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    let meta = file.metadata().map_err(|err| err.to_string())?;
+    if !meta.is_file() {
+        return Err("codex output is not a regular file".to_string());
+    }
+    Ok(ValidatedOutput {
+        len: meta.len(),
+        file: Some(file),
+    })
+}
+
+fn read_codex_output(out: &Path, share_user: Option<&str>) -> Result<String, String> {
+    use std::io::Read;
+    let validated = validated_codex_output(out, share_user)?;
+    let Some(mut file) = validated.file else {
+        return Err("codex output is missing".to_string());
+    };
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|err| err.to_string())?;
+    if text.trim().is_empty() {
+        return Err("codex output is empty".to_string());
+    }
+    Ok(text)
 }
 
 #[cfg(unix)]
@@ -853,7 +918,15 @@ pub(crate) fn call_codex(
         live.observe(&crate::stream::Piece::Text(line.to_string()));
     }
     if !status.success() {
-        return classify_codex_failure(status.code(), &stdout, &stderr, out, prompt, &packet_sent);
+        return classify_codex_failure(
+            status.code(),
+            &stdout,
+            &stderr,
+            out,
+            prompt,
+            &packet_sent,
+            share_user.as_deref(),
+        );
     }
     match read_codex_output(out, share_user.as_deref()) {
         Ok(text) => AgentResult::Finished {
@@ -904,14 +977,53 @@ fn classify_codex_failure(
     out: &Path,
     prompt: &str,
     packet: &str,
+    share_user: Option<&str>,
 ) -> AgentResult {
-    let file = match std::fs::read_to_string(out) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(_) => "unreadable".to_string(),
+    classify_failed_codex_exit(
+        code,
+        stdout,
+        stderr,
+        out,
+        prompt,
+        packet,
+        &codex_version(),
+        share_user,
+    )
+}
+
+/// Classify a non-zero Codex exit without reading `-o`.
+///
+/// Missing, or a validated regular file of length 0, can be a limit. Any other
+/// length is ordinary. A symlink, another non-regular file, or a failed
+/// ownership check is an ordinary failure carrying the same guard text as a
+/// successful read. The opened file is dropped here and is not read.
+#[allow(clippy::too_many_arguments)] // exit, streams, path, echo inputs, version, and owner
+fn classify_failed_codex_exit(
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    out: &Path,
+    prompt: &str,
+    packet: &str,
+    version: &str,
+    share_user: Option<&str>,
+) -> AgentResult {
+    let out_marker = match validated_codex_output(out, share_user) {
+        Ok(validated) => {
+            let empty = validated.len == 0;
+            drop(validated.file);
+            if empty { "" } else { "present" }
+        }
+        Err(err) => {
+            return AgentResult::Failed {
+                output: format!(
+                    "{err}\ncodex exited {}\n{stdout}\n{stderr}",
+                    code.unwrap_or(-1)
+                ),
+            };
+        }
     };
-    let version = codex_version();
-    match classify_codex_exit(code, stderr, stdout, &file, &version, prompt, packet) {
+    match classify_codex_exit(code, stderr, stdout, out_marker, version, prompt, packet) {
         CodexExit::Limited { signature } => AgentResult::UsageLimit {
             cli: "codex".to_string(),
             reset_at: None,
@@ -960,14 +1072,18 @@ pub(crate) fn codex_version() -> String {
 }
 
 /// A usage limit only when every signal is present. Stdout is ignored.
-/// The `-o` text is `out`. A phrase in stdout or in `out` is not a limit.
+/// `out` is empty only for a missing path or a regular file of length 0.
+/// A non-empty marker means the file has bytes. Whitespace is not empty.
+/// A phrase in stdout or in `out` is not a limit.
 ///
 /// `codex exec` prints the prompt, and the stdin packet inside `<stdin>`, on
 /// stderr (`user` plus that text). That echo is removed before matching.
-/// Only `ERROR: ` lines after the echo count, and the last of those lines
-/// must itself be a limit signature. Zero copies of the echo is not an echo.
-/// More than one copy, or sent text that could spoof a limit when the echo
-/// cannot be found, is an ordinary failure.
+/// Only `ERROR: ` lines after the echo count. An ordinary signature on any
+/// of those lines vetoes a limit. The last of those lines must also itself
+/// be a limit signature. That last-line rule is extra and does not replace
+/// the veto. Zero copies of the echo is not an echo. More than one copy, or
+/// sent text that could spoof a limit when the echo cannot be found, is an
+/// ordinary failure.
 pub(crate) fn classify_codex_exit(
     code: Option<i32>,
     stderr: &str,
@@ -978,30 +1094,33 @@ pub(crate) fn classify_codex_exit(
     packet: &str,
 ) -> CodexExit {
     let _ = stdout;
-    if code == Some(0) && !out.trim().is_empty() {
+    let out_empty = out.is_empty();
+    if code == Some(0) && !out_empty {
         return CodexExit::Ok;
     }
     let version_ok = CODEX_VERIFIED_VERSIONS
         .iter()
         .any(|item| version.trim() == *item);
-    if code != Some(1) || !out.trim().is_empty() || !version_ok {
+    if code != Some(1) || !out_empty || !version_ok {
         return CodexExit::Ordinary;
     }
     let region = match stderr_after_codex_echo(stderr, prompt, packet) {
         Some(region) => region,
         None => return CodexExit::Ordinary,
     };
-    let mut errors = region
+    let errors: Vec<&str> = region
         .lines()
         .map(|line| line.trim_end_matches('\r'))
-        .filter(|line| line.starts_with("ERROR: "));
-    let Some(last) = errors.next_back() else {
+        .filter(|line| line.starts_with("ERROR: "))
+        .collect();
+    let Some(last) = errors.last().copied() else {
         return CodexExit::Ordinary;
     };
-    if CODEX_ORDINARY_SIGNATURES
-        .iter()
-        .any(|phrase| last.contains(phrase))
-    {
+    if errors.iter().any(|line| {
+        CODEX_ORDINARY_SIGNATURES
+            .iter()
+            .any(|phrase| line.contains(phrase))
+    }) {
         return CodexExit::Ordinary;
     }
     if let Some((id, _)) = CODEX_LIMIT_SIGNATURES
@@ -1275,7 +1394,9 @@ fn review_tools_only(listed: &str) -> bool {
 }
 
 /// Read-only Claude review. A forbidden argv is refused before the process
-/// is resolved. An error, a limit, or a model other than the pin is `Failed`.
+/// is resolved. An error, a limit, a missing `modelUsage`, or any model other
+/// than the pin is `Failed` and is never an approval. The model string is the
+/// `modelUsage` key, which has to equal `canonicalModel` and the pin.
 pub(crate) fn call_claude_reviewer(
     cwd: &Path,
     prompt: &str,
@@ -1362,9 +1483,9 @@ pub(crate) fn call_claude_reviewer(
     }
     match parse_claude_review_envelope(&stdout) {
         Ok((result, model)) => {
-            if let Some(model) = model.as_deref()
-                && model != relaybook_core::SONNET_REVIEW_MODEL
-            {
+            // `model` is the `modelUsage` key. The review row stores that same
+            // pin when the review starts; a mismatch never reaches record.
+            if model != relaybook_core::SONNET_REVIEW_MODEL {
                 return AgentResult::Failed {
                     output: format!("claude model {model} is not the pinned reviewer"),
                 };
@@ -1381,7 +1502,12 @@ pub(crate) fn call_claude_reviewer(
     }
 }
 
-fn parse_claude_review_envelope(stdout: &str) -> Result<(String, Option<String>), String> {
+/// The result text and the model recorded from `modelUsage`.
+///
+/// The installed CLI has no top-level `model`. Every `modelUsage` entry's key
+/// and `canonicalModel` must be the pinned Sonnet id. A missing or empty
+/// `modelUsage` fails closed. A top-level `model`, when present, must match too.
+fn parse_claude_review_envelope(stdout: &str) -> Result<(String, String), String> {
     let text = stdout.trim();
     let value: serde_json::Value = serde_json::from_str(text)
         .map_err(|_| "claude output is not one JSON object".to_string())?;
@@ -1395,11 +1521,45 @@ fn parse_claude_review_envelope(stdout: &str) -> Result<(String, Option<String>)
         .get("result")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "claude output has no result".to_string())?;
-    let model = object
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
+    let model = claude_model_from_usage(object)?;
+    if let Some(top) = object.get("model") {
+        let Some(top) = top.as_str() else {
+            return Err("claude model is not the pinned reviewer".to_string());
+        };
+        if top != relaybook_core::SONNET_REVIEW_MODEL {
+            return Err(format!("claude model {top} is not the pinned reviewer"));
+        }
+    }
     Ok((result.to_string(), model))
+}
+
+fn claude_model_from_usage(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, String> {
+    let Some(usage) = object
+        .get("modelUsage")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Err("claude output has no modelUsage".to_string());
+    };
+    if usage.is_empty() {
+        return Err("claude output has no modelUsage".to_string());
+    }
+    let mut recorded = None;
+    for (key, entry) in usage {
+        let canonical = entry
+            .as_object()
+            .and_then(|item| item.get("canonicalModel"))
+            .and_then(serde_json::Value::as_str);
+        if key != relaybook_core::SONNET_REVIEW_MODEL
+            || canonical != Some(relaybook_core::SONNET_REVIEW_MODEL)
+        {
+            let shown = canonical.unwrap_or(key.as_str());
+            return Err(format!("claude model {shown} is not the pinned reviewer"));
+        }
+        recorded = Some(key.clone());
+    }
+    recorded.ok_or_else(|| "claude output has no modelUsage".to_string())
 }
 
 fn forbidden_codex_arg(args: &[String]) -> Option<&str> {
@@ -1668,10 +1828,11 @@ mod tests {
 
     use super::{
         AccountKind, Accounts, AgentResult, CodexExit, CodexSandbox, account_line, classify,
-        classify_codex_exit, claude_account, codex_args, codex_echoed_prompt,
-        codex_login_status_args, codex_output_file, forbidden_claude_review_arg,
-        forbidden_codex_arg, parse_codex_retry_after, parse_codex_verdict, path_is_inside,
-        prepare_codex_output, read_codex_output, review_input_too_large, sonnet_review_args,
+        classify_codex_exit, classify_failed_codex_exit, claude_account, codex_args,
+        codex_echoed_prompt, codex_login_status_args, codex_output_file,
+        forbidden_claude_review_arg, forbidden_codex_arg, parse_claude_review_envelope,
+        parse_codex_retry_after, parse_codex_verdict, path_is_inside, prepare_codex_output,
+        read_codex_output, review_input_too_large, sonnet_review_args,
     };
 
     #[test]
@@ -2210,6 +2371,208 @@ mod tests {
         assert!(
             matches!(limit_of(USAGE, prompt, &packet), CodexExit::Ordinary),
             "sent limit text with no located echo is ordinary"
+        );
+    }
+
+    /// Ordinary signatures veto on every remaining `ERROR: ` line. The last
+    /// line being a limit is an extra condition, not a replacement for that veto.
+    #[test]
+    fn ordinary_signature_on_any_error_line_vetoes_a_later_limit() {
+        let auth = "ERROR: unexpected status 401 Unauthorized: bad key, url: \u{2026}";
+        let plain = "ERROR: exceeded retry limit, last status: 429 Too Many Requests";
+        let quota_then_auth = format!("{QUOTA}\n{auth}");
+        let auth_then_quota = format!("{auth}\n{QUOTA}");
+        let plain_then_limit = format!("{plain}\n{USAGE}");
+        assert!(
+            matches!(limit_of(&auth_then_quota, "", ""), CodexExit::Ordinary),
+            "401 then quota"
+        );
+        assert!(
+            matches!(limit_of(&quota_then_auth, "", ""), CodexExit::Ordinary),
+            "quota then 401"
+        );
+        assert!(
+            matches!(limit_of(&plain_then_limit, "", ""), CodexExit::Ordinary),
+            "plain 429 then limit"
+        );
+        assert!(
+            matches!(
+                limit_of(USAGE, "", ""),
+                CodexExit::Limited { signature } if signature == "usage_limit"
+            ),
+            "limit alone"
+        );
+        assert!(
+            matches!(
+                classify_codex_exit(Some(1), USAGE, "", " \n", VERSION, "", ""),
+                CodexExit::Ordinary
+            ),
+            "whitespace in -o is not empty"
+        );
+    }
+
+    /// `-o` on a failed exit is classified from metadata. The file is not read.
+    #[test]
+    fn failed_codex_exit_classifies_output_from_metadata() {
+        let dir = tempfile::tempdir().expect("temp");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::symlink_metadata(dir.path())
+                .expect("dir meta")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(dir.path(), permissions).expect("private dir");
+        }
+        let out = dir.path().join("codex-last.md");
+        std::fs::write(&out, " \n\t").expect("whitespace");
+        let whitespace =
+            classify_failed_codex_exit(Some(1), "", USAGE, &out, "", "", VERSION, None);
+        assert!(
+            matches!(whitespace, AgentResult::Failed { .. }),
+            "whitespace-only is not empty: {whitespace:?}"
+        );
+        assert!(
+            !matches!(whitespace, AgentResult::UsageLimit { .. }),
+            "whitespace-only must not be a limit: {whitespace:?}"
+        );
+
+        std::fs::write(&out, "").expect("empty");
+        let empty = classify_failed_codex_exit(Some(1), "", USAGE, &out, "", "", VERSION, None);
+        assert!(
+            matches!(empty, AgentResult::UsageLimit { ref output, .. } if output.starts_with("usage_limit\n")),
+            "0-byte regular file plus the limit transcript: {empty:?}"
+        );
+
+        std::fs::remove_file(&out).expect("remove");
+        let missing = classify_failed_codex_exit(Some(1), "", USAGE, &out, "", "", VERSION, None);
+        assert!(
+            matches!(missing, AgentResult::UsageLimit { .. }),
+            "missing -o plus the limit transcript: {missing:?}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            symlink("/dev/zero", &out).expect("symlink");
+            let linked =
+                classify_failed_codex_exit(Some(1), "", USAGE, &out, "", "", VERSION, None);
+            let AgentResult::Failed { output } = linked else {
+                panic!("symlink to /dev/zero must be ordinary, not a limit: {linked:?}");
+            };
+            assert!(
+                output.contains("not a regular file"),
+                "symlink must hit the output guard without a read: {output}"
+            );
+            assert!(
+                !output.contains("usage_limit"),
+                "symlink must not be classified as a limit: {output}"
+            );
+        }
+    }
+
+    /// `modelUsage` entry from claude-envelope-evidence.md. That capture used
+    /// `claude-opus-5-5`. A real Sonnet envelope has not been captured; tests
+    /// substitute the pinned id into this shape. There is no top-level `model`.
+    fn claude_usage_entry(canonical: &str) -> serde_json::Value {
+        serde_json::json!({
+            "inputTokens": 44,
+            "outputTokens": 32677,
+            "cacheReadInputTokens": 1461950,
+            "cacheCreationInputTokens": 110819,
+            "webSearchRequests": 0,
+            "costUSD": 1.832658,
+            "contextWindow": 1000000,
+            "maxOutputTokens": 128000,
+            "thinkingTokens": 20638,
+            "cacheCreationEphemeral5mInputTokens": 0,
+            "cacheCreationEphemeral1hInputTokens": 110819,
+            "canonicalModel": canonical,
+            "provider": "firstParty",
+            "costBasis": "list"
+        })
+    }
+
+    fn claude_envelope(models: &[(&str, &str)], top_model: Option<&str>) -> String {
+        let mut usage = serde_json::Map::new();
+        for (key, canonical) in models {
+            usage.insert((*key).to_string(), claude_usage_entry(canonical));
+        }
+        let mut object = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "permission_denials": [],
+            "result": "{\"verdict\":\"approved\"}"
+        });
+        if !models.is_empty() {
+            object["modelUsage"] = serde_json::Value::Object(usage);
+        }
+        if let Some(model) = top_model {
+            object["model"] = serde_json::Value::String(model.to_string());
+        }
+        object.to_string()
+    }
+
+    #[test]
+    fn another_model_only_in_model_usage_is_failed() {
+        let stdout = claude_envelope(&[("claude-opus-5-5", "claude-opus-5-5")], None);
+        let err = parse_claude_review_envelope(&stdout).expect_err("opus modelUsage");
+        assert!(err.contains("claude-opus-5-5"), "{err}");
+    }
+
+    #[test]
+    fn mixed_model_usage_is_failed() {
+        let stdout = claude_envelope(
+            &[
+                ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+                ("claude-opus-5-5", "claude-opus-5-5"),
+            ],
+            None,
+        );
+        let err = parse_claude_review_envelope(&stdout).expect_err("mixed modelUsage");
+        assert!(err.contains("not the pinned reviewer"), "{err}");
+    }
+
+    #[test]
+    fn missing_model_usage_is_failed() {
+        let stdout = claude_envelope(&[], Some(relaybook_core::SONNET_REVIEW_MODEL));
+        let err = parse_claude_review_envelope(&stdout).expect_err("missing modelUsage");
+        assert!(err.contains("no modelUsage"), "{err}");
+        let empty = serde_json::json!({
+            "type": "result",
+            "is_error": false,
+            "result": "ok",
+            "modelUsage": {}
+        })
+        .to_string();
+        assert!(
+            parse_claude_review_envelope(&empty)
+                .expect_err("empty modelUsage")
+                .contains("no modelUsage")
+        );
+    }
+
+    #[test]
+    fn pinned_model_usage_is_accepted() {
+        let stdout = claude_envelope(&[("claude-sonnet-5-5", "claude-sonnet-5-5")], None);
+        let (result, model) = parse_claude_review_envelope(&stdout).expect("sonnet modelUsage");
+        assert_eq!(model, relaybook_core::SONNET_REVIEW_MODEL);
+        assert!(result.contains("approved"), "{result}");
+        let with_top = claude_envelope(
+            &[("claude-sonnet-5-5", "claude-sonnet-5-5")],
+            Some(relaybook_core::SONNET_REVIEW_MODEL),
+        );
+        let (_, model) = parse_claude_review_envelope(&with_top).expect("matching top-level model");
+        assert_eq!(model, "claude-sonnet-5-5");
+        let wrong_top = claude_envelope(
+            &[("claude-sonnet-5-5", "claude-sonnet-5-5")],
+            Some("claude-opus-5-5"),
+        );
+        assert!(
+            parse_claude_review_envelope(&wrong_top)
+                .expect_err("top-level model")
+                .contains("claude-opus-5-5")
         );
     }
 
