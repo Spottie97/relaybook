@@ -258,6 +258,7 @@ fn apply_probes(cmd: &mut Command, probes: &Probes) {
     cmd.env_remove("ANTHROPIC_API_KEY");
     cmd.env_remove("RELAYBOOK_ABORT_REVIEW_TRANSITION");
     cmd.env_remove("RELAYBOOK_CODEX_USER");
+    cmd.env_remove("RELAYBOOK_FAKE_REVIEWER_ONLY");
 }
 
 fn run_probed(dir: &Path, probes: &Probes, args: &[&str]) -> std::process::Output {
@@ -2248,6 +2249,53 @@ fn codex_unparsable_output_never_accepts() {
     );
     assert!(!probes.log.join("gh.args").exists());
     assert!(bare_relaybook_refs(&repo.bare).is_empty());
+}
+
+#[test]
+fn reviewer_edit_branch_or_ledger_write_halts() {
+    let cases = [
+        ("edit", "reviewer edited the worktree"),
+        ("branch", "reviewer moved HEAD"),
+        ("tag", "created a tag"),
+        ("config", "reviewer changed git config"),
+        ("hook", "reviewer changed hooks"),
+        ("ledger", "ledger changed during review"),
+    ];
+    for (kind, reason) in cases {
+        let repo = gated_repo();
+        let probes = install_probes();
+        let mut cmd = relaybook(repo.path());
+        apply_probes(&mut cmd, &probes);
+        cmd.env("RELAYBOOK_FAKE_KIND", kind);
+        cmd.env("RELAYBOOK_FAKE_REVIEWER_ONLY", "1");
+        cmd.args(["run", "--prd", "prd.md", "--gates", "none"]);
+        let output = cmd.output().expect("run");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(1), "{kind}: {text}");
+        assert!(text.contains(reason), "{kind}: {text}");
+        assert!(
+            !codex_lines(&probes.log).is_empty(),
+            "{kind} did not reach codex:\n{text}"
+        );
+        let row = run_row(repo.path());
+        assert_eq!(row.status, "stopped", "{kind}: {text}");
+        assert_eq!(row.stop_reason.as_deref(), Some(reason), "{kind}: {text}");
+        let reviews = stored_reviews(repo.path());
+        assert!(
+            !reviews.is_empty() && reviews.iter().all(|review| review.verdict.is_none()),
+            "{kind}: {reviews:?}\n{text}"
+        );
+        assert!(
+            bare_relaybook_refs(&repo.bare).is_empty(),
+            "{kind} pushed: {}",
+            bare_relaybook_refs(&repo.bare)
+        );
+        assert!(!probes.log.join("gh.args").exists(), "{kind} opened a pr");
+    }
 }
 
 #[test]

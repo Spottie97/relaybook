@@ -37,6 +37,12 @@ fn kind() -> String {
     env::var("RELAYBOOK_FAKE_KIND").unwrap_or_default()
 }
 
+/// Planner and executor skip their `edit` and `tag` side effects. Codex still
+/// performs the kind. Classic tests leave this unset.
+fn reviewer_only() -> bool {
+    env::var("RELAYBOOK_FAKE_REVIEWER_ONLY").ok().as_deref() == Some("1")
+}
+
 fn graphify(args: &[String]) {
     if let Ok(path) = env::var("GRAPHIFY_CWD_LOG") {
         let cwd = env::current_dir()
@@ -129,7 +135,7 @@ fn claude(args: &[String]) {
         );
     }
     match kind().as_str() {
-        "edit" => {
+        "edit" if !reviewer_only() => {
             let _ = fs::write("dirty.txt", "dirty\n");
         }
         "fail" => std::process::exit(1),
@@ -222,7 +228,7 @@ fn cursor(args: &[String]) {
             relay(&["task", "block", "work", "--reason", "stuck"]);
             return;
         }
-        "tag" => {
+        "tag" if !reviewer_only() => {
             git(&["tag", "v9"]);
         }
         "extra" => {

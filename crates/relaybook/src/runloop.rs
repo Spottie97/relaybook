@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -1255,6 +1258,192 @@ fn shared_guard_gated(before: &Snap, after: &Snap) -> Result<(), String> {
     Ok(())
 }
 
+/// Worktree, refs, git config, and hooks around one Codex review.
+///
+/// `run_branch` is the run's branch, used for `origin/<branch>` even if the
+/// reviewer switches HEAD. `snap.branch` is the abbrev-ref at snapshot time.
+struct GatedSnap {
+    run_branch: String,
+    snap: Snap,
+    refs: Vec<String>,
+    config: Option<Vec<u8>>,
+    hooks: String,
+}
+
+fn gated_snap(cwd: &Path, run_branch: &str) -> Result<GatedSnap, String> {
+    Ok(GatedSnap {
+        run_branch: run_branch.to_string(),
+        snap: snap(cwd, run_branch, true)?,
+        refs: all_ref_lines(cwd)?,
+        config: git_path_bytes(cwd, "config")?,
+        hooks: hooks_fingerprint(cwd)?,
+    })
+}
+
+/// Halt when the reviewer changed the repo during the Codex call.
+///
+/// HEAD is compared before other refs: a commit moves both, and that halt
+/// reason is "reviewer moved HEAD". Tags and remote-tracking refs keep the
+/// reasons `shared_guard_gated` already uses. Any other ref change names the
+/// first ref in sorted order.
+fn guard_reviewer(cwd: &Path, before: &GatedSnap) -> Result<(), String> {
+    let after = gated_snap(cwd, &before.run_branch)?;
+    if after.snap.head != before.snap.head || after.snap.branch != before.snap.branch {
+        return Err("reviewer moved HEAD".to_string());
+    }
+    if after.snap.tree != before.snap.tree {
+        return Err("reviewer edited the worktree".to_string());
+    }
+    shared_guard_gated(&before.snap, &after.snap)?;
+    if let Some(name) = changed_ref(&before.refs, &after.refs) {
+        return Err(format!("reviewer changed refs: {name}"));
+    }
+    if after.config != before.config {
+        return Err("reviewer changed git config".to_string());
+    }
+    if after.hooks != before.hooks {
+        return Err("reviewer changed hooks".to_string());
+    }
+    Ok(())
+}
+
+fn all_ref_lines(cwd: &Path) -> Result<Vec<String>, String> {
+    let text = git(
+        cwd,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "--end-of-options",
+        ],
+    )?;
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    Ok(lines)
+}
+
+fn changed_ref(before: &[String], after: &[String]) -> Option<String> {
+    let before = ref_map(before);
+    let after = ref_map(after);
+    let mut names: Vec<&String> = before.keys().chain(after.keys()).collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .find(|name| before.get(*name) != after.get(*name))
+        .cloned()
+}
+
+fn ref_map(lines: &[String]) -> BTreeMap<String, String> {
+    let mut refs = BTreeMap::new();
+    for line in lines {
+        let Some((sha, name)) = line.split_once(' ') else {
+            continue;
+        };
+        refs.insert(name.to_string(), sha.to_string());
+    }
+    refs
+}
+
+fn git_file(cwd: &Path, name: &str) -> Result<PathBuf, String> {
+    let raw = git(cwd, &["rev-parse", "--git-path", name])?;
+    let path = PathBuf::from(&raw);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(cwd.join(path))
+    }
+}
+
+fn git_path_bytes(cwd: &Path, name: &str) -> Result<Option<Vec<u8>>, String> {
+    let path = git_file(cwd, name)?;
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("read {}: {err}", path.display())),
+    }
+}
+
+fn hooks_fingerprint(cwd: &Path) -> Result<String, String> {
+    let path = git_file(cwd, "hooks")?;
+    let mut body = Vec::new();
+    append_hooks(&path, &mut body, 0)?;
+    Ok(fnv1a(&body))
+}
+
+fn append_hooks(dir: &Path, body: &mut Vec<u8>, depth: u32) -> Result<(), String> {
+    if depth > 32 {
+        return Err("hooks directory is too deep".to_string());
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            body.extend_from_slice(b"missing");
+            return Ok(());
+        }
+        Err(err) => return Err(format!("read {}: {err}", dir.display())),
+    };
+    body.extend_from_slice(b"present\0");
+    let mut items = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("read {}: {err}", dir.display()))?;
+        items.push(entry);
+    }
+    items.sort_by_key(|entry| entry.file_name());
+    for entry in items {
+        let path = entry.path();
+        let name = entry.file_name();
+        body.extend_from_slice(name.to_string_lossy().as_bytes());
+        body.push(0);
+        let meta =
+            fs::symlink_metadata(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+        body.extend_from_slice(&permission_token(&meta).to_le_bytes());
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            body.push(b'l');
+            let target =
+                fs::read_link(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+            body.extend_from_slice(target.to_string_lossy().as_bytes());
+        } else if file_type.is_dir() {
+            body.push(b'd');
+            append_hooks(&path, body, depth + 1)?;
+        } else if file_type.is_file() {
+            body.push(b'f');
+            let bytes = fs::read(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+            body.extend_from_slice(&bytes);
+        } else {
+            body.push(b'o');
+        }
+        body.push(0);
+    }
+    Ok(())
+}
+
+fn permission_token(meta: &fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode()
+    }
+    #[cfg(not(unix))]
+    {
+        u32::from(meta.permissions().readonly())
+    }
+}
+
+fn fnv1a(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn dirty(cwd: &Path) -> Result<bool, String> {
     Ok(!crate::git::dirty_paths(cwd)?.is_empty())
 }
@@ -1444,6 +1633,11 @@ fn review_with_codex(
     let invocation_token = prepared.invocation_token.clone();
     let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
     let out = agents::codex_output_file(&root, run_id, review_id, generation);
+    let review_branch = run.branch.clone();
+    let before = match gated_snap(cwd, &review_branch) {
+        Ok(before) => before,
+        Err(err) => return Control::Return(halt(cwd, &mut ledger, &mut run, &err)),
+    };
     drop(ledger);
     let live = live_session(session, cwd, run_id, quiet);
     live.begin(&format!("● Reviewing {label} (codex)"));
@@ -1470,6 +1664,12 @@ fn review_with_codex(
             action,
         )
     };
+    if let Err(reason) = guard_reviewer(cwd, &before) {
+        close_live(session, cwd, run_id, quiet, elapsed, &result, "halted");
+        return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Halt {
+            reason,
+        }));
+    }
     match &result {
         AgentResult::Unavailable { cli } => {
             close_live(session, cwd, run_id, quiet, elapsed, &result, "unavailable");
@@ -1547,8 +1747,14 @@ fn review_with_codex(
     if let Err(err) = recorded {
         close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
         drop(ledger);
-        if err.to_string() == relaybook_core::STALE_REVIEW_INVOCATION {
+        let message = err.to_string();
+        if message == relaybook_core::STALE_REVIEW_INVOCATION {
             return Control::Return(fail(relaybook_core::STALE_REVIEW_INVOCATION));
+        }
+        if message == "ledger changed during review" {
+            return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Halt {
+                reason: message,
+            }));
         }
         return Control::Return(invocation(
             relaybook_core::ReviewInvocationAction::FailureStreak,
