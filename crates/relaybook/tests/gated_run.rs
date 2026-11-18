@@ -371,6 +371,7 @@ fn set_run_stage(dir: &Path, stage: &str) {
     ledger.save_run(&mut run).expect("save");
 }
 
+#[cfg(unix)]
 fn authorization_count(dir: &Path) -> i64 {
     let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
     conn.query_row("SELECT COUNT(*) FROM release_authorizations", [], |row| {
@@ -1605,6 +1606,7 @@ fn typed_phrases(buf: &[u8]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(unix)]
 fn authorize_while_prompted(dir: &Path, sha: &str, during: impl FnOnce()) -> PtyOutput {
     use std::io::{Read, Write};
     use std::sync::mpsc;
@@ -3232,6 +3234,7 @@ fn output_is_outside(root: &Path, raw: &str) -> bool {
     !path.starts_with(root)
 }
 
+#[cfg(unix)]
 fn output_flag(line: &str) -> String {
     let args: Vec<&str> = line.split_whitespace().collect();
     let index = args

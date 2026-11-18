@@ -585,10 +585,9 @@ fn sonnet_approval_blocks_release_until_codex_rereview() {
         authorize_text.contains("codex re-review pending"),
         "{authorize_text}"
     );
-    let approve = relaybook(repo.path())
-        .arg("approve")
-        .output()
-        .expect("approve");
+    let mut approve_cmd = relaybook(repo.path());
+    apply_probes(&mut approve_cmd, &probes);
+    let approve = approve_cmd.arg("approve").output().expect("approve");
     let approve_text = text_of(&approve);
     assert!(
         approve_text.contains("codex re-review pending"),

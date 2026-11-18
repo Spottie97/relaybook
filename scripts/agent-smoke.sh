@@ -1,7 +1,8 @@
 #!/bin/sh
 # Manual smoke test. Not part of CI.
 # Needs a signed-in claude, the Cursor CLI, a signed-in codex, and a real
-# graphify on PATH. Also needs git, timeout, python3, and sqlite3 3.45.1.
+# graphify on PATH. Also needs git, python3, and sqlite3 3.45.1.
+# A deadline uses timeout if it is on PATH, otherwise gtimeout, otherwise python3.
 # One run: real-graphify checks in a throwaway repo, schema 8 against a
 # 0.3.3 build, real git ls-remote, a real read-only Codex review (exit 0
 # and a schema-valid verdict) plus a separate write-denial probe, then the
@@ -51,8 +52,78 @@ run_graphify() {
   run_in_repo "$graph" "$graph_home" "$@"
 }
 
+# True when run_timeout can enforce a deadline.
+have_deadline() {
+  command -v timeout >/dev/null 2>&1 \
+    || command -v gtimeout >/dev/null 2>&1 \
+    || command -v python3 >/dev/null 2>&1
+}
+
+require_deadline() {
+  if have_deadline; then
+    return 0
+  fi
+  echo "timeout, gtimeout, and python3 are not on PATH" >&2
+  return 1
+}
+
+# Stop a command after N seconds. A deadline exits 124, matching GNU timeout.
+# Prefer timeout, then gtimeout. python3 kills the command's process group.
+run_timeout() {
+  _deadline_secs=$1
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_deadline_secs" "$@" || return $?
+    return 0
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$_deadline_secs" "$@" || return $?
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "timeout, gtimeout, and python3 are not on PATH" >&2
+    return 127
+  fi
+  python3 -c '
+import os
+import signal
+import subprocess
+import sys
+
+seconds = float(sys.argv[1])
+command = sys.argv[2:]
+if not command:
+    sys.stderr.write("run_timeout: missing command\n")
+    raise SystemExit(127)
+try:
+    child = subprocess.Popen(command, start_new_session=True)
+except OSError:
+    raise SystemExit(127)
+try:
+    code = child.wait(timeout=seconds)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        child.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        child.wait()
+    raise SystemExit(124)
+if code < 0:
+    raise SystemExit(128 - code)
+raise SystemExit(code)
+' "$_deadline_secs" "$@" || return $?
+  return 0
+}
+
 # Build 0.3.3 and check schema 8 guards. Not part of CI.
-# Classic run --prd is capped with timeout: it must get past the insert and
+# Classic run --prd is capped with run_timeout: it must get past the insert and
 # must not print the guard. It does not have to finish the agent loop.
 # Classic run --resume stays in manual mode, so 0.3.3 saves the run and then
 # stops with "mode is manual". Gated run commands must print the guard.
@@ -66,8 +137,7 @@ smoke_schema_v8() {
     echo "sqlite3 is not on PATH" >&2
     exit 1
   fi
-  if ! command -v timeout >/dev/null 2>&1; then
-    echo "timeout is not on PATH" >&2
+  if ! require_deadline; then
     exit 1
   fi
   _sqlver=$(sqlite3 -version | awk '{print $1}')
@@ -149,7 +219,7 @@ smoke_schema_v8() {
   fi
   run_in_repo "$_gated" "" "$_new" mode auto
   _rc=0
-  run_in_repo "$_gated" "" timeout 90 "$_old" run --prd prd.md >"$_out" 2>"$_err" || _rc=$?
+  run_in_repo "$_gated" "" run_timeout 90 "$_old" run --prd prd.md >"$_out" 2>"$_err" || _rc=$?
   if [ "$_rc" -eq 0 ] || { ! grep -F -q "$_guard" "$_out" && ! grep -F -q "$_guard" "$_err"; }; then
     echo "gated run --prd did not fail with the guard" >&2
     cat "$_out" "$_err" >&2
@@ -162,7 +232,7 @@ smoke_schema_v8() {
   fi
   sqlite3 "$_db" "INSERT INTO runs (prd_path, prd_sha256, branch, stage, cycle, agent_calls, est_cost_usd, status, started_at, failure_streak, complete_requested, workflow, write_stamp) VALUES ('prd.md', 'abc', 'main', 'plan', 0, 0, 0, 'paused', '2026-01-01T00:00:00.000Z', 0, 0, 'gated', 0);"
   _rc=0
-  run_in_repo "$_gated" "" timeout 90 "$_old" run --resume >"$_out" 2>"$_err" || _rc=$?
+  run_in_repo "$_gated" "" run_timeout 90 "$_old" run --resume >"$_out" 2>"$_err" || _rc=$?
   if [ "$_rc" -eq 0 ] || { ! grep -F -q "$_guard" "$_out" && ! grep -F -q "$_guard" "$_err"; }; then
     echo "gated run --resume did not fail with the guard" >&2
     cat "$_out" "$_err" >&2
@@ -195,7 +265,7 @@ smoke_schema_v8() {
   run_in_repo "$_classic" "" "$_new" mode auto
   _cdb="$_classic/.relaybook/ledger.db"
   _rc=0
-  run_in_repo "$_classic" "" timeout 45 "$_old" run --prd prd.md >"$_out" 2>"$_err" || _rc=$?
+  run_in_repo "$_classic" "" run_timeout 45 "$_old" run --prd prd.md >"$_out" 2>"$_err" || _rc=$?
   if grep -F -q "$_guard" "$_out" || grep -F -q "$_guard" "$_err"; then
     echo "classic run --prd hit the guard" >&2
     cat "$_out" "$_err" >&2
@@ -210,7 +280,7 @@ smoke_schema_v8() {
   sqlite3 "$_cdb" "UPDATE runs SET status='paused', stop_reason=NULL WHERE id = (SELECT id FROM runs ORDER BY id DESC LIMIT 1);"
   run_in_repo "$_classic" "" "$_new" mode manual
   _rc=0
-  run_in_repo "$_classic" "" timeout 90 "$_old" run --resume >"$_out" 2>"$_err" || _rc=$?
+  run_in_repo "$_classic" "" run_timeout 90 "$_old" run --resume >"$_out" 2>"$_err" || _rc=$?
   if grep -F -q "$_guard" "$_out" || grep -F -q "$_guard" "$_err"; then
     echo "classic run --resume hit the guard" >&2
     cat "$_out" "$_err" >&2
@@ -413,8 +483,7 @@ smoke_codex() {
     echo "codex: not on PATH" >&2
     exit 1
   fi
-  if ! command -v timeout >/dev/null 2>&1; then
-    echo "timeout is not on PATH" >&2
+  if ! require_deadline; then
     exit 1
   fi
   if ! command -v python3 >/dev/null 2>&1; then
@@ -532,7 +601,7 @@ PY
   (
     clear_git_repo_env
     cd "$codex_repo" || exit 1
-    timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" -m "$codex_model" --output-schema "$codex_schema" -o "$codex_out" "$codex_prompt" <"$smoke_tmp/packet.txt"
+    run_timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" -m "$codex_model" --output-schema "$codex_schema" -o "$codex_out" "$codex_prompt" <"$smoke_tmp/packet.txt"
   ) >"$smoke_tmp/codex.out" 2>"$smoke_tmp/codex.err" || codex_rc=$?
   if [ "$codex_rc" -ne 0 ]; then
     if [ "$codex_rc" -eq 124 ]; then
@@ -556,7 +625,7 @@ PY
   (
     clear_git_repo_env
     cd "$codex_repo" || exit 1
-    timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" -m "$codex_model" -o "$probe_out" "$probe_prompt" </dev/null
+    run_timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" -m "$codex_model" -o "$probe_out" "$probe_prompt" </dev/null
   ) >"$smoke_tmp/codex.out" 2>"$smoke_tmp/codex.err" || codex_rc=$?
   if [ "$codex_rc" -ne 0 ]; then
     if [ "$codex_rc" -eq 124 ]; then

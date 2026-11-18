@@ -1881,9 +1881,11 @@ mod tests {
         classify_codex_exit, classify_failed_codex_exit, claude_account, codex_args,
         codex_echoed_prompt, codex_login_status_args, codex_output_file,
         forbidden_claude_review_arg, forbidden_codex_arg, parse_claude_review_envelope,
-        parse_codex_retry_after, parse_codex_verdict, path_is_inside, prepare_codex_output,
-        read_codex_output, review_input_too_large, sonnet_review_args,
+        parse_codex_retry_after, parse_codex_verdict, path_is_inside, review_input_too_large,
+        sonnet_review_args,
     };
+    #[cfg(unix)]
+    use super::{prepare_codex_output, read_codex_output};
 
     #[test]
     fn usage_limit_is_not_a_failure_and_keeps_the_reset_time() {
