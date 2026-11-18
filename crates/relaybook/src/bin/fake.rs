@@ -370,11 +370,14 @@ fn claude_reviewer(args: &[String]) {
 
 fn codex(args: &[String]) {
     if args.first().map(String::as_str) == Some("login") {
+        // codex-verification-v2.md row 3: `Not logged in` / `Logged in using ChatGPT`.
         if env::var("RELAYBOOK_FAKE_CODEX_AUTH").ok().as_deref() == Some("missing") {
             eprintln!("Not logged in");
+            vanish_after_status();
             std::process::exit(1);
         }
         println!("Logged in using ChatGPT");
+        vanish_after_status();
         return;
     }
     if args.first().map(String::as_str) == Some("--version") {
@@ -384,11 +387,13 @@ fn codex(args: &[String]) {
                 &args.join(" "),
             );
         }
+        // V3 verified version, also the version string from the V2 run.
         println!(
             "{}",
             env::var("RELAYBOOK_FAKE_CODEX_VERSION")
                 .unwrap_or_else(|_| "codex-cli 0.169.0".to_string())
         );
+        vanish_after_status();
         return;
     }
     if let Ok(log) = env::var("LOG") {
@@ -412,13 +417,20 @@ fn codex(args: &[String]) {
                 write_out(out.as_deref(), "{\"ok\":true}\n");
                 return;
             }
+            // Fixture stderr is copied from the verification notes. Do not paraphrase.
+            // - plain429: codex-verification-v3.md E2, 429 rate_limit_exceeded.
+            // - auth401: V3 E2, 401. The ellipsis in `url: …` is the note's character.
+            // - too-large: codex-verification-v2.md row 4, byte for byte. rc 1, empty -o.
+            //   That capture has no `ERROR:` prefix.
+            // - limit / limit-stdout: V3 E2, 429 usage_limit_reached, plan pro, resets_at.
+            //   limit-stdout prints that same line on stdout.
             let stderr = match codex_kind().as_str() {
                 "plain429" => "ERROR: exceeded retry limit, last status: 429 Too Many Requests\n",
                 "auth401" => {
                     "ERROR: Reconnecting... 1/1\nERROR: unexpected status 401 Unauthorized: bad key, url: …\n"
                 }
                 "too-large" => {
-                    "ERROR: Input exceeds the maximum length of 1048576 characters (input_error_code input_too_large, max_chars 1048576, actual_chars 4194123)\n"
+                    "Input exceeds the maximum length of 1048576 characters (input_error_code input_too_large, max_chars 1048576, actual_chars 4194123)\n"
                 }
                 "limit-stdout" => "",
                 _ => {
@@ -624,6 +636,29 @@ fn claim_hold_slot(dir: &str) -> i64 {
         }
     }
     0
+}
+
+/// Test seam. `RELAYBOOK_FAKE_CODEX_VANISH=1` removes this executable after
+/// `login` or `--version`, so the next `codex` lookup fails on every platform.
+/// Renaming uses [`std::env::consts::EXE_SUFFIX`] because a running Windows
+/// image can be renamed when it cannot be deleted.
+fn vanish_after_status() {
+    if env::var("RELAYBOOK_FAKE_CODEX_VANISH").ok().as_deref() != Some("1") {
+        return;
+    }
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let dest = exe.with_file_name(format!(
+        "codex-vanished-{}{}",
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    if fs::rename(&exe, &dest).is_ok() {
+        let _ = fs::remove_file(&dest);
+        return;
+    }
+    let _ = fs::remove_file(&exe);
 }
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {

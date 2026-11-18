@@ -238,9 +238,12 @@ CREATE TABLE IF NOT EXISTS reviewer_events (
 );
 ";
 
-/// Stops an older schema 8 binary from authorizing a release while a Claude
-/// approval still has no approved Codex re-review. A missing setting is the
-/// same as `before-release`. `fallback_rereview=off` does not fire.
+/// Stops an authorization while a Claude approval still has no approved Codex
+/// re-review. A missing setting is the same as `before-release`.
+/// `fallback_rereview=off` does not fire. Coverage is the caller-supplied run
+/// when that id is set, and otherwise the run on the selected release review
+/// (the latest approved release review at `NEW.commit_sha`), including a
+/// stopped run and a null `NEW.run_id`.
 pub(crate) const REREVIEW_AUTHORIZE_TRIGGER: &str = "
 CREATE TRIGGER IF NOT EXISTS relaybook_guard_rereview_authorize
 BEFORE INSERT ON release_authorizations
@@ -248,12 +251,22 @@ WHEN (
     (SELECT value FROM settings WHERE key = 'fallback_rereview') IS NULL
     OR (SELECT value FROM settings WHERE key = 'fallback_rereview') = 'before-release'
 )
- AND NEW.run_id IS NOT NULL
  AND EXISTS (
     SELECT 1 FROM reviews AS sonnet
-    WHERE sonnet.run_id = NEW.run_id
-      AND sonnet.reviewer = 'claude'
+    WHERE sonnet.reviewer = 'claude'
       AND sonnet.verdict = 'approved'
+      AND (
+        (NEW.run_id IS NOT NULL AND sonnet.run_id = NEW.run_id)
+        OR sonnet.run_id = (
+            SELECT selected.run_id FROM reviews AS selected
+            WHERE selected.scope = 'release'
+              AND selected.commit_sha = NEW.commit_sha
+              AND selected.verdict = 'approved'
+              AND selected.run_id IS NOT NULL
+            ORDER BY selected.id DESC
+            LIMIT 1
+        )
+      )
       AND NOT EXISTS (
           SELECT 1 FROM reviews AS codex
           WHERE codex.rereview_of = sonnet.id

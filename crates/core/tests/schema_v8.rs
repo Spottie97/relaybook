@@ -1253,3 +1253,319 @@ fn retry_after_from_error_is_ignored_and_advisory_iso_is_clamped() {
     let missing = ledger.resolve_retry_after(None, 60).expect("missing");
     assert_eq!(missing.1, "backoff");
 }
+
+fn claude_release_review(conn: &Connection, run_id: i64, sha: &str) -> i64 {
+    let mark = r#"{"events":null,"reports":null,"decisions":null,"steps":null,"tasks_updated_at":null,"fingerprint":""}"#;
+    conn.execute(
+        "INSERT INTO reviews (
+            scope, run_id, branch, reviewer, base_sha, commit_sha, ledger_mark, verdict, started_at
+         ) VALUES (
+            'release', ?1, 'feature', 'claude', 'base', ?2, ?3, 'approved', '2026-01-01T00:00:00.000Z'
+         )",
+        rusqlite::params![run_id, sha, mark],
+    )
+    .expect("review");
+    conn.last_insert_rowid()
+}
+
+fn stop_run(ledger: &mut Ledger, run_id: i64) {
+    let mut run = ledger.run_by_id(run_id).expect("run");
+    run.status = "stopped".to_string();
+    ledger.save_run(&mut run).expect("stop");
+}
+
+/// The trigger and the Rust check both refuse a stopped run when the caller
+/// supplies no run id. Coverage comes from the selected release review.
+#[test]
+fn stopped_run_null_run_id_blocks_authorization_in_sql_and_rust() {
+    let (_dir, path) = fresh_path();
+    let run_id = {
+        let mut ledger = Ledger::initialize(&path).expect("init");
+        gate(&mut ledger);
+        ledger
+            .set_setting("fallback_rereview", "before-release")
+            .expect("policy");
+        let run = ledger
+            .start_run("prd.md", "digest", "feature", Some("gated"))
+            .expect("run");
+        stop_run(&mut ledger, run.id);
+        run.id
+    };
+    let review_id = {
+        let conn = Connection::open(&path).expect("open");
+        claude_release_review(&conn, run_id, "abc")
+    };
+    {
+        let conn = Connection::open(&path).expect("open");
+        let err = conn
+            .execute(
+                "INSERT INTO release_authorizations (
+                    run_id, branch, commit_sha, review_id, authorized_by, created_at
+                 ) VALUES (NULL, 'feature', 'abc', ?1, 'maintainer', '2026-01-01T00:00:00.000Z')",
+                [review_id],
+            )
+            .expect_err("trigger");
+        assert!(
+            err.to_string().contains("codex re-review pending"),
+            "trigger: {err}"
+        );
+    }
+    let mut ledger = Ledger::open(&path).expect("open");
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute("DROP TRIGGER relaybook_guard_rereview_authorize", [])
+            .expect("drop trigger");
+    }
+    let err = ledger
+        .authorize_release("feature", "abc", "abc", "maintainer", None)
+        .expect_err("rust");
+    assert!(
+        err.to_string().contains("codex re-review pending"),
+        "rust check: {err}"
+    );
+    drop(ledger);
+    let conn = Connection::open(&path).expect("open");
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM release_authorizations", [], |row| {
+            row.get(0)
+        })
+        .expect("count");
+    assert_eq!(rows, 0);
+}
+
+/// An older trigger that only reads `NEW.run_id` is replaced on open.
+/// `user_version` stays 8. A null `run_id` then refuses.
+#[test]
+fn old_rereview_trigger_is_replaced_at_v8() {
+    let (_dir, path) = fresh_path();
+    let run_id = {
+        let mut ledger = Ledger::initialize(&path).expect("init");
+        gate(&mut ledger);
+        let run = ledger
+            .start_run("prd.md", "digest", "feature", Some("gated"))
+            .expect("run");
+        stop_run(&mut ledger, run.id);
+        run.id
+    };
+    assert_eq!(user_version(&path), 8);
+    let review_id = {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute(
+            "DROP TRIGGER IF EXISTS relaybook_guard_rereview_authorize",
+            [],
+        )
+        .expect("drop");
+        conn.execute_batch(
+            "
+            CREATE TRIGGER relaybook_guard_rereview_authorize
+            BEFORE INSERT ON release_authorizations
+            WHEN NEW.run_id IS NOT NULL
+             AND EXISTS (
+                SELECT 1 FROM reviews AS sonnet
+                WHERE sonnet.reviewer = 'claude'
+                  AND sonnet.verdict = 'approved'
+                  AND sonnet.run_id = NEW.run_id
+             )
+            BEGIN
+              SELECT RAISE(ABORT, 'codex re-review pending');
+            END;
+            ",
+        )
+        .expect("old trigger");
+        let review_id = claude_release_review(&conn, run_id, "abc");
+        conn.execute(
+            "INSERT INTO release_authorizations (
+                run_id, branch, commit_sha, review_id, authorized_by, created_at
+             ) VALUES (NULL, 'feature', 'abc', ?1, 'maintainer', '2026-01-01T00:00:00.000Z')",
+            [review_id],
+        )
+        .expect("old trigger allows a null run id");
+        conn.execute("DELETE FROM release_authorizations", [])
+            .expect("clear");
+        review_id
+    };
+    drop(Ledger::open(&path).expect("upgrade"));
+    assert_eq!(user_version(&path), 8);
+    let conn = Connection::open(&path).expect("open");
+    let sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'relaybook_guard_rereview_authorize'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("sql");
+    assert!(sql.contains("selected.run_id"), "{sql}");
+    let err = conn
+        .execute(
+            "INSERT INTO release_authorizations (
+                run_id, branch, commit_sha, review_id, authorized_by, created_at
+             ) VALUES (NULL, 'feature', 'abc', ?1, 'maintainer', '2026-01-01T00:00:00.000Z')",
+            [review_id],
+        )
+        .expect_err("upgraded trigger");
+    assert!(err.to_string().contains("codex re-review pending"), "{err}");
+}
+
+fn probe_event_count(path: &Path, kind: &str) -> i64 {
+    let conn = Connection::open(path).expect("open");
+    conn.query_row(
+        "SELECT COUNT(*) FROM reviewer_events WHERE kind = ?1",
+        [kind],
+        |row| row.get(0),
+    )
+    .expect("events")
+}
+
+fn assert_probe_halt(path: &Path, outcome: relaybook_core::ProbeOutcome) {
+    let mut ledger = Ledger::open(path).expect("open");
+    let run = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("run");
+    let claim = ledger
+        .begin_probe(run.id, run.write_stamp, "plan", 1)
+        .expect("begin");
+    ledger.create_task("extra", "Extra").expect("mutate");
+    let written = ledger
+        .record_probe(
+            run.id,
+            claim.generation,
+            &claim.token,
+            "plan",
+            &claim.ledger_mark,
+            outcome,
+        )
+        .expect("record");
+    match written {
+        relaybook_core::ProbeOutcome::Halt { reason } => {
+            assert_eq!(reason, relaybook_core::LEDGER_CHANGED_DURING_REVIEW);
+        }
+        other => panic!("mutated probe wrote {other:?}"),
+    }
+    let stored = ledger.run_by_id(run.id).expect("stored");
+    assert_eq!(stored.status, "stopped");
+    assert_eq!(
+        stored.stop_reason.as_deref(),
+        Some(relaybook_core::LEDGER_CHANGED_DURING_REVIEW)
+    );
+    drop(ledger);
+    assert_eq!(probe_event_count(path, "probe_ok"), 0);
+    assert_eq!(probe_event_count(path, "switched_to_codex"), 0);
+    assert_eq!(probe_event_count(path, "probe_failed"), 1);
+}
+
+#[test]
+fn probe_record_halts_every_outcome_when_the_ledger_changes() {
+    for outcome in [
+        relaybook_core::ProbeOutcome::Ok {
+            version: "codex-cli 0.169.0".to_string(),
+        },
+        relaybook_core::ProbeOutcome::Limited {
+            retry_after: "2026-01-01T01:00:00.000Z".to_string(),
+            source: "backoff".to_string(),
+            evidence: "limit".to_string(),
+            version: "codex-cli 0.169.0".to_string(),
+        },
+        relaybook_core::ProbeOutcome::Failed {
+            evidence: "plain".to_string(),
+            version: "codex-cli 0.169.0".to_string(),
+        },
+        relaybook_core::ProbeOutcome::Halt {
+            reason: "reviewer edited the worktree".to_string(),
+        },
+    ] {
+        let (_dir, path) = fresh_path();
+        drop(Ledger::initialize(&path).expect("init"));
+        assert_probe_halt(&path, outcome);
+    }
+}
+
+#[test]
+fn probe_record_keeps_ok_when_the_mark_matches() {
+    let (_dir, path) = fresh_path();
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    let run = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("run");
+    let claim = ledger
+        .begin_probe(run.id, run.write_stamp, "plan", 1)
+        .expect("begin");
+    let written = ledger
+        .record_probe(
+            run.id,
+            claim.generation,
+            &claim.token,
+            "plan",
+            &claim.ledger_mark,
+            relaybook_core::ProbeOutcome::Ok {
+                version: "codex-cli 0.169.0".to_string(),
+            },
+        )
+        .expect("record");
+    assert!(matches!(written, relaybook_core::ProbeOutcome::Ok { .. }));
+    let stored = ledger.run_by_id(run.id).expect("stored");
+    assert_eq!(stored.status, "active");
+    assert_eq!(stored.stop_reason, None);
+    drop(ledger);
+    assert_eq!(probe_event_count(&path, "probe_ok"), 1);
+    assert_eq!(probe_event_count(&path, "switched_to_codex"), 1);
+}
+
+#[test]
+fn publishing_claim_reads_the_current_rereview_policy() {
+    let (_dir, path) = fresh_path();
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    gate(&mut ledger);
+    ledger
+        .set_setting("fallback_rereview", "before-release")
+        .expect("policy");
+    let run = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("run");
+    drop(ledger);
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute(
+            "INSERT INTO tasks (slug, title, status, created_at, updated_at, run_id)
+             VALUES ('work', 'Work', 'done', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', ?1)",
+            [run.id],
+        )
+        .expect("task");
+        let task_id: i64 = conn
+            .query_row("SELECT id FROM tasks WHERE slug = 'work'", [], |row| {
+                row.get(0)
+            })
+            .expect("task id");
+        conn.execute(
+            "INSERT INTO reviews (
+                scope, task_id, run_id, branch, reviewer, base_sha, commit_sha, ledger_mark,
+                verdict, started_at
+             ) VALUES (
+                'task', ?1, ?2, 'feature', 'claude', 'base', 'abc',
+                '{\"events\":null,\"reports\":null,\"decisions\":null,\"steps\":null,\"tasks_updated_at\":null,\"fingerprint\":\"\"}',
+                'approved', '2026-01-01T00:00:00.000Z'
+             )",
+            rusqlite::params![task_id, run.id],
+        )
+        .expect("review");
+    }
+    let mut ledger = Ledger::open(&path).expect("open");
+    let stamp = ledger.run_by_id(run.id).expect("stamp").write_stamp;
+    let mut publishing = ledger.run_by_id(run.id).expect("run");
+    publishing.stage = "publishing".to_string();
+    let err = ledger.claim_run(&mut publishing).expect_err("blocked");
+    assert!(err.to_string().contains("codex re-review pending"), "{err}");
+    let stored = ledger.run_by_id(run.id).expect("unchanged");
+    assert_eq!(stored.write_stamp, stamp);
+    assert_eq!(stored.stage, "plan");
+    stop_run(&mut ledger, run.id);
+    ledger
+        .set_setting_with("fallback_rereview", "off", true)
+        .expect("off");
+    let mut again = ledger.run_by_id(run.id).expect("again");
+    again.stage = "publishing".to_string();
+    ledger
+        .claim_run(&mut again)
+        .expect("current policy allows the claim");
+    assert_eq!(again.stage, "publishing");
+}

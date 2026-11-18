@@ -236,7 +236,7 @@ fn reviewer_fallback_needed(conn: &Connection) -> Result<bool, Error> {
     if !table_exists(conn, "reviewer_events")? {
         return Ok(true);
     }
-    Ok(!trigger_exists(conn, "relaybook_guard_rereview_authorize")?)
+    Ok(!rereview_trigger_current(conn)?)
 }
 
 fn restore_reviewer_fallback(conn: &Connection) -> Result<(), Error> {
@@ -255,10 +255,29 @@ fn restore_reviewer_fallback(conn: &Connection) -> Result<(), Error> {
     if !table_exists(conn, "reviewer_events")? {
         conn.execute_batch(REVIEWER_EVENTS_TABLE)?;
     }
-    if !trigger_exists(conn, "relaybook_guard_rereview_authorize")? {
+    if !rereview_trigger_current(conn)? {
+        conn.execute(
+            "DROP TRIGGER IF EXISTS relaybook_guard_rereview_authorize",
+            [],
+        )?;
         conn.execute_batch(REREVIEW_AUTHORIZE_TRIGGER)?;
     }
     Ok(())
+}
+
+/// True when the installed re-review trigger derives the run from the selected
+/// release review. An older body that only reads `NEW.run_id` is replaced on
+/// open. `user_version` stays 8.
+fn rereview_trigger_current(conn: &Connection) -> Result<bool, Error> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'relaybook_guard_rereview_authorize'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|sql| sql.contains("selected.run_id")))
 }
 
 fn index_exists(conn: &Connection, name: &str) -> Result<bool, Error> {

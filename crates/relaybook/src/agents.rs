@@ -816,7 +816,8 @@ pub(crate) fn call_codex(
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let packet = packet.to_string();
+    let packet_sent = packet.to_string();
+    let packet = packet_sent.clone();
     let stdin_thread = std::thread::spawn(move || {
         if let Some(mut stdin) = stdin {
             let _ = stdin.write_all(packet.as_bytes());
@@ -852,7 +853,7 @@ pub(crate) fn call_codex(
         live.observe(&crate::stream::Piece::Text(line.to_string()));
     }
     if !status.success() {
-        return classify_codex_failure(status.code(), &stdout, &stderr, out);
+        return classify_codex_failure(status.code(), &stdout, &stderr, out, prompt, &packet_sent);
     }
     match read_codex_output(out, share_user.as_deref()) {
         Ok(text) => AgentResult::Finished {
@@ -901,6 +902,8 @@ fn classify_codex_failure(
     stdout: &str,
     stderr: &str,
     out: &Path,
+    prompt: &str,
+    packet: &str,
 ) -> AgentResult {
     let file = match std::fs::read_to_string(out) {
         Ok(text) => text,
@@ -908,7 +911,7 @@ fn classify_codex_failure(
         Err(_) => "unreadable".to_string(),
     };
     let version = codex_version();
-    match classify_codex_exit(code, stderr, stdout, &file, &version) {
+    match classify_codex_exit(code, stderr, stdout, &file, &version, prompt, packet) {
         CodexExit::Limited { signature } => AgentResult::UsageLimit {
             cli: "codex".to_string(),
             reset_at: None,
@@ -958,12 +961,21 @@ pub(crate) fn codex_version() -> String {
 
 /// A usage limit only when every signal is present. Stdout is ignored.
 /// The `-o` text is `out`. A phrase in stdout or in `out` is not a limit.
+///
+/// `codex exec` prints the prompt, and the stdin packet inside `<stdin>`, on
+/// stderr (`user` plus that text). That echo is removed before matching.
+/// Only `ERROR: ` lines after the echo count, and the last of those lines
+/// must itself be a limit signature. Zero copies of the echo is not an echo.
+/// More than one copy, or sent text that could spoof a limit when the echo
+/// cannot be found, is an ordinary failure.
 pub(crate) fn classify_codex_exit(
     code: Option<i32>,
     stderr: &str,
     stdout: &str,
     out: &str,
     version: &str,
+    prompt: &str,
+    packet: &str,
 ) -> CodexExit {
     let _ = stdout;
     if code == Some(0) && !out.trim().is_empty() {
@@ -972,23 +984,85 @@ pub(crate) fn classify_codex_exit(
     let version_ok = CODEX_VERIFIED_VERSIONS
         .iter()
         .any(|item| version.trim() == *item);
-    let signature = CODEX_LIMIT_SIGNATURES
+    if code != Some(1) || !out.trim().is_empty() || !version_ok {
+        return CodexExit::Ordinary;
+    }
+    let region = match stderr_after_codex_echo(stderr, prompt, packet) {
+        Some(region) => region,
+        None => return CodexExit::Ordinary,
+    };
+    let mut errors = region
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| line.starts_with("ERROR: "));
+    let Some(last) = errors.next_back() else {
+        return CodexExit::Ordinary;
+    };
+    if CODEX_ORDINARY_SIGNATURES
         .iter()
-        .find(|(_, phrase)| stderr.contains(phrase));
-    let ordinary = CODEX_ORDINARY_SIGNATURES
+        .any(|phrase| last.contains(phrase))
+    {
+        return CodexExit::Ordinary;
+    }
+    if let Some((id, _)) = CODEX_LIMIT_SIGNATURES
         .iter()
-        .any(|phrase| stderr.contains(phrase));
-    if code == Some(1)
-        && out.trim().is_empty()
-        && version_ok
-        && !ordinary
-        && let Some((id, _)) = signature
+        .find(|(_, phrase)| last.contains(phrase))
     {
         return CodexExit::Limited {
             signature: (*id).to_string(),
         };
     }
     CodexExit::Ordinary
+}
+
+/// Text Codex 0.169.0 appends when stdin is piped beside the prompt argument.
+/// `prompt_with_stdin_context` in `codex-rs/exec/src/lib.rs` at `rust-v0.169.0`.
+fn codex_echoed_prompt(prompt: &str, packet: &str) -> String {
+    if packet.trim().is_empty() {
+        return prompt.to_string();
+    }
+    let mut combined = format!("{prompt}\n\n<stdin>\n{packet}");
+    if !packet.ends_with('\n') {
+        combined.push('\n');
+    }
+    combined.push_str("</stdin>");
+    combined
+}
+
+/// `Some` is the stderr that follows one unambiguous echo, or all of `stderr`
+/// when the prompt and packet were not echoed and cannot spoof a limit.
+/// `None` is fail closed: the echo appears more than once, or the sent text
+/// contains a limit phrase or an `ERROR: ` line and that echo is missing.
+fn stderr_after_codex_echo<'a>(stderr: &'a str, prompt: &str, packet: &str) -> Option<&'a str> {
+    let echoed = codex_echoed_prompt(prompt, packet);
+    if echoed.is_empty() {
+        return Some(stderr);
+    }
+    let block = format!("user\n{echoed}");
+    let mut from = 0;
+    let mut start = None;
+    let mut count = 0;
+    while let Some(pos) = stderr[from..].find(&block) {
+        count += 1;
+        if count > 1 {
+            return None;
+        }
+        start = Some(from + pos);
+        from += pos + block.len();
+    }
+    match start {
+        Some(start) => Some(&stderr[start + block.len()..]),
+        None if sent_text_can_spoof_limit(prompt, packet) => None,
+        None => Some(stderr),
+    }
+}
+
+fn sent_text_can_spoof_limit(prompt: &str, packet: &str) -> bool {
+    let sent = format!("{prompt}\n{packet}");
+    CODEX_LIMIT_SIGNATURES
+        .iter()
+        .any(|(_, phrase)| sent.contains(phrase))
+        || sent.lines().any(|line| line.starts_with("ERROR: "))
 }
 
 /// E2 prints only a zone-less local clock. That text is not a timestamp.
@@ -1073,7 +1147,10 @@ pub(crate) fn sonnet_review_args(prompt: &str) -> Vec<String> {
 }
 
 /// Refuse before spawn when the argv could edit, run a shell, or use the web.
-/// `--strict-mcp-config` is not `--mcp-config`.
+/// `--strict-mcp-config` is not `--mcp-config`. Option names are normalized:
+/// `--opt=value` is the same option as `--opt`, and the short aliases from
+/// `claude --help` (`-r`/`--resume`, `-c`/`--continue`, `--allowed-tools`)
+/// are the long names.
 pub(crate) fn forbidden_claude_review_arg(args: &[String]) -> Option<String> {
     let mut saw_dont_ask = false;
     let mut saw_tools = false;
@@ -1081,36 +1158,38 @@ pub(crate) fn forbidden_claude_review_arg(args: &[String]) -> Option<String> {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].as_str();
-        if arg.starts_with("--dangerously")
-            || arg == "--add-dir"
-            || arg == "--resume"
-            || arg == "--continue"
-            || arg == "-c"
-            || arg == "--fallback-model"
-            || arg == "--mcp-config"
-        {
-            return Some(arg.to_string());
+        let Some((raw_name, inline)) = claude_option(arg) else {
+            index += 1;
+            continue;
+        };
+        let name = canonical_claude_option(raw_name);
+        if claude_option_forbidden(name) {
+            return Some(format!("--{name}"));
         }
-        if arg == "--permission-mode" {
-            let mode = args.get(index + 1).map(String::as_str);
-            if mode != Some("dontAsk") {
+        if name == "permission-mode" {
+            let mode = claude_option_value(args, &mut index, inline);
+            if mode != "dontAsk" {
                 return Some("--permission-mode".to_string());
             }
             saw_dont_ask = true;
-            index += 2;
+            index += 1;
             continue;
         }
-        if arg == "--tools" || arg == "--allowedTools" || arg == "--allowed-tools" {
-            let listed = args.get(index + 1).map(String::as_str).unwrap_or("");
+        if name == "tools" || name == "allowedTools" {
+            let listed = claude_option_value(args, &mut index, inline);
             if !review_tools_only(listed) {
-                return Some(arg.to_string());
+                return Some(if name == "tools" {
+                    "--tools".to_string()
+                } else {
+                    "--allowedTools".to_string()
+                });
             }
-            if arg == "--tools" {
+            if name == "tools" {
                 saw_tools = true;
             } else {
                 saw_allowed = true;
             }
-            index += 2;
+            index += 1;
             continue;
         }
         index += 1;
@@ -1125,6 +1204,59 @@ pub(crate) fn forbidden_claude_review_arg(args: &[String]) -> Option<String> {
         return Some("--allowedTools".to_string());
     }
     None
+}
+
+/// `--name`, `--name=value`, `-x`, or `-x=value`. Anything else is positional.
+fn claude_option(arg: &str) -> Option<(&str, Option<&str>)> {
+    let rest = if let Some(rest) = arg.strip_prefix("--") {
+        rest
+    } else if let Some(rest) = arg.strip_prefix('-') {
+        rest
+    } else {
+        return None;
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.split_once('=') {
+        Some((name, value)) if !name.is_empty() => Some((name, Some(value))),
+        Some(_) => None,
+        None => Some((rest, None)),
+    }
+}
+
+/// Aliases verified in `claude --help` (2.1.325): `-r, --resume`,
+/// `-c, --continue`, `--allowedTools, --allowed-tools`, and
+/// `--allow-dangerously-skip-permissions`.
+fn canonical_claude_option(name: &str) -> &str {
+    match name {
+        "r" | "resume" => "resume",
+        "c" | "continue" => "continue",
+        "allowed-tools" => "allowedTools",
+        "allow-dangerously-skip-permissions" => "dangerously-skip-permissions",
+        other => other,
+    }
+}
+
+fn claude_option_forbidden(name: &str) -> bool {
+    name.starts_with("dangerously")
+        || name == "add-dir"
+        || name == "resume"
+        || name == "continue"
+        || name == "fallback-model"
+        || name == "mcp-config"
+}
+
+fn claude_option_value<'a>(
+    args: &'a [String],
+    index: &mut usize,
+    inline: Option<&'a str>,
+) -> &'a str {
+    if let Some(value) = inline {
+        return value;
+    }
+    *index += 1;
+    args.get(*index).map(String::as_str).unwrap_or("")
 }
 
 fn review_tools_only(listed: &str) -> bool {
@@ -1536,10 +1668,10 @@ mod tests {
 
     use super::{
         AccountKind, Accounts, AgentResult, CodexExit, CodexSandbox, account_line, classify,
-        classify_codex_exit, claude_account, codex_args, codex_login_status_args,
-        codex_output_file, forbidden_claude_review_arg, forbidden_codex_arg,
-        parse_codex_retry_after, parse_codex_verdict, path_is_inside, prepare_codex_output,
-        read_codex_output, review_input_too_large, sonnet_review_args,
+        classify_codex_exit, claude_account, codex_args, codex_echoed_prompt,
+        codex_login_status_args, codex_output_file, forbidden_claude_review_arg,
+        forbidden_codex_arg, parse_codex_retry_after, parse_codex_verdict, path_is_inside,
+        prepare_codex_output, read_codex_output, review_input_too_large, sonnet_review_args,
     };
 
     #[test]
@@ -1949,52 +2081,51 @@ mod tests {
     const QUOTA: &str = "ERROR: Quota exceeded. Check your plan and billing details.";
     const VERSION: &str = "codex-cli 0.169.0";
 
+    fn limit_of(stderr: &str, prompt: &str, packet: &str) -> CodexExit {
+        classify_codex_exit(Some(1), stderr, "", "", VERSION, prompt, packet)
+    }
+
     #[test]
     fn codex_limit_needs_every_signal() {
         assert!(matches!(
-            classify_codex_exit(Some(1), USAGE, "", "", VERSION),
+            limit_of(USAGE, "", ""),
             CodexExit::Limited { signature } if signature == "usage_limit"
         ));
         assert!(matches!(
-            classify_codex_exit(Some(1), QUOTA, "", "", VERSION),
+            limit_of(QUOTA, "", ""),
             CodexExit::Limited { signature } if signature == "quota_exceeded"
         ));
         assert!(matches!(
-            classify_codex_exit(Some(2), USAGE, "", "", VERSION),
+            classify_codex_exit(Some(2), USAGE, "", "", VERSION, "", ""),
             CodexExit::Ordinary
         ));
         assert!(matches!(
-            classify_codex_exit(Some(1), USAGE, "", "{\"ok\":true}", VERSION),
+            classify_codex_exit(Some(1), USAGE, "", "{\"ok\":true}", VERSION, "", ""),
             CodexExit::Ordinary
         ));
         assert!(matches!(
-            classify_codex_exit(Some(1), "ERROR: something else", "", "", VERSION),
+            limit_of("ERROR: something else", "", ""),
             CodexExit::Ordinary
         ));
         let with_auth = format!("{USAGE}\nERROR: unexpected status 401 Unauthorized");
+        assert!(matches!(limit_of(&with_auth, "", ""), CodexExit::Ordinary));
         assert!(matches!(
-            classify_codex_exit(Some(1), &with_auth, "", "", VERSION),
+            classify_codex_exit(Some(1), USAGE, "", "", "codex-cli 0.1.0", "", ""),
             CodexExit::Ordinary
         ));
         assert!(matches!(
-            classify_codex_exit(Some(1), USAGE, "", "", "codex-cli 0.1.0"),
+            classify_codex_exit(Some(1), "", USAGE, "", VERSION, "", ""),
             CodexExit::Ordinary
         ));
         assert!(matches!(
-            classify_codex_exit(Some(1), "", USAGE, "", VERSION),
+            classify_codex_exit(Some(1), "", "", USAGE, VERSION, "", ""),
             CodexExit::Ordinary
         ));
         assert!(matches!(
-            classify_codex_exit(Some(1), "", "", USAGE, VERSION),
-            CodexExit::Ordinary
-        ));
-        assert!(matches!(
-            classify_codex_exit(
-                Some(1),
+            limit_of(
                 "ERROR: exceeded retry limit, last status: 429 Too Many Requests",
                 "",
-                "",
-                VERSION
+                ""
             ),
             CodexExit::Ordinary
         ));
@@ -2005,6 +2136,80 @@ mod tests {
                 "ERROR: You\u{2019}ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again later."
             ),
             None
+        );
+    }
+
+    /// Full stderr transcripts. The `user` block is the Codex 0.169.0 echo of
+    /// the prompt and the stdin packet.
+    fn echoed_transcript(prompt: &str, packet: &str, after: &str) -> String {
+        let echoed = codex_echoed_prompt(prompt, packet);
+        format!("OpenAI Codex v0.169.0\n--------\nuser\n{echoed}\n{after}")
+    }
+
+    #[test]
+    fn echoed_limit_text_does_not_override_the_last_error() {
+        let prompt = "Review the diff.";
+        let phrase = "You\u{2019}ve hit your usage limit";
+        let plain_429 = "ERROR: exceeded retry limit, last status: 429 Too Many Requests\n";
+        let server_500 = "ERROR: We\u{2019}re currently experiencing high demand, which may cause temporary errors.\n";
+        let packet = format!("diff --git a/a b/a\n+{phrase}\n");
+        assert!(
+            matches!(
+                limit_of(
+                    &echoed_transcript(prompt, &packet, plain_429),
+                    prompt,
+                    &packet
+                ),
+                CodexExit::Ordinary
+            ),
+            "echoed limit phrase plus a plain 429"
+        );
+        assert!(
+            matches!(
+                limit_of(
+                    &echoed_transcript(prompt, &packet, server_500),
+                    prompt,
+                    &packet
+                ),
+                CodexExit::Ordinary
+            ),
+            "echoed limit phrase plus a 500"
+        );
+        assert!(
+            matches!(
+                limit_of(USAGE, "Review the packet.", "diff --git a/a b/a\n+hello\n"),
+                CodexExit::Limited { signature } if signature == "usage_limit"
+            ),
+            "real limit with no echo match"
+        );
+        let forged = format!("note\nERROR: {phrase}\n");
+        assert!(
+            matches!(
+                limit_of(
+                    &echoed_transcript(prompt, &forged, server_500),
+                    prompt,
+                    &forged
+                ),
+                CodexExit::Ordinary
+            ),
+            "forged ERROR line in the packet plus an ordinary final error"
+        );
+        assert!(
+            matches!(
+                limit_of(&echoed_transcript(prompt, &forged, ""), prompt, &forged),
+                CodexExit::Ordinary
+            ),
+            "forged ERROR line is not a limit once the echo is removed"
+        );
+        let once = echoed_transcript(prompt, "diff\n", USAGE);
+        let twice = format!("{once}\n{once}");
+        assert!(
+            matches!(limit_of(&twice, prompt, "diff\n"), CodexExit::Ordinary),
+            "an echo that appears twice is ordinary"
+        );
+        assert!(
+            matches!(limit_of(USAGE, prompt, &packet), CodexExit::Ordinary),
+            "sent limit text with no located echo is ordinary"
         );
     }
 
@@ -2033,6 +2238,41 @@ mod tests {
             bad[index + 1] = "Read,Bash".to_string();
             assert!(forbidden_claude_review_arg(&bad).is_some(), "{tools}");
         }
+        for forged in [
+            "--add-dir=/p",
+            "--resume=s",
+            "-r",
+            "-r=session",
+            "-c",
+            "--tools=Bash",
+            "--allowedTools=Bash",
+            "--allowed-tools=Bash",
+            "--mcp-config=servers.json",
+            "--allow-dangerously-skip-permissions",
+        ] {
+            let mut bad = args.clone();
+            bad.push(forged.to_string());
+            assert!(
+                forbidden_claude_review_arg(&bad).is_some(),
+                "{forged} must be refused before spawn"
+            );
+        }
+        let mut equals = Vec::new();
+        let mut index = 0;
+        while index < args.len() {
+            let arg = &args[index];
+            if arg == "--tools" || arg == "--allowedTools" || arg == "--permission-mode" {
+                equals.push(format!("{}={}", arg, args[index + 1]));
+                index += 2;
+                continue;
+            }
+            equals.push(arg.clone());
+            index += 1;
+        }
+        assert!(
+            forbidden_claude_review_arg(&equals).is_none(),
+            "equals form of the read-only argv must be allowed: {equals:?}"
+        );
         let mut mode = args.clone();
         let index = mode
             .iter()

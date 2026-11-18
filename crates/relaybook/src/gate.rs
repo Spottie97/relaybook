@@ -938,7 +938,7 @@ pub(crate) fn prepare_authorize(
         return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
     }
     ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
-    refuse_pending_rereview(ledger)?;
+    refuse_pending_rereview(ledger, sha)?;
     match ledger.release_review_at(sha)? {
         Some(review) if review.verdict.as_deref() == Some("approved") => {}
         _ => {
@@ -1076,8 +1076,10 @@ pub(crate) fn refuse_live_workflow(ledger: &Ledger) -> Result<(), Error> {
 /// `release authorize` is allowed when no gated run is live, or when that run
 /// is waiting at `gate_release`.
 /// `before-release` refuses while an approved Claude review has no approved
-/// Codex re-review. The database trigger is the backstop for the insert.
-pub(crate) fn refuse_pending_rereview(ledger: &Ledger) -> Result<(), Error> {
+/// Codex re-review. Live runs are checked, and so is the run on the approved
+/// release review at `sha`, including a stopped run. The database trigger is
+/// the backstop for the insert.
+pub(crate) fn refuse_pending_rereview(ledger: &Ledger, sha: &str) -> Result<(), Error> {
     if ledger.settings()?.fallback_rereview == "off" {
         return Ok(());
     }
@@ -1086,7 +1088,23 @@ pub(crate) fn refuse_pending_rereview(ledger: &Ledger) -> Result<(), Error> {
             return Err(Error::InvalidSetting("codex re-review pending".to_string()));
         }
     }
+    if let Some(review) = ledger.release_review_at(sha)?
+        && review.verdict.as_deref() == Some("approved")
+        && let Some(run_id) = review.run_id
+        && !ledger.pending_rereviews(run_id)?.is_empty()
+    {
+        return Err(Error::InvalidSetting("codex re-review pending".to_string()));
+    }
     Ok(())
+}
+
+/// True when the current `fallback_rereview` policy blocks publication.
+/// `off` does not block. The check does not look at the run's stage.
+pub(crate) fn rereview_blocks_publication(ledger: &Ledger, run_id: i64) -> Result<bool, Error> {
+    if ledger.settings()?.fallback_rereview == "off" {
+        return Ok(false);
+    }
+    Ok(!ledger.pending_rereviews(run_id)?.is_empty())
 }
 
 /// True when approve must not pass a release checkpoint while Codex still

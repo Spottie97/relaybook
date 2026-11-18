@@ -1148,7 +1148,7 @@ fn range_text(range: &gitinfo::ReleaseRange) -> String {
 fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
     let sha = sha.trim();
     let mut ledger = open_ledger(cwd)?;
-    gate::refuse_pending_rereview(&ledger)?;
+    gate::refuse_pending_rereview(&ledger, sha)?;
     gate::allow_release_authorize(&ledger)?;
     let first = gate::prepare_authorize(&ledger, cwd, sha)?;
     if let gate::PublishScreen::Present(message) =

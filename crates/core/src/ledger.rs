@@ -929,6 +929,9 @@ impl Ledger {
                     ));
                 }
             }
+            if publication_claim_blocked(conn, run)? {
+                return Err(Error::InvalidSetting("codex re-review pending".to_string()));
+            }
             crate::runs::save(conn, run)
         })
     }
@@ -1655,7 +1658,9 @@ impl Ledger {
     /// run: a run waiting at `gate_release` on `branch` supplies its id, and
     /// any other live gated run refuses the write. The caller-supplied id is
     /// kept when no gated run is live, or when the waiting run is on another
-    /// branch. `revalidate` runs inside the write transaction after the row
+    /// branch. Pending Codex coverage is the run on the selected release
+    /// review, including a stopped run and a null caller-supplied id.
+    /// `revalidate` runs inside the write transaction after the row
     /// is inserted and before commit.
     #[allow(clippy::too_many_arguments)] // sha, head, the range, and the recheck are distinct
     pub fn authorize_release_with(
@@ -1691,6 +1696,7 @@ impl Ledger {
                     ));
                 }
             };
+            refuse_selected_rereview(conn, review_id)?;
             let created_at = now(conn)?;
             let run_id = stored_authorization_run_id(conn, &branch, run_id)?;
             conn.execute(
@@ -2206,22 +2212,29 @@ impl Ledger {
             if changed != 1 {
                 return Err(stale_review());
             }
+            let ledger_mark = encode_mark(&capture_mark(conn)?, "")?;
             Ok(ProbeClaim {
                 generation: generation.checked_add(1).ok_or_else(stale_review)?,
                 token,
+                ledger_mark,
             })
         })
     }
 
-    /// Record a probe that still holds `generation` and `token`.
+    /// Record a probe that still holds `generation`, `token`, and `ledger_mark`.
+    ///
+    /// Every outcome, including a successful probe, is a halt when the ledger
+    /// mark captured by [`Self::begin_probe`] no longer matches. The returned
+    /// outcome is the one that was written.
     pub fn record_probe(
         &mut self,
         run_id: i64,
         generation: i64,
         token: &str,
         stage: &str,
+        ledger_mark: &str,
         outcome: ProbeOutcome,
-    ) -> Result<(), Error> {
+    ) -> Result<ProbeOutcome, Error> {
         self.transaction(|conn| {
             let run = crate::runs::load(conn, run_id)?;
             if run.write_stamp != generation || run.stage != stage || run.status != "active" {
@@ -2231,6 +2244,18 @@ impl Ledger {
             if run.stop_reason.as_deref() != Some(expected.as_str()) {
                 return Err(stale_review());
             }
+            let changed = match decode_mark(ledger_mark) {
+                Ok((stored, _)) => capture_mark(conn)? != stored,
+                Err(_) => true,
+            };
+            let outcome = if changed {
+                ProbeOutcome::Halt {
+                    reason: LEDGER_CHANGED_DURING_REVIEW.to_string(),
+                }
+            } else {
+                outcome
+            };
+            let written = outcome.clone();
             match outcome {
                 ProbeOutcome::Ok { version } => {
                     insert_reviewer_event(
@@ -2312,7 +2337,7 @@ impl Ledger {
                     crate::runs::save(conn, &mut run)?;
                 }
             }
-            Ok(())
+            Ok(written)
         })
     }
 
@@ -2890,10 +2915,12 @@ pub enum CodexAvailability {
 }
 
 /// A probe the driver may run. `generation` is the `write_stamp` after the claim.
+/// `ledger_mark` is the mark captured in that same write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeClaim {
     pub generation: i64,
     pub token: String,
+    pub ledger_mark: String,
 }
 
 /// What a Codex probe returned. Recorded in the same write that checks the claim.
@@ -3173,6 +3200,34 @@ fn pending_rereview_rows(conn: &Connection, run_id: i64) -> Result<Vec<PendingRe
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Error::from)
+}
+
+/// Current `fallback_rereview` policy for the run that owns the selected
+/// release review. A stopped run is included. `off` does not refuse.
+fn refuse_selected_rereview(conn: &Connection, review_id: i64) -> Result<(), Error> {
+    if crate::settings::load(conn)?.fallback_rereview == "off" {
+        return Ok(());
+    }
+    let Some(run_id) = load_review(conn, review_id)?.run_id else {
+        return Ok(());
+    };
+    if pending_rereview_rows(conn, run_id)?.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::InvalidSetting("codex re-review pending".to_string()))
+    }
+}
+
+/// The publication claim reads the current policy. Pending Codex re-reviews
+/// block `stage = publishing` unless `fallback_rereview` is `off`.
+fn publication_claim_blocked(conn: &Connection, run: &crate::runs::Run) -> Result<bool, Error> {
+    if run.stage != "publishing" || run.workflow.as_deref() != Some("gated") {
+        return Ok(false);
+    }
+    if crate::settings::load(conn)?.fallback_rereview == "off" {
+        return Ok(false);
+    }
+    Ok(!pending_rereview_rows(conn, run.id)?.is_empty())
 }
 
 fn now(conn: &Connection) -> Result<String, Error> {

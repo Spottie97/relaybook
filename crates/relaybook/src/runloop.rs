@@ -367,6 +367,11 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<i64, String> {
             git(cwd, &["checkout", &run.branch])?;
             return Err(signoff_wait(cwd));
         }
+        if crate::gate::rereview_blocks_publication(&ledger, run.id)
+            .map_err(|err| err.to_string())?
+        {
+            return Err("codex re-review pending".to_string());
+        }
         // One approve owns publication. The loser keeps the waiting row and
         // does not check out, screen, or push.
         run.stage = "publish".to_string();
@@ -1240,9 +1245,20 @@ fn reviews_section(ledger: &Ledger, run_id: i64) -> String {
     if lines.is_empty() {
         return String::new();
     }
+    let pending = match ledger.pending_rereviews(run_id) {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| row.review_id)
+            .collect::<Vec<_>>(),
+        Err(_) => lines
+            .iter()
+            .filter(|line| claude_review_awaits_coverage(line, &lines))
+            .map(|line| line.id)
+            .collect(),
+    };
     let mut body = String::from("\n## Reviews\n");
-    for line in lines {
-        let slug = line.slug.unwrap_or_else(|| {
+    for line in &lines {
+        let slug = line.slug.clone().unwrap_or_else(|| {
             if line.scope == "release" {
                 "release".to_string()
             } else {
@@ -1252,19 +1268,53 @@ fn reviews_section(ledger: &Ledger, run_id: i64) -> String {
         let model = line.reviewer_model.as_deref().unwrap_or("unset");
         let fallback = line.fallback_reason.as_deref().unwrap_or("none");
         let verdict = line.verdict.as_deref().unwrap_or("pending");
-        let state = if let Some(id) = line.rereview_of {
-            format!("re-review of {id}")
-        } else if line.reviewer == "claude" {
-            "awaiting Codex re-review".to_string()
-        } else {
-            "codex".to_string()
-        };
+        let state = review_coverage_state(line, &lines, &pending);
         body.push_str(&format!(
             "- {slug}: {reviewer} {model}; fallback: {fallback}; {verdict}; {state}\n",
             reviewer = line.reviewer
         ));
     }
     body
+}
+
+fn claude_review_covered(
+    line: &relaybook_core::RunReviewLine,
+    lines: &[relaybook_core::RunReviewLine],
+) -> bool {
+    lines.iter().any(|other| {
+        other.rereview_of == Some(line.id)
+            && other.reviewer == "codex"
+            && other.verdict.as_deref() == Some("approved")
+    })
+}
+
+fn claude_review_awaits_coverage(
+    line: &relaybook_core::RunReviewLine,
+    lines: &[relaybook_core::RunReviewLine],
+) -> bool {
+    line.reviewer == "claude"
+        && line.verdict.as_deref() == Some("approved")
+        && !claude_review_covered(line, lines)
+}
+
+fn review_coverage_state(
+    line: &relaybook_core::RunReviewLine,
+    lines: &[relaybook_core::RunReviewLine],
+    pending: &[i64],
+) -> String {
+    if let Some(id) = line.rereview_of {
+        return format!("re-review of {id}");
+    }
+    if line.reviewer == "claude" && pending.contains(&line.id) {
+        return "awaiting Codex re-review".to_string();
+    }
+    if line.reviewer == "claude" && claude_review_covered(line, lines) {
+        return "Codex re-reviewed: approved".to_string();
+    }
+    if line.reviewer == "claude" {
+        return "claude".to_string();
+    }
+    "codex".to_string()
 }
 
 struct Snap {
@@ -2327,6 +2377,7 @@ fn probe_codex(
                 claim.generation,
                 &claim.token,
                 &stage,
+                &claim.ledger_mark,
                 relaybook_core::ProbeOutcome::Halt {
                     reason: err.clone(),
                 },
@@ -2391,6 +2442,17 @@ fn probe_codex(
         Ok(ledger) => ledger,
         Err(err) => return Control::Return(fail(&err.to_string())),
     };
+    let outcome = match ledger.record_probe(
+        run_id,
+        claim.generation,
+        &claim.token,
+        &stage,
+        &claim.ledger_mark,
+        outcome,
+    ) {
+        Ok(outcome) => outcome,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
     let limited_until = match &outcome {
         relaybook_core::ProbeOutcome::Limited { retry_after, .. } => Some(retry_after.clone()),
         _ => None,
@@ -2399,9 +2461,6 @@ fn probe_codex(
         outcome,
         relaybook_core::ProbeOutcome::Failed { .. } | relaybook_core::ProbeOutcome::Halt { .. }
     );
-    if let Err(err) = ledger.record_probe(run_id, claim.generation, &claim.token, &stage, outcome) {
-        return Control::Return(fail(&err.to_string()));
-    }
     if failed {
         let run = ledger.run_by_id(run_id).ok();
         let reason = run
@@ -2855,6 +2914,11 @@ fn queue_release_review(ledger: &mut Ledger, run: &mut Run) -> Result<(), String
 fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
     if let Some(output) = refuse_workflow_change(ledger, run) {
         return output;
+    }
+    match crate::gate::rereview_blocks_publication(ledger, run.id) {
+        Ok(true) => return fail("codex re-review pending"),
+        Ok(false) => {}
+        Err(err) => return fail(&err.to_string()),
     }
     // Take the run before any publish screen. A stale snapshot fails here
     // and must not push or save over the owner.

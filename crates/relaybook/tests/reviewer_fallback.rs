@@ -108,26 +108,21 @@ struct Probes {
     _root: tempfile::TempDir,
     log: PathBuf,
     bin: PathBuf,
-    fakes: PathBuf,
 }
 
 fn install_probes() -> Probes {
     let root = tempfile::tempdir().expect("probes");
     let log = root.path().join("log");
-    let fakes = root.path().join("fakes");
     let bin = root.path().join("bin");
     fs::create_dir_all(&log).expect("log");
-    fs::create_dir_all(&fakes).expect("fakes");
     fs::create_dir_all(&bin).expect("bin");
     for name in ["claude", "cursor-agent", "gh", "codex"] {
-        copy_fake(&fakes, name);
         copy_fake(&bin, name);
     }
     Probes {
         _root: root,
         log,
         bin,
-        fakes,
     }
 }
 
@@ -206,6 +201,35 @@ fn codex_args(probes: &Probes) -> String {
     fs::read_to_string(probes.log.join("codex.args")).unwrap_or_default()
 }
 
+/// codex-verification-v2.md row 4. The sentence has no `ERROR:` prefix.
+#[test]
+fn oversized_input_fixture_matches_v2_row_4() {
+    let dir = tempfile::tempdir().expect("temp");
+    let dest = dir
+        .path()
+        .join(format!("codex{}", std::env::consts::EXE_SUFFIX));
+    fs::copy(env!("CARGO_BIN_EXE_fake"), &dest).expect("copy");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&dest).expect("meta").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&dest, permissions).expect("chmod");
+    }
+    let out = dir.path().join("out.md");
+    let output = Command::new(&dest)
+        .args(["exec", "-o", out.to_str().expect("utf8")])
+        .env("RELAYBOOK_FAKE_CODEX_KIND", "too-large")
+        .output()
+        .expect("fake");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "Input exceeds the maximum length of 1048576 characters (input_error_code input_too_large, max_chars 1048576, actual_chars 4194123)\n"
+    );
+    assert_eq!(fs::read_to_string(&out).unwrap_or_default(), "");
+}
+
 #[test]
 fn ordinary_codex_failures_never_fall_back() {
     for kind in [
@@ -256,13 +280,9 @@ fn timeout_and_vanished_codex_do_not_fall_back() {
 
     let repo = gated_repo();
     let probes = install_probes();
-    let codex_name = format!("codex{}", std::env::consts::EXE_SUFFIX);
-    write_vanishing_codex(
-        &probes.bin.join(&codex_name),
-        &probes.fakes.join(&codex_name),
-    );
     let mut cmd = relaybook(repo.path());
     apply_probes(&mut cmd, &probes);
+    cmd.env("RELAYBOOK_FAKE_CODEX_VANISH", "1");
     cmd.env("PATH", path_without_codex(&probes.bin));
     cmd.args(["run", "--prd", "prd.md", "--gates", "none"]);
     let output = cmd.output().expect("vanished");
@@ -272,22 +292,6 @@ fn timeout_and_vanished_codex_do_not_fall_back() {
     assert_eq!(event_count(repo.path()), 0);
     assert!(!claude_args(&probes).contains("--tools"));
 }
-
-#[cfg(unix)]
-fn write_vanishing_codex(path: &Path, fake: &Path) {
-    let fake = fake.display();
-    let script = format!(
-        "#!/bin/sh\nif [ \"$1\" = \"login\" ] || [ \"$1\" = \"--version\" ]; then\n  '{fake}' \"$@\"\n  status=$?\n  rm -f \"$0\"\n  exit \"$status\"\nfi\nexec '{fake}' \"$@\"\n"
-    );
-    fs::write(path, script).expect("wrapper");
-    use std::os::unix::fs::PermissionsExt;
-    let mut permissions = fs::metadata(path).expect("meta").permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).expect("chmod");
-}
-
-#[cfg(not(unix))]
-fn write_vanishing_codex(_path: &Path, _fake: &Path) {}
 
 fn path_without_codex(bin: &Path) -> std::ffi::OsString {
     let mut path = std::ffi::OsString::from(bin);
@@ -822,6 +826,308 @@ fn report_replaced_during_sonnet_review_is_not_accepted() {
         )
         .unwrap_or(0);
     assert_eq!(approved, 0, "{text}");
+}
+
+fn run_state(dir: &Path) -> (i64, String, String, String) {
+    db(dir)
+        .query_row(
+            "SELECT id, branch, status, stage FROM runs ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("run")
+}
+
+fn origin_tip(dir: &Path, branch: &str) -> Option<String> {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args([
+            "rev-parse",
+            "--verify",
+            &format!("refs/remotes/origin/{branch}"),
+        ])
+        .output()
+        .expect("rev-parse");
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn remote_checks(dir: &Path) -> i64 {
+    db(dir)
+        .query_row("SELECT COUNT(*) FROM remote_checks", [], |row| row.get(0))
+        .expect("checks")
+}
+
+/// Sonnet approves the release while re-review is off. Tightening the policy
+/// and stopping the run still blocks authorization, including a null run id.
+#[test]
+fn stopped_sonnet_release_blocks_later_authorization() {
+    let repo = gated_repo();
+    set_setting(repo.path(), "review_fallback", "sonnet");
+    set_setting(repo.path(), "fallback_rereview", "off");
+    let probes = install_probes();
+    let output = run_with(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "limit",
+    );
+    let text = text_of(&output);
+    let approved: i64 = db(repo.path())
+        .query_row(
+            "SELECT COUNT(*) FROM reviews
+             WHERE scope = 'release' AND reviewer = 'claude' AND verdict = 'approved'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("reviews");
+    assert_eq!(approved, 1, "{text}");
+    set_setting(repo.path(), "fallback_rereview", "before-release");
+    let _ = relaybook(repo.path()).args(["run", "stop"]).output();
+    let (_run_id, _branch, status, _stage) = run_state(repo.path());
+    assert_eq!(status, "stopped", "{text}");
+    let head = head_sha(repo.path());
+    let (review_id, review_sha): (i64, String) = db(repo.path())
+        .query_row(
+            "SELECT id, commit_sha FROM reviews
+             WHERE scope = 'release' AND reviewer = 'claude' AND verdict = 'approved'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("review id");
+    assert_eq!(review_sha, head, "{text}");
+    let authorize = relaybook(repo.path())
+        .args(["release", "authorize", "--sha", &head])
+        .output()
+        .expect("authorize");
+    assert!(
+        text_of(&authorize).contains("codex re-review pending"),
+        "{}",
+        text_of(&authorize)
+    );
+    let err = db(repo.path())
+        .execute(
+            "INSERT INTO release_authorizations (
+                run_id, branch, commit_sha, review_id, authorized_by, created_at
+             ) VALUES (NULL, 'feature', ?1, ?2, 'maintainer', '2026-01-01T00:00:00.000Z')",
+            rusqlite::params![head, review_id],
+        )
+        .expect_err("null run id");
+    assert!(err.to_string().contains("codex re-review pending"), "{err}");
+}
+
+#[test]
+fn tightened_policy_blocks_resume_and_publish() {
+    let repo = gated_repo();
+    set_setting(repo.path(), "review_fallback", "sonnet");
+    set_setting(repo.path(), "fallback_rereview", "off");
+    let probes = install_probes();
+    let output = run_with(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "limit",
+    );
+    let text = text_of(&output);
+    let (run_id, branch, status, stage) = run_state(repo.path());
+    assert_eq!(status, "waiting", "{text}");
+    assert_eq!(stage, "gate_release", "{text}");
+    let head = head_sha(repo.path());
+    let review_id: i64 = db(repo.path())
+        .query_row(
+            "SELECT id FROM reviews
+             WHERE scope = 'release' AND reviewer = 'claude' AND verdict = 'approved'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("review");
+    db(repo.path())
+        .execute(
+            "INSERT INTO release_authorizations (
+                run_id, branch, commit_sha, review_id, authorized_by, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 'maintainer', '2026-01-01T00:00:00.000Z')",
+            rusqlite::params![run_id, branch, head, review_id],
+        )
+        .expect("authorize while off");
+    set_setting(repo.path(), "fallback_rereview", "before-release");
+    let before = origin_tip(repo.path(), &branch);
+    let checks = remote_checks(repo.path());
+    let resumed = run_with(repo.path(), &probes, &["run", "--resume"], "limit");
+    let resumed_text = text_of(&resumed);
+    assert!(
+        resumed_text.contains("codex re-review pending"),
+        "{resumed_text}"
+    );
+    let (_id, _branch, status, stage) = run_state(repo.path());
+    assert_eq!(stage, "gate_release", "{resumed_text}");
+    assert_eq!(status, "waiting", "{resumed_text}");
+    assert!(!probes.log.join("gh.args").exists(), "{resumed_text}");
+    assert_eq!(origin_tip(repo.path(), &branch), before, "{resumed_text}");
+
+    db(repo.path())
+        .execute(
+            "UPDATE runs SET stage = 'publish', status = 'waiting', write_stamp = write_stamp + 1
+             WHERE id = ?1",
+            [run_id],
+        )
+        .expect("stage");
+    let published = run_with(repo.path(), &probes, &["run", "--resume"], "limit");
+    let published_text = text_of(&published);
+    assert!(
+        published_text.contains("codex re-review pending"),
+        "{published_text}"
+    );
+    assert!(!probes.log.join("gh.args").exists(), "{published_text}");
+    assert_eq!(origin_tip(repo.path(), &branch), before, "{published_text}");
+    assert_eq!(remote_checks(repo.path()), checks, "{published_text}");
+    let (_id, _branch, _status, stage) = run_state(repo.path());
+    assert_ne!(stage, "publishing", "{published_text}");
+}
+
+#[test]
+fn pull_request_body_names_completed_and_pending_coverage() {
+    let repo = gated_repo();
+    set_setting(repo.path(), "review_fallback", "sonnet");
+    set_setting(repo.path(), "fallback_rereview", "off");
+    let probes = install_probes();
+    let output = run_with(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "limit",
+    );
+    let text = text_of(&output);
+    let (run_id, branch, status, stage) = run_state(repo.path());
+    assert_eq!(status, "waiting", "{text}");
+    assert_eq!(stage, "gate_release", "{text}");
+    let head = head_sha(repo.path());
+    let (task_review, task_id, release_review): (i64, i64, i64) = db(repo.path())
+        .query_row(
+            "SELECT task.id, task.task_id, release.id
+             FROM reviews AS task
+             JOIN reviews AS release ON release.run_id = task.run_id
+             WHERE task.run_id = ?1
+               AND task.scope = 'task'
+               AND task.reviewer = 'claude'
+               AND task.verdict = 'approved'
+               AND release.scope = 'release'
+               AND release.reviewer = 'claude'
+               AND release.verdict = 'approved'",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("reviews");
+    db(repo.path())
+        .execute(
+            "INSERT INTO reviews (
+                scope, task_id, run_id, branch, reviewer, commit_sha, ledger_mark,
+                verdict, started_at, rereview_of
+             ) VALUES (
+                'task', ?1, ?2, ?3, 'codex', ?4, 'mark',
+                'approved', '2026-01-01T00:00:00.000Z', ?5
+             )",
+            rusqlite::params![task_id, run_id, branch, head, task_review],
+        )
+        .expect("rereview");
+    db(repo.path())
+        .execute(
+            "INSERT INTO release_authorizations (
+                run_id, branch, commit_sha, review_id, authorized_by, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 'maintainer', '2026-01-01T00:00:00.000Z')",
+            rusqlite::params![run_id, branch, head, release_review],
+        )
+        .expect("authorize");
+    let published = run_with(repo.path(), &probes, &["run", "--resume"], "limit");
+    let published_text = text_of(&published);
+    let body = fs::read_to_string(probes.log.join("gh.args")).unwrap_or_default();
+    assert!(
+        body.contains("Codex re-reviewed: approved"),
+        "{published_text}\n{body}"
+    );
+    assert!(
+        body.contains("awaiting Codex re-review"),
+        "{published_text}\n{body}"
+    );
+    assert!(
+        body.contains(&format!("re-review of {task_review}")),
+        "{published_text}\n{body}"
+    );
+}
+
+#[test]
+fn probe_stops_when_the_ledger_changes_during_the_probe() {
+    let repo = gated_repo();
+    set_setting(repo.path(), "review_fallback", "sonnet");
+    let probes = install_probes();
+    let output = run_with(
+        repo.path(),
+        &probes,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "limit",
+    );
+    assert!(
+        text_of(&output).contains("waiting for Codex re-review"),
+        "{}",
+        text_of(&output)
+    );
+    db(repo.path())
+        .execute(
+            "UPDATE reviewer_events SET retry_after = strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 minutes')",
+            [],
+        )
+        .expect("backdate");
+    let hold = probes.log.join("hold");
+    fs::create_dir_all(&hold).expect("hold");
+    let mut child = spawn_probe(repo.path(), &probes, &hold);
+    assert!(
+        wait_for(&hold.join("started-1"), Duration::from_secs(45)),
+        "probe did not start\n{}",
+        held_output(&probes, "probe")
+    );
+    let changed = db(repo.path())
+        .execute(
+            "UPDATE tasks SET updated_at = '2099-01-01T00:00:00.000Z'",
+            [],
+        )
+        .expect("mutate");
+    assert!(changed >= 1, "no task row to mutate");
+    fs::write(hold.join("release-1"), "{\"ok\":true}\n").expect("release");
+    let _ = wait_child(&mut child, Duration::from_secs(30));
+    let text = held_output(&probes, "probe");
+    assert!(text.contains("ledger changed during review"), "{text}");
+    assert!(!text.contains("Codex probe ok"), "{text}");
+    assert!(!text.contains("Switched back to Codex"), "{text}");
+    let kinds: Vec<String> = db(repo.path())
+        .prepare("SELECT kind FROM reviewer_events ORDER BY id")
+        .expect("prepare")
+        .query_map([], |row| row.get(0))
+        .expect("map")
+        .map(|row| row.expect("kind"))
+        .collect();
+    assert!(kinds.contains(&"probe_failed".to_string()), "{kinds:?}");
+    assert!(!kinds.contains(&"probe_ok".to_string()), "{kinds:?}");
+    assert!(
+        !kinds.contains(&"switched_to_codex".to_string()),
+        "{kinds:?}"
+    );
+}
+
+fn spawn_probe(dir: &Path, probes: &Probes, hold: &Path) -> std::process::Child {
+    let mut cmd = relaybook(dir);
+    apply_probes(&mut cmd, probes);
+    cmd.env("RELAYBOOK_FAKE_CODEX_KIND", "hold");
+    cmd.env("RELAYBOOK_CODEX_HOLD", hold);
+    cmd.args(["run", "--resume"]);
+    cmd.stdout(std::process::Stdio::from(
+        fs::File::create(probes.log.join("probe.out")).expect("stdout"),
+    ));
+    cmd.stderr(std::process::Stdio::from(
+        fs::File::create(probes.log.join("probe.err")).expect("stderr"),
+    ));
+    cmd.spawn().expect("spawn")
 }
 
 fn head_sha(dir: &Path) -> String {
