@@ -1394,8 +1394,8 @@ fn review_with_codex(
         }
     }
     let prepared = match &scope {
-        CodexScope::Task(slug) => crate::gate::start_task_review(&mut ledger, cwd, run_id, slug),
-        CodexScope::Release => crate::gate::start_release_review(&mut ledger, cwd, run_id),
+        CodexScope::Task(slug) => crate::gate::start_task_review(&mut ledger, cwd, &run, slug),
+        CodexScope::Release => crate::gate::start_release_review(&mut ledger, cwd, &run),
     };
     let prepared = match prepared {
         Ok(prepared) => prepared,

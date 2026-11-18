@@ -163,13 +163,14 @@ fn install_probes() -> Probes {
     }
 }
 
+/// Path of a copied fake: `name` plus `std::env::consts::EXE_SUFFIX`.
+fn fake_executable(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+}
+
 fn copy_fake(dir: &Path, name: &str) {
     let src = PathBuf::from(env!("CARGO_BIN_EXE_fake"));
-    let dest = if cfg!(windows) {
-        dir.join(format!("{name}.exe"))
-    } else {
-        dir.join(name)
-    };
+    let dest = fake_executable(dir, name);
     fs::copy(src, &dest).expect("copy fake");
     #[cfg(unix)]
     {
@@ -2049,7 +2050,7 @@ fn assert_codex_argv(line: &str, read_only: bool) {
 fn missing_codex_fails_preflight() {
     let repo = gated_repo();
     let probes = install_probes();
-    fs::remove_file(probes.bin.join("codex")).expect("remove codex");
+    fs::remove_file(fake_executable(&probes.bin, "codex")).expect("remove codex");
     let mut cmd = relaybook(repo.path());
     apply_probes(&mut cmd, &probes);
     cmd.env("PATH", &probes.bin);
@@ -2072,7 +2073,7 @@ fn path_without_real_codex(bin: &Path) -> std::ffi::OsString {
     let mut path = std::ffi::OsString::from(bin);
     if let Some(rest) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&rest) {
-            if dir.join("codex").is_file() || dir.join("codex.exe").is_file() {
+            if fake_executable(&dir, "codex").is_file() || dir.join("codex.exe").is_file() {
                 continue;
             }
             path.push(":");
@@ -3267,13 +3268,14 @@ struct PendingReviewIdentity {
     report_id: Option<i64>,
     started_at: String,
     ledger_mark: String,
+    invocation_token: Option<String>,
 }
 
 fn pending_reviews(dir: &Path) -> Vec<PendingReviewIdentity> {
     let conn = rusqlite::Connection::open(dir.join(".relaybook").join("ledger.db")).expect("open");
     let mut stmt = conn
         .prepare(
-            "SELECT id, report_id, started_at, ledger_mark
+            "SELECT id, report_id, started_at, ledger_mark, invocation_token
              FROM reviews WHERE verdict IS NULL ORDER BY id",
         )
         .expect("prepare");
@@ -3283,6 +3285,7 @@ fn pending_reviews(dir: &Path) -> Vec<PendingReviewIdentity> {
             report_id: row.get(1)?,
             started_at: row.get(2)?,
             ledger_mark: row.get(3)?,
+            invocation_token: row.get(4)?,
         })
     })
     .expect("query")
@@ -3549,6 +3552,214 @@ fn stale_review_preparer_cannot_replace_a_newer_pending_review() {
         "{:?}",
         report_rows(repo.path())
     );
+}
+
+#[test]
+fn stale_task_preparer_paused_before_reload_keeps_the_newer_review() {
+    assert_stale_preparer_paused_before_reload(false);
+}
+
+#[test]
+fn stale_release_preparer_paused_before_reload_keeps_the_newer_review() {
+    assert_stale_preparer_paused_before_reload(true);
+}
+
+/// Pause the older preparer on the review-start reload, stop/resume, and let
+/// the replacement reach Codex. `release_review` holds the second pause, after
+/// the older process has finished its task review.
+fn assert_stale_preparer_paused_before_reload(release_review: bool) {
+    let repo = gated_repo();
+    let probes = install_probes();
+    copy_fake(&probes.bin, "graphify");
+    let prepare = probes.log.join("prepare-hold");
+    let codex = probes.log.join("codex-hold");
+    fs::create_dir_all(&prepare).expect("prepare hold");
+    fs::create_dir_all(&codex).expect("codex hold");
+    let mut guard = ProcessGuard {
+        releases: vec![prepare.clone(), codex.clone()],
+        children: Vec::new(),
+    };
+    let slot = if release_review { 2 } else { 1 };
+    guard.children.push(spawn_prepare_pause(
+        repo.path(),
+        &probes,
+        &prepare,
+        &["run", "--prd", "prd.md", "--gates", "none"],
+        "older",
+    ));
+    if release_review {
+        assert!(
+            wait_for_file(
+                &prepare.join("started-1"),
+                std::time::Duration::from_secs(45)
+            ),
+            "task prepare did not block\n{}",
+            held_output(&probes, "older")
+        );
+        fs::write(prepare.join("release-1"), "go\n").expect("release task prepare");
+    }
+    assert!(
+        wait_for_file(
+            &prepare.join(format!("started-{slot}")),
+            std::time::Duration::from_secs(45)
+        ),
+        "prepare did not block before the run reload\n{}",
+        held_output(&probes, "older")
+    );
+    assert!(
+        pending_reviews(repo.path()).is_empty(),
+        "a pending review existed before this starter reloaded the run: {:?}",
+        pending_reviews(repo.path())
+    );
+    let stop = relaybook(repo.path())
+        .args(["run", "stop"])
+        .output()
+        .expect("stop");
+    let stop_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        !stop.status.success() && stop_text.contains("stopped"),
+        "{stop_text}"
+    );
+    guard.children.push(spawn_codex_pause(
+        repo.path(),
+        &probes,
+        &codex,
+        &["run", "--resume"],
+        "newer",
+    ));
+    assert!(
+        wait_for_file(&codex.join("started-1"), std::time::Duration::from_secs(45)),
+        "replacement invocation did not reach codex\n{}",
+        held_output(&probes, "newer")
+    );
+    let pending = pending_reviews(repo.path());
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let newer = pending[0].clone();
+    assert!(
+        newer
+            .invocation_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty()),
+        "replacement review has no invocation token: {newer:?}"
+    );
+    fs::write(prepare.join(format!("release-{slot}")), "go\n").expect("release stale prepare");
+    let started = std::time::Instant::now();
+    loop {
+        let kept = pending_reviews(repo.path());
+        if kept != vec![newer.clone()] {
+            let older_text = held_output(&probes, "older");
+            assert_eq!(
+                kept,
+                vec![newer.clone()],
+                "the stale preparer replaced the newer review\n{older_text}"
+            );
+        }
+        if child_exited(&mut guard.children[0], std::time::Duration::from_millis(50)) {
+            break;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(20) {
+            panic!(
+                "stale preparer did not finish\n{}",
+                held_output(&probes, "older")
+            );
+        }
+    }
+    let older_text = held_output(&probes, "older");
+    let kept = pending_reviews(repo.path());
+    assert_eq!(
+        kept,
+        vec![newer.clone()],
+        "the stale preparer replaced the newer review\n{older_text}"
+    );
+    assert_eq!(kept[0].id, newer.id);
+    assert_eq!(kept[0].invocation_token, newer.invocation_token);
+    assert_eq!(kept[0].started_at, newer.started_at);
+    assert!(
+        older_text.contains("stale review invocation"),
+        "{older_text}"
+    );
+    let row = run_row(repo.path());
+    assert_eq!(row.status, "active", "{} {}", row.stage, row.status);
+    assert!(
+        row.stop_reason.is_none(),
+        "stale preparer stopped the live run: {} {:?}",
+        row.status,
+        row.stop_reason
+    );
+    if release_review {
+        assert_eq!(row.stage, "release_review", "{}", row.status);
+    } else {
+        assert_eq!(row.stage, "review", "{}", row.status);
+    }
+    assert!(
+        guard.children[1].try_wait().expect("newer").is_none(),
+        "replacement invocation exited\n{}",
+        held_output(&probes, "newer")
+    );
+}
+
+struct ProcessGuard {
+    releases: Vec<PathBuf>,
+    children: Vec<std::process::Child>,
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        for dir in &self.releases {
+            for n in 1..=8 {
+                let _ = fs::write(dir.join(format!("release-{n}")), "go\n");
+            }
+        }
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn spawn_prepare_pause(
+    dir: &Path,
+    probes: &Probes,
+    prepare: &Path,
+    args: &[&str],
+    name: &str,
+) -> std::process::Child {
+    let mut cmd = relaybook(dir);
+    apply_probes(&mut cmd, probes);
+    cmd.env("RELAYBOOK_REVIEW_PREPARE_HOLD", prepare);
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::from(
+        fs::File::create(probes.log.join(format!("{name}.out"))).expect("stdout"),
+    ));
+    cmd.stderr(std::process::Stdio::from(
+        fs::File::create(probes.log.join(format!("{name}.err"))).expect("stderr"),
+    ));
+    cmd.spawn().expect("spawn")
+}
+
+fn spawn_codex_pause(
+    dir: &Path,
+    probes: &Probes,
+    codex: &Path,
+    args: &[&str],
+    name: &str,
+) -> std::process::Child {
+    let mut cmd = relaybook(dir);
+    apply_probes(&mut cmd, probes);
+    cmd.env("RELAYBOOK_FAKE_KIND", "hold");
+    cmd.env("RELAYBOOK_CODEX_HOLD", codex);
+    cmd.args(args);
+    cmd.stdout(std::process::Stdio::from(
+        fs::File::create(probes.log.join(format!("{name}.out"))).expect("stdout"),
+    ));
+    cmd.stderr(std::process::Stdio::from(
+        fs::File::create(probes.log.join(format!("{name}.err"))).expect("stderr"),
+    ));
+    cmd.spawn().expect("spawn")
 }
 
 #[test]

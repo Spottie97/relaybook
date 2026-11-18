@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use relaybook_core::{Error, Ledger, OwnedReviewExpect, Review, ScopedTask, Status};
+use relaybook_core::{Error, Ledger, OwnedReviewExpect, Review, Run, ScopedTask, Status};
 
 use crate::gitinfo;
 
@@ -437,10 +437,13 @@ pub(crate) struct PreparedReview {
 /// Start the owning run's task review and refresh the graph.
 /// Manual `review start` still refuses a live run. A failed refresh is recorded
 /// and does not stop the review.
+///
+/// `run` is the driver's snapshot, including the `write_stamp` and stage claimed
+/// before preparation. This function does not reload the run.
 pub(crate) fn start_task_review(
     ledger: &mut Ledger,
     cwd: &Path,
-    run_id: i64,
+    run: &Run,
     slug: &str,
 ) -> Result<PreparedReview, Error> {
     if ledger.settings()?.workflow != "gated" {
@@ -472,11 +475,22 @@ pub(crate) fn start_task_review(
             ));
         }
     }
-    let run = ledger.run_by_id(run_id)?;
+    if run.stage != "review" {
+        return Err(Error::InvalidSetting(
+            relaybook_core::STALE_REVIEW_INVOCATION.to_string(),
+        ));
+    }
+    // Fixed for this driver before the pause. A later write_stamp must not be adopted.
+    let run_id = run.id;
+    let generation = run.write_stamp;
+    let stage = run.stage.clone();
+    let agent_calls = run.agent_calls;
+    // Tests pause here, before the start transaction reads the live run.
+    hold_owned_review_prepare()?;
     let expect = OwnedReviewExpect {
-        generation: run.write_stamp,
-        stage: run.stage,
-        agent_calls: run.agent_calls + 1,
+        generation,
+        stage,
+        agent_calls: agent_calls + 1,
         report_id: Some(report.id),
         report_body: Some(report.body.clone()),
     };
@@ -537,10 +551,13 @@ pub(crate) fn start_task_review(
 
 /// Start the owning run's release review and refresh the graph.
 /// A failed refresh is recorded and does not stop the review.
+///
+/// `run` is the driver's snapshot, including the `write_stamp` and stage claimed
+/// before preparation. This function does not reload the run.
 pub(crate) fn start_release_review(
     ledger: &mut Ledger,
     cwd: &Path,
-    run_id: i64,
+    run: &Run,
 ) -> Result<PreparedReview, Error> {
     if ledger.settings()?.workflow != "gated" {
         return Err(Error::InvalidSetting(
@@ -549,11 +566,21 @@ pub(crate) fn start_release_review(
     }
     let checkout = release_checkout(ledger, cwd, "review start")?;
     ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
-    let run = ledger.run_by_id(run_id)?;
+    if run.stage != "release_review" {
+        return Err(Error::InvalidSetting(
+            relaybook_core::STALE_REVIEW_INVOCATION.to_string(),
+        ));
+    }
+    let run_id = run.id;
+    let generation = run.write_stamp;
+    let stage = run.stage.clone();
+    let agent_calls = run.agent_calls;
+    // Same pause point as the task starter, before the start transaction.
+    hold_owned_review_prepare()?;
     let expect = OwnedReviewExpect {
-        generation: run.write_stamp,
-        stage: run.stage,
-        agent_calls: run.agent_calls + 1,
+        generation,
+        stage,
+        agent_calls: agent_calls + 1,
         report_id: None,
         report_body: None,
     };
@@ -920,6 +947,67 @@ pub(crate) fn task_is_done(ledger: &Ledger, slug: &str) -> Result<bool, Error> {
         .list_tasks(Some(Status::Done), false, true)?
         .iter()
         .any(|task| task.slug == slug))
+}
+
+/// Test seam. `RELAYBOOK_REVIEW_PREPARE_HOLD` is a directory; the starter
+/// writes `started-N` and waits for `release-N` before the start transaction.
+/// Unset, this returns immediately. Release builds ignore the variable.
+fn hold_owned_review_prepare() -> Result<(), Error> {
+    #[cfg(debug_assertions)]
+    {
+        hold_owned_review_prepare_for_tests()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(debug_assertions)]
+fn hold_owned_review_prepare_for_tests() -> Result<(), Error> {
+    let Ok(dir) = std::env::var("RELAYBOOK_REVIEW_PREPARE_HOLD") else {
+        return Ok(());
+    };
+    if dir.is_empty() {
+        return Ok(());
+    }
+    let root = PathBuf::from(dir);
+    std::fs::create_dir_all(&root)
+        .map_err(|err| Error::InvalidSetting(format!("review prepare hold: {err}")))?;
+    let seq = claim_prepare_slot(&root)?;
+    std::fs::write(root.join(format!("started-{seq}")), b"prepare")
+        .map_err(|err| Error::InvalidSetting(format!("review prepare hold: {err}")))?;
+    let release = root.join(format!("release-{seq}"));
+    for _ in 0..1600 {
+        if release.is_file() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Err(Error::InvalidSetting(
+        "review prepare hold timed out".to_string(),
+    ))
+}
+
+#[cfg(debug_assertions)]
+fn claim_prepare_slot(dir: &Path) -> Result<u32, Error> {
+    for n in 1..100 {
+        let path = dir.join(format!("claim-{n}"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(n),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(Error::InvalidSetting(format!("review prepare hold: {err}")));
+            }
+        }
+    }
+    Err(Error::InvalidSetting(
+        "review prepare hold slot failed".to_string(),
+    ))
 }
 
 fn require_gated_clean_tree(cwd: &Path, ledger: &Ledger) -> Result<(), Error> {
