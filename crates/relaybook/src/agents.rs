@@ -68,16 +68,6 @@ pub(crate) enum AccountKind {
     Plan,
 }
 
-impl AccountKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::ApiKey => "api key",
-            Self::Subscription => "subscription account",
-            Self::Plan => "plan account",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Accounts {
     pub claude: AccountKind,
@@ -136,12 +126,30 @@ pub(crate) fn require_codex() -> Result<(), String> {
     }
 }
 
-pub(crate) fn account_line(accounts: &Accounts) -> String {
-    format!(
-        "claude: {}, cursor: {}",
-        accounts.claude.label(),
-        accounts.cursor.label()
-    )
+/// Every arm is a literal, so nothing read from claude, cursor-agent, or the
+/// environment reaches stdout.
+pub(crate) fn preflight_summary(kinds: Accounts) -> &'static str {
+    match (kinds.claude, kinds.cursor) {
+        (AccountKind::ApiKey, AccountKind::ApiKey) => "claude: api key, cursor: api key",
+        (AccountKind::ApiKey, AccountKind::Subscription) => {
+            "claude: api key, cursor: subscription account"
+        }
+        (AccountKind::ApiKey, AccountKind::Plan) => "claude: api key, cursor: plan account",
+        (AccountKind::Subscription, AccountKind::ApiKey) => {
+            "claude: subscription account, cursor: api key"
+        }
+        (AccountKind::Subscription, AccountKind::Subscription) => {
+            "claude: subscription account, cursor: subscription account"
+        }
+        (AccountKind::Subscription, AccountKind::Plan) => {
+            "claude: subscription account, cursor: plan account"
+        }
+        (AccountKind::Plan, AccountKind::ApiKey) => "claude: plan account, cursor: api key",
+        (AccountKind::Plan, AccountKind::Subscription) => {
+            "claude: plan account, cursor: subscription account"
+        }
+        (AccountKind::Plan, AccountKind::Plan) => "claude: plan account, cursor: plan account",
+    }
 }
 
 pub(crate) fn call_claude(
@@ -1877,11 +1885,11 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        AccountKind, Accounts, AgentResult, CodexExit, CodexSandbox, account_line, classify,
-        classify_codex_exit, classify_failed_codex_exit, claude_account, codex_args,
-        codex_echoed_prompt, codex_login_status_args, codex_output_file,
-        forbidden_claude_review_arg, forbidden_codex_arg, parse_claude_review_envelope,
-        parse_codex_retry_after, parse_codex_verdict, path_is_inside, review_input_too_large,
+        AccountKind, Accounts, AgentResult, CodexExit, CodexSandbox, classify, classify_codex_exit,
+        classify_failed_codex_exit, claude_account, codex_args, codex_echoed_prompt,
+        codex_login_status_args, codex_output_file, forbidden_claude_review_arg,
+        forbidden_codex_arg, parse_claude_review_envelope, parse_codex_retry_after,
+        parse_codex_verdict, path_is_inside, preflight_summary, review_input_too_large,
         sonnet_review_args,
     };
     #[cfg(unix)]
@@ -1927,12 +1935,12 @@ mod tests {
     }
 
     #[test]
-    fn account_line_never_prints_the_api_key_or_an_address() {
+    fn preflight_summary_never_prints_the_api_key_or_an_address() {
         let sentinel = "sentinel-key-value";
         let previous = std::env::var_os("ANTHROPIC_API_KEY");
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", sentinel) };
         let kind = claude_account().expect("api key");
-        let line = account_line(&Accounts {
+        let line = preflight_summary(Accounts {
             claude: kind,
             cursor: AccountKind::Plan,
         });
@@ -1946,6 +1954,34 @@ mod tests {
         assert_eq!(line, "claude: api key, cursor: plan account");
         assert!(!line.contains(sentinel));
         assert!(!line.contains('@'));
+    }
+
+    #[test]
+    fn preflight_summary_covers_every_kind_pair() {
+        fn expected(kind: AccountKind) -> &'static str {
+            match kind {
+                AccountKind::ApiKey => "api key",
+                AccountKind::Subscription => "subscription account",
+                AccountKind::Plan => "plan account",
+            }
+        }
+        for claude in [
+            AccountKind::ApiKey,
+            AccountKind::Subscription,
+            AccountKind::Plan,
+        ] {
+            for cursor in [
+                AccountKind::ApiKey,
+                AccountKind::Subscription,
+                AccountKind::Plan,
+            ] {
+                let line = preflight_summary(Accounts { claude, cursor });
+                assert_eq!(
+                    line,
+                    format!("claude: {}, cursor: {}", expected(claude), expected(cursor))
+                );
+            }
+        }
     }
 
     #[test]

@@ -121,6 +121,12 @@ fn spawn_holder(pid_path: &std::ffi::OsStr) {
             });
         }
     }
+    #[cfg(windows)]
+    {
+        // The holder's extra stdout must not keep git's pipe open. Stderr stays
+        // inheritable: the test is that the descendant holds stderr.
+        clear_inherited_input_and_output();
+    }
     match child.spawn() {
         Ok(child) => {
             if fs::write(pid_path, child.id().to_string()).is_err() {
@@ -131,6 +137,32 @@ fn spawn_holder(pid_path: &std::ffi::OsStr) {
         Err(err) => {
             eprintln!("git shim: {err}");
             process::exit(2);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn clear_inherited_input_and_output() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[allow(non_snake_case)]
+        fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
+        #[allow(non_snake_case)]
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = usize::MAX as *mut std::ffi::c_void;
+    // SAFETY: borrows this process's standard handles and clears the inherit
+    // bit. Stderr is left inheritable so the holder keeps it open.
+    unsafe {
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE] {
+            let handle = GetStdHandle(id);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
         }
     }
 }

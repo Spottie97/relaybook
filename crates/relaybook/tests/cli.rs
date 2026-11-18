@@ -11,6 +11,11 @@ use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use serde_json::{Value, json};
 
+#[path = "support/conpty.rs"]
+mod conpty;
+
+use conpty::ENTER;
+
 #[test]
 fn claim_race_has_one_winner() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -5721,14 +5726,16 @@ fn authorize_and_replace_signoff_tag(
         let mut buf = Vec::new();
         let mut tmp = [0_u8; 1024];
         let mut sent = false;
+        let mut answered = 0;
         loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
+                    conpty::answer_cursor_queries(&buf, &mut answered, &mut writer);
                     let phrases = typed_phrases(&buf);
                     if !sent && !phrases.is_empty() {
-                        let phrase = format!("{}\n", phrases[0]);
+                        let phrase = format!("{}{ENTER}", phrases[0]);
                         let _ = writer.write_all(phrase.as_bytes());
                         let _ = writer.flush();
                         sent = true;
@@ -5748,6 +5755,7 @@ fn authorize_and_replace_signoff_tag(
         }
         match PtyChild::try_wait(child.as_mut()) {
             Ok(Some(_)) => {
+                drop(pair.master);
                 let buf = recv
                     .recv_timeout(Duration::from_secs(5))
                     .unwrap_or_default();
@@ -5782,13 +5790,14 @@ fn authorize_and_replace_signoff_tag(
             Err(err) => panic!("wait failed: {err}"),
         }
     };
+    drop(pair.master);
     let buf = recv
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
     PtyOutput {
         success: status.success(),
         code: status.exit_code(),
-        output: String::from_utf8_lossy(&buf).into_owned(),
+        output: conpty::strip_vt(&String::from_utf8_lossy(&buf)),
     }
 }
 
@@ -5832,14 +5841,16 @@ fn authorize_at_tty(dir: &Path, fake: &GraphifyFake, log: Option<&Path>, sha: &s
         let mut buf = Vec::new();
         let mut tmp = [0_u8; 1024];
         let mut sent = false;
+        let mut answered = 0;
         loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
+                    conpty::answer_cursor_queries(&buf, &mut answered, &mut writer);
                     let phrases = typed_phrases(&buf);
                     if !sent && !phrases.is_empty() {
-                        let phrase = format!("{}\n", phrases[0]);
+                        let phrase = format!("{}{ENTER}", phrases[0]);
                         let _ = writer.write_all(phrase.as_bytes());
                         let _ = writer.flush();
                         sent = true;
@@ -5864,18 +5875,19 @@ fn authorize_at_tty(dir: &Path, fake: &GraphifyFake, log: Option<&Path>, sha: &s
             Err(err) => panic!("wait failed: {err}"),
         }
     };
+    drop(pair.master);
     let buf = recv
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
     PtyOutput {
         success: status.success(),
         code: status.exit_code(),
-        output: String::from_utf8_lossy(&buf).into_owned(),
+        output: conpty::strip_vt(&String::from_utf8_lossy(&buf)),
     }
 }
 
 fn typed_phrases(buf: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(buf);
+    let text = conpty::strip_vt(&String::from_utf8_lossy(buf));
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines: Vec<&str> = text.split('\n').collect();
     if !text.ends_with('\n') {
@@ -5889,6 +5901,36 @@ fn typed_phrases(buf: &[u8]) -> Vec<String> {
                 .map(ToOwned::to_owned)
         })
         .collect()
+}
+
+#[test]
+fn typed_phrases_reads_a_conpty_style_prompt() {
+    let buf = b"\x1b]0;relaybook.exe\x07\x1b[?25l\x1b[HAuthorize this release?\r\nType release 0123456789ab\x1b[K\r\n";
+    assert_eq!(typed_phrases(buf), vec!["release 0123456789ab".to_string()]);
+}
+
+#[test]
+fn answer_cursor_queries_replies_once_per_request() {
+    let mut answered = 0;
+    let mut out = Vec::new();
+    conpty::answer_cursor_queries(b"\x1b[6", &mut answered, &mut out);
+    assert_eq!(answered, 0);
+    assert!(out.is_empty());
+    let mut buf = b"\x1b[6".to_vec();
+    buf.extend_from_slice(b"n\x1b[6n");
+    conpty::answer_cursor_queries(&buf, &mut answered, &mut out);
+    assert_eq!(answered, 2);
+    assert_eq!(out, b"\x1b[1;1R\x1b[1;1R");
+    let len = out.len();
+    conpty::answer_cursor_queries(&buf, &mut answered, &mut out);
+    assert_eq!(answered, 2);
+    assert_eq!(out.len(), len);
+}
+
+#[test]
+fn strip_vt_leaves_plain_text_unchanged() {
+    let text = "Type release 0123456789ab\n";
+    assert_eq!(conpty::strip_vt(text), text);
 }
 
 fn posix_shell() -> PathBuf {
@@ -5928,14 +5970,19 @@ fn pty_run(dir: &Path, program: &Path, args: &[&str]) -> PtyOutput {
     let mut child = pair.slave.spawn_command(cmd).expect("spawn");
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().expect("reader");
+    let mut writer = pair.master.take_writer().expect("writer");
     let (send, recv) = mpsc::channel();
     thread::spawn(move || {
         let mut buf = Vec::new();
         let mut tmp = [0_u8; 1024];
+        let mut answered = 0;
         loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
-                Ok(count) => buf.extend_from_slice(&tmp[..count]),
+                Ok(count) => {
+                    buf.extend_from_slice(&tmp[..count]);
+                    conpty::answer_cursor_queries(&buf, &mut answered, &mut writer);
+                }
                 Err(_) => break,
             }
         }
@@ -5955,13 +6002,14 @@ fn pty_run(dir: &Path, program: &Path, args: &[&str]) -> PtyOutput {
             Err(err) => panic!("wait failed: {err}"),
         }
     };
+    drop(pair.master);
     let buf = recv
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
     PtyOutput {
         success: status.success(),
         code: status.exit_code(),
-        output: String::from_utf8_lossy(&buf).into_owned(),
+        output: conpty::strip_vt(&String::from_utf8_lossy(&buf)),
     }
 }
 
@@ -6061,19 +6109,24 @@ fn answer_prompts_in(
         let mut buf = Vec::new();
         let mut tmp = [0_u8; 1024];
         let mut sent = 0usize;
+        let mut answered = 0;
         loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
+                    conpty::answer_cursor_queries(&buf, &mut answered, &mut writer);
                     let phrases = typed_phrases(&buf);
                     while sent < answers.len() && phrases.len() > sent {
                         if !delay.is_zero() {
                             thread::sleep(delay);
                         }
                         let line = match answers[sent] {
-                            PromptAnswer::Phrase => format!("{}\n", phrases[sent]),
-                            PromptAnswer::Text(text) => text.to_string(),
+                            PromptAnswer::Phrase => format!("{}{ENTER}", phrases[sent]),
+                            PromptAnswer::Text(text) => text.strip_suffix('\n').map_or_else(
+                                || text.to_string(),
+                                |prefix| format!("{prefix}{ENTER}"),
+                            ),
                         };
                         let _ = writer.write_all(line.as_bytes());
                         let _ = writer.flush();
@@ -6099,13 +6152,14 @@ fn answer_prompts_in(
             Err(err) => panic!("wait failed: {err}"),
         }
     };
+    drop(pair.master);
     let buf = recv
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
     PtyOutput {
         success: status.success(),
         code: status.exit_code(),
-        output: String::from_utf8_lossy(&buf).into_owned(),
+        output: conpty::strip_vt(&String::from_utf8_lossy(&buf)),
     }
 }
 
@@ -6145,16 +6199,18 @@ fn authorize_and_insert_during_second_prompt(dir: &Path, sha: &str) -> PtyOutput
         let mut buf = Vec::new();
         let mut tmp = [0_u8; 1024];
         let mut stage = 0usize;
+        let mut answered = 0;
         loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
-                    let text = String::from_utf8_lossy(&buf);
+                    conpty::answer_cursor_queries(&buf, &mut answered, &mut writer);
+                    let text = conpty::strip_vt(&String::from_utf8_lossy(&buf));
                     let phrases = typed_phrases(&buf);
                     if stage == 0 && text.contains("Authorize this release?") && !phrases.is_empty()
                     {
-                        let line = format!("{}\n", phrases[0]);
+                        let line = format!("{}{ENTER}", phrases[0]);
                         let _ = writer.write_all(line.as_bytes());
                         let _ = writer.flush();
                         stage = 1;
@@ -6164,7 +6220,7 @@ fn authorize_and_insert_during_second_prompt(dir: &Path, sha: &str) -> PtyOutput
                     {
                         let id = insert_concurrent_remote_check(&ledger_dir);
                         let _ = inserted_tx.send(id);
-                        let line = format!("{}\n", phrases[1]);
+                        let line = format!("{}{ENTER}", phrases[1]);
                         let _ = writer.write_all(line.as_bytes());
                         let _ = writer.flush();
                         stage = 2;
@@ -6189,6 +6245,7 @@ fn authorize_and_insert_during_second_prompt(dir: &Path, sha: &str) -> PtyOutput
             Err(err) => panic!("wait failed: {err}"),
         }
     };
+    drop(pair.master);
     let buf = recv
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
@@ -6198,6 +6255,6 @@ fn authorize_and_insert_during_second_prompt(dir: &Path, sha: &str) -> PtyOutput
     PtyOutput {
         success: status.success(),
         code: status.exit_code(),
-        output: String::from_utf8_lossy(&buf).into_owned(),
+        output: conpty::strip_vt(&String::from_utf8_lossy(&buf)),
     }
 }

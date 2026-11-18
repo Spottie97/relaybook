@@ -137,7 +137,7 @@ fn apply_overrides(db: &Path, launch: &Launch) -> Result<(), String> {
 }
 
 fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Result<i64, String> {
-    let accounts = agents::preflight()?;
+    let agent_kinds = agents::preflight()?;
     let mut ledger = Ledger::open(db).map_err(|err| err.to_string())?;
     let settings = ledger.settings().map_err(|err| err.to_string())?;
     if settings.mode != "auto" {
@@ -205,7 +205,7 @@ fn begin_run(db: &Path, cwd: &Path, prd: Option<&Path>, new_only: bool) -> Resul
             );
         }
     }
-    println!("{}", agents::account_line(&accounts));
+    println!("{}", agents::preflight_summary(agent_kinds));
     Ok(run_id)
 }
 
@@ -326,7 +326,7 @@ fn add_to_run(db: &Path, slugs: &[String]) -> RunOutput {
 }
 
 fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<i64, String> {
-    let accounts = agents::preflight()?;
+    let agent_kinds = agents::preflight()?;
     let mut ledger = Ledger::open(db).map_err(|err| err.to_string())?;
     let Some(mut run) = ledger.resumable_run().map_err(|err| err.to_string())? else {
         return Err("no run to resume".to_string());
@@ -402,7 +402,7 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<i64, String> {
         ledger.claim_run(&mut run).map_err(|err| err.to_string())?;
         git(cwd, &["checkout", &run.branch])?;
     }
-    println!("{}", agents::account_line(&accounts));
+    println!("{}", agents::preflight_summary(agent_kinds));
     Ok(run.id)
 }
 

@@ -703,13 +703,15 @@ fn loosening_fallback_accepts_the_typed_phrase_at_a_tty() {
     let head = head_sha(repo.path());
     let token = &head[..12];
     let phrase = format!("sonnet {token}\n");
-    let output = pty_answer(
+    let (success, buf) = pty_answer(
         repo.path(),
         &["config", "set", "review_fallback", "sonnet"],
         &phrase,
     );
-    let text = String::from_utf8_lossy(&output);
+    let text = String::from_utf8_lossy(&buf);
     assert!(text.contains("review_fallback sonnet"), "{text}");
+    assert!(success, "{text}");
+    assert_eq!(typed_phrases(&buf)[0], phrase.trim_end());
 }
 
 #[test]
@@ -1242,9 +1244,30 @@ fn wait_child(child: &mut std::process::Child, limit: Duration) -> String {
 }
 
 #[cfg(unix)]
-fn pty_answer(dir: &Path, args: &[&str], phrase: &str) -> Vec<u8> {
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+fn typed_phrases(buf: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(buf);
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    if !text.ends_with('\n') {
+        lines.pop();
+    }
+    lines
+        .into_iter()
+        .filter_map(|line| {
+            line.strip_prefix("Type ")
+                .filter(|phrase| !phrase.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn pty_answer(dir: &Path, args: &[&str], phrase: &str) -> (bool, Vec<u8>) {
+    use portable_pty::{
+        Child as PtyChild, ChildKiller, CommandBuilder, PtySize, native_pty_system,
+    };
     use std::io::{Read, Write};
+    use std::sync::mpsc;
 
     let system = native_pty_system();
     let pair = system
@@ -1267,18 +1290,47 @@ fn pty_answer(dir: &Path, args: &[&str], phrase: &str) -> Vec<u8> {
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().expect("reader");
     let mut writer = pair.master.take_writer().expect("writer");
-    writer.write_all(phrase.as_bytes()).expect("write");
-    let _ = writer.flush();
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(15) {
-        if child.try_wait().ok().flatten().is_some() {
-            break;
+    let (send, recv) = mpsc::channel();
+    let phrase = phrase.to_string();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut tmp = [0_u8; 1024];
+        let mut sent = false;
+        loop {
+            match reader.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(count) => {
+                    buf.extend_from_slice(&tmp[..count]);
+                    if !sent {
+                        let phrases = typed_phrases(&buf);
+                        if !phrases.is_empty() {
+                            let _ = writer.write_all(phrase.as_bytes());
+                            let _ = writer.flush();
+                            sent = true;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
         }
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    let mut buf = Vec::new();
-    let _ = reader.read_to_end(&mut buf);
-    buf
+        let _ = send.send(buf);
+    });
+    let started = Instant::now();
+    let status = loop {
+        match PtyChild::try_wait(child.as_mut()) {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < Duration::from_secs(20) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = ChildKiller::kill(child.as_mut());
+                panic!("timed out waiting for config set");
+            }
+            Err(err) => panic!("wait failed: {err}"),
+        }
+    };
+    let buf = recv
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or_default();
+    (status.success(), buf)
 }

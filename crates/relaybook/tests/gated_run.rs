@@ -5,6 +5,11 @@ use std::process::Command;
 use assert_cmd::prelude::*;
 use serde_json::{Value, json};
 
+#[path = "support/conpty.rs"]
+mod conpty;
+
+use conpty::ENTER;
+
 const GATED_RUN_REFUSAL: &str = "relaybook run is not available with workflow=gated in this build";
 
 fn relaybook(dir: &Path) -> Command {
@@ -1590,7 +1595,7 @@ struct PtyOutput {
 }
 
 fn typed_phrases(buf: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(buf);
+    let text = conpty::strip_vt(&String::from_utf8_lossy(buf));
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines: Vec<&str> = text.split('\n').collect();
     if !text.ends_with('\n') {
@@ -1645,17 +1650,19 @@ fn authorize_while_prompted(dir: &Path, sha: &str, during: impl FnOnce()) -> Pty
         let mut buf = Vec::new();
         let mut tmp = [0_u8; 1024];
         let mut sent = false;
+        let mut answered = 0;
         loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
-                    let text = String::from_utf8_lossy(&buf);
+                    conpty::answer_cursor_queries(&buf, &mut answered, &mut writer);
+                    let text = conpty::strip_vt(&String::from_utf8_lossy(&buf));
                     let phrases = typed_phrases(&buf);
                     if !sent && text.contains("Authorize this release?") && !phrases.is_empty() {
                         let _ = seen_tx.send(phrases[0].clone());
                         if go_rx.recv_timeout(Duration::from_secs(30)).is_ok() {
-                            let line = format!("{}\n", phrases[0]);
+                            let line = format!("{}{ENTER}", phrases[0]);
                             let _ = writer.write_all(line.as_bytes());
                             let _ = writer.flush();
                         }
@@ -1686,13 +1693,14 @@ fn authorize_while_prompted(dir: &Path, sha: &str, during: impl FnOnce()) -> Pty
             Err(err) => panic!("wait failed: {err}"),
         }
     };
+    drop(pair.master);
     let buf = recv
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
     PtyOutput {
         success: status.success(),
         code: status.exit_code(),
-        output: String::from_utf8_lossy(&buf).into_owned(),
+        output: conpty::strip_vt(&String::from_utf8_lossy(&buf)),
     }
 }
 
@@ -1743,17 +1751,19 @@ fn answer_at_tty_with(
         let mut buf = Vec::new();
         let mut tmp = [0_u8; 1024];
         let mut sent = false;
+        let mut answered = 0;
         loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(count) => {
                     buf.extend_from_slice(&tmp[..count]);
+                    conpty::answer_cursor_queries(&buf, &mut answered, &mut writer);
                     let phrases = typed_phrases(&buf);
                     if !sent && !phrases.is_empty() {
                         let line = if accept {
-                            format!("{}\n", phrases[0])
+                            format!("{}{ENTER}", phrases[0])
                         } else {
-                            "n\n".to_string()
+                            format!("n{ENTER}")
                         };
                         let _ = writer.write_all(line.as_bytes());
                         let _ = writer.flush();
@@ -1779,13 +1789,14 @@ fn answer_at_tty_with(
             Err(err) => panic!("wait failed: {err}"),
         }
     };
+    drop(pair.master);
     let buf = recv
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_default();
     PtyOutput {
         success: status.success(),
         code: status.exit_code(),
-        output: String::from_utf8_lossy(&buf).into_owned(),
+        output: conpty::strip_vt(&String::from_utf8_lossy(&buf)),
     }
 }
 
