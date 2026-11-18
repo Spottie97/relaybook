@@ -2869,7 +2869,12 @@ fn gated_auto_review_records_task_and_release_graph_refresh() {
     let head = head_sha(repo.path());
     let run_id = latest_run_id(repo.path());
     let builds = graph_builds(repo.path());
-    assert!(builds.iter().all(|row| row.step != "plan"), "{builds:?}");
+    assert!(
+        builds.iter().any(|row| {
+            row.step == "plan" && row.status == "built" && row.run_id == Some(run_id)
+        }),
+        "{builds:?}"
+    );
     for step in ["review", "release-review"] {
         let row = builds
             .iter()
@@ -2899,6 +2904,7 @@ fn gated_auto_review_records_task_and_release_graph_refresh() {
 fn gated_auto_review_continues_when_graph_refresh_fails() {
     let repo = gated_repo();
     commit_graphify_ignore(repo.path());
+    let base = head_sha(repo.path());
     let probes = install_probes();
     copy_fake(&probes.bin, "graphify");
     let log = probes.log.join("graphify.log");
@@ -2930,6 +2936,12 @@ fn gated_auto_review_continues_when_graph_refresh_fails() {
     let stdin = fs::read_to_string(probes.log.join("codex.stdin")).unwrap_or_default();
     assert!(stdin.contains("\"graph_status\": \"failed\""), "{stdin}");
     assert!(stdin.contains("no graph"), "{stdin}");
+    let graph_line = format!("Graph: no graph at {base}");
+    let claude = fs::read_to_string(probes.log.join("claude.args")).unwrap_or_default();
+    let cursor = fs::read_to_string(probes.log.join("cursor.args")).unwrap_or_default();
+    assert!(claude.contains(&graph_line), "{claude}");
+    assert!(cursor.contains(&format!("Base: {base}\n")), "{cursor}");
+    assert!(cursor.contains(&graph_line), "{cursor}");
     let trace = fs::read_to_string(&log).unwrap_or_default();
     assert!(trace.contains("update ."), "{trace}");
     let row = run_row(repo.path());
@@ -2944,6 +2956,177 @@ fn gated_auto_review_continues_when_graph_refresh_fails() {
     );
     assert!(bare_relaybook_refs(&repo.bare).is_empty());
     assert!(!probes.log.join("gh.args").exists());
+}
+
+#[test]
+fn gated_run_refreshes_graph_before_each_step() {
+    let repo = gated_repo();
+    commit_graphify_ignore(repo.path());
+    let base = head_sha(repo.path());
+    let probes = install_probes();
+    install_graphify(&probes);
+    let log = probes.log.join("graphify.log");
+    let output = run_with_graphify(repo.path(), &probes, &log, "graph");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    let head = head_sha(repo.path());
+    assert_ne!(head, base);
+    assert_graphify_updates_only(&log);
+    let run_id = latest_run_id(repo.path());
+    let builds = graph_builds(repo.path());
+    let plan = builds
+        .iter()
+        .find(|row| row.step == "plan")
+        .unwrap_or_else(|| panic!("missing plan: {builds:?}"));
+    assert_eq!(plan.status, "built", "{builds:?}");
+    assert_eq!(plan.commit_sha, base, "{builds:?}");
+    assert_eq!(plan.run_id, Some(run_id), "{builds:?}");
+    assert!(
+        builds.iter().any(|row| {
+            row.step == "implement"
+                && row.status == "built"
+                && row.commit_sha == base
+                && row.run_id == Some(run_id)
+        }),
+        "{builds:?}"
+    );
+    assert!(
+        builds
+            .iter()
+            .any(|row| { row.step == "review" && row.status == "built" && row.commit_sha == head }),
+        "{builds:?}"
+    );
+    #[cfg(unix)]
+    assert_graphify_update_order(
+        &fs::read_to_string(probes.log.join("invocations")).unwrap_or_default(),
+    );
+}
+
+#[test]
+fn gated_prompts_carry_graph_sha() {
+    let repo = gated_repo();
+    commit_graphify_ignore(repo.path());
+    let base = head_sha(repo.path());
+    let probes = install_probes();
+    install_graphify(&probes);
+    let log = probes.log.join("graphify.log");
+    let output = run_with_graphify(repo.path(), &probes, &log, "graph");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    let head = head_sha(repo.path());
+    let graph_line = format!("Graph: {base} at {base}");
+    let claude = fs::read_to_string(probes.log.join("claude.args")).unwrap_or_default();
+    let cursor = fs::read_to_string(probes.log.join("cursor.args")).unwrap_or_default();
+    let stdin = fs::read_to_string(probes.log.join("codex.stdin")).unwrap_or_default();
+    assert!(claude.contains(&graph_line), "{claude}");
+    assert!(cursor.contains(&format!("Base: {base}\n")), "{cursor}");
+    assert!(cursor.contains(&graph_line), "{cursor}");
+    assert!(
+        stdin.contains(&format!("\"graph_sha\": \"{head}\"")),
+        "{stdin}"
+    );
+    assert!(stdin.contains("\"graph_status\": \"built\""), "{stdin}");
+}
+
+#[test]
+fn classic_run_never_runs_graphify() {
+    let repo = origin_repo();
+    let probes = install_probes();
+    install_graphify(&probes);
+    let log = probes.log.join("graphify.log");
+    let output = run_with_graphify(repo.path(), &probes, &log, "graph");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{text}{err}");
+    assert!(
+        fs::read_to_string(&log).unwrap_or_default().is_empty(),
+        "classic run called graphify"
+    );
+    assert!(graph_builds(repo.path()).is_empty());
+    let claude = fs::read_to_string(probes.log.join("claude.args")).unwrap_or_default();
+    let cursor = fs::read_to_string(probes.log.join("cursor.args")).unwrap_or_default();
+    assert!(claude.contains("PRD:"), "{claude}");
+    assert!(!claude.contains("Graph:"), "{claude}");
+    assert!(cursor.contains("Task slug:"), "{cursor}");
+    assert!(!cursor.contains("Base:"), "{cursor}");
+    assert!(!cursor.contains("Graph:"), "{cursor}");
+    assert!(!probes.log.join("codex.stdin").exists());
+}
+
+fn install_graphify(probes: &Probes) {
+    let fakes = probes._root.path().join("fakes");
+    copy_fake(&fakes, "graphify");
+    #[cfg(unix)]
+    {
+        write_trace_wrapper(
+            &probes.bin.join("graphify"),
+            "graphify",
+            &fake_executable(&fakes, "graphify"),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        copy_fake(&probes.bin, "graphify");
+    }
+}
+
+fn assert_graphify_updates_only(log: &Path) {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    assert!(!text.contains("extract"), "{text}");
+    assert!(text.lines().any(|line| line == "update ."), "{text}");
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        assert!(
+            line == "update ." || line.starts_with("affected "),
+            "{line}\n{text}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn assert_graphify_update_order(trace: &str) {
+    let updates = trace_positions(trace, |line| {
+        line.starts_with("graphify ") && line.contains("update .")
+    });
+    let planners = trace_positions(trace, |line| line.starts_with("claude -p"));
+    let executors = trace_positions(trace, |line| line.starts_with("cursor-agent -p"));
+    let reviews = trace_positions(trace, |line| line.starts_with("codex exec"));
+    assert!(!planners.is_empty(), "{trace}");
+    assert!(!executors.is_empty(), "{trace}");
+    assert!(!reviews.is_empty(), "{trace}");
+    assert!(
+        updates.iter().any(|index| *index < planners[0]),
+        "no graphify update before the planner\n{trace}"
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|index| *index > planners[0] && *index < executors[0]),
+        "no graphify update before Cursor\n{trace}"
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|index| *index > executors[0] && *index < reviews[0]),
+        "no graphify update before Codex\n{trace}"
+    );
+    assert!(
+        !trace
+            .lines()
+            .any(|line| line.starts_with("graphify ") && line.contains("extract")),
+        "{trace}"
+    );
+}
+
+#[cfg(unix)]
+fn trace_positions(trace: &str, pred: impl Fn(&str) -> bool) -> Vec<usize> {
+    trace
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| pred(line))
+        .map(|(index, _)| index)
+        .collect()
 }
 
 struct HoldGuard {
@@ -3347,9 +3530,9 @@ fn write_readonly_codex(path: &Path, fake: &Path) {
     fs::set_permissions(path, permissions).expect("chmod");
 }
 
-/// Claim refresh, task-done refresh, then the review refresh. Later updates
-/// belong to a replacement invocation.
-const REVIEW_GRAPHIFY_HOLD_FROM: &str = "3";
+/// Plan refresh, implement refresh, claim refresh, task-done refresh, then the
+/// review refresh. Later updates belong to a replacement invocation.
+const REVIEW_GRAPHIFY_HOLD_FROM: &str = "5";
 
 fn spawn_graph_review(
     dir: &Path,
@@ -3397,7 +3580,7 @@ fn wait_for_child_releasing_graph(
 ) {
     let start = std::time::Instant::now();
     loop {
-        release_later_graph_holds(hold, 4);
+        release_later_graph_holds(hold, 6);
         if child_exited(child, std::time::Duration::from_millis(50)) {
             return;
         }
@@ -3608,7 +3791,7 @@ fn report_replaced_during_graph_refresh_is_not_accepted() {
         "refresh",
     ));
     assert!(
-        wait_for_file(&hold.join("started-3"), std::time::Duration::from_secs(45)),
+        wait_for_file(&hold.join("started-5"), std::time::Duration::from_secs(45)),
         "review refresh did not block\n{}\n{}",
         held_output(&probes, "refresh"),
         fs::read_to_string(probes.log.join("graphify.log")).unwrap_or_default()
@@ -3619,7 +3802,7 @@ fn report_replaced_during_graph_refresh_is_not_accepted() {
         pending_reviews(repo.path())
     );
     replace_done_report(repo.path(), "work", "replacement-during-refresh");
-    fs::write(hold.join("release-3"), "go\n").expect("release");
+    fs::write(hold.join("release-5"), "go\n").expect("release");
     wait_for_child_releasing_graph(&mut guard.children[0], &hold, &probes, "refresh");
     let text = held_output(&probes, "refresh");
     let rows = report_rows(repo.path());
@@ -3666,7 +3849,7 @@ fn stale_review_preparer_cannot_replace_a_newer_pending_review() {
     ));
     assert!(
         wait_for_file(
-            &graph_hold.join("started-3"),
+            &graph_hold.join("started-5"),
             std::time::Duration::from_secs(45)
         ),
         "older review refresh did not block\n{}\n{}",
@@ -3700,14 +3883,14 @@ fn stale_review_preparer_cannot_replace_a_newer_pending_review() {
     ));
     assert!(
         wait_for_file(
-            &graph_hold.join("started-4"),
+            &graph_hold.join("started-6"),
             std::time::Duration::from_secs(45)
         ),
         "newer review refresh did not block\n{}\n{}",
         held_output(&probes, "newer"),
         fs::read_to_string(probes.log.join("graphify.log")).unwrap_or_default()
     );
-    fs::write(graph_hold.join("release-4"), "go\n").expect("release newer");
+    fs::write(graph_hold.join("release-6"), "go\n").expect("release newer");
     assert!(
         wait_for_file(
             &codex_hold.join("started-1"),
@@ -3719,7 +3902,7 @@ fn stale_review_preparer_cannot_replace_a_newer_pending_review() {
     let pending = pending_reviews(repo.path());
     assert_eq!(pending.len(), 1, "{pending:?}");
     let newer = pending[0].clone();
-    fs::write(graph_hold.join("release-3"), "go\n").expect("release older");
+    fs::write(graph_hold.join("release-5"), "go\n").expect("release older");
     assert!(
         child_exited(&mut guard.children[0], std::time::Duration::from_secs(20)),
         "older preparer did not finish\n{}",

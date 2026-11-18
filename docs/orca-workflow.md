@@ -61,7 +61,6 @@ A program that can read the prompt can type the line. A signing key that same us
 **Planned:**
 
 - A runloop guard that stops a reviewer who edits the branch or the ledger.
-- Graph refresh at plan and implement inside the auto runner.
 
 ## Reviewer edits
 
@@ -79,6 +78,6 @@ In gated mode Relaybook runs `graphify update .` at each step boundary above, an
 
 Between steps, Graphify's post-commit and post-checkout hooks and Relaybook's post-merge and post-rewrite hooks may refresh the graph. `relaybook setup --no-hooks` skips the hooks setup installs. Setup also skips Relaybook's hooks when `core.hooksPath` is set, or when Husky or Lefthook is present. The step-boundary refresh still runs.
 
-The auto runner calls Graphify for task review and release review. A failed refresh does not stop that review. Plan and implement refresh is planned, above. Classic mode does not refresh at claim, done, or review.
+The auto runner calls Graphify before planning, before each implementation step, and for task review and release review. It records `plan`, `implement`, `review`, and `release-review` on `graph_builds`. The planner prompt includes `Graph: <graph_sha or no graph> at <commit>`. The executor prompt adds `Base: <HEAD>` and that Graph line. A failed refresh does not stop the run. Classic mode does not refresh at claim, done, review, or in the auto runner.
 
 `relaybook setup` and `relaybook uninstall --graphify` still run Graphify's install and uninstall commands. The opt-in workflow from `relaybook setup --ci` runs `graphify extract` in GitHub Actions when an LLM API secret is set, and `graphify update` otherwise. See [configuration.md](configuration.md#how-the-graph-stays-current).

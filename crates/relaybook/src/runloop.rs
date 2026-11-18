@@ -447,7 +447,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
                         .join(", ")
                 })
                 .unwrap_or_default();
-            let prompt = if adopted.is_empty() {
+            let mut prompt = if adopted.is_empty() {
                 format!("PRD:\n{prd}")
             } else {
                 format!(
@@ -457,6 +457,20 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
             let budget = settings.est_cost_cap_usd.clone();
             let run_id = run.id;
             let gated = is_gated(&run);
+            // Before the plan snapshot. A skipped or failed refresh stays on the prompt
+            // as "no graph" and does not stop the run. Classic prompts are unchanged.
+            if gated {
+                match crate::gate::record_graph_refresh_for(
+                    &mut ledger,
+                    cwd,
+                    "plan",
+                    None,
+                    Some(run_id),
+                ) {
+                    Ok(refresh) => append_graph_prompt(&mut prompt, &refresh),
+                    Err(err) => return halt(cwd, &mut ledger, &mut run, &err.to_string()),
+                }
+            }
             run.agent_calls += 1;
             if let Err(err) = ledger.save_run(&mut run) {
                 return fail(&err.to_string());
@@ -753,17 +767,33 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
         if new_task && run.cycle >= settings.max_cycles {
             return halt(cwd, &mut ledger, &mut run, "max_cycles");
         }
+        let timeout = agents::cursor_timeout(settings.cursor_timeout_min);
+        let mut prompt = format!("{}\nTask slug: {slug}\n", agents::executor_template());
+        let run_id = run.id;
+        let branch = run.branch.clone();
+        let gated = is_gated(&run);
+        // Before the executor snapshot. Claim and done still refresh on their own.
+        if gated {
+            match crate::gate::record_graph_refresh_for(
+                &mut ledger,
+                cwd,
+                "implement",
+                Some(&slug),
+                Some(run_id),
+            ) {
+                Ok(refresh) => {
+                    prompt.push_str(&format!("Base: {}\n", refresh.commit_sha));
+                    append_graph_prompt(&mut prompt, &refresh);
+                }
+                Err(err) => return halt(cwd, &mut ledger, &mut run, &err.to_string()),
+            }
+        }
         if new_task {
             run.cycle += 1;
             run.current_slug = Some(slug.clone());
         }
         run.stage = "execute".to_string();
         run.agent_calls += 1;
-        let timeout = agents::cursor_timeout(settings.cursor_timeout_min);
-        let prompt = format!("{}\nTask slug: {slug}\n", agents::executor_template());
-        let run_id = run.id;
-        let branch = run.branch.clone();
-        let gated = is_gated(&run);
         if let Err(err) = ledger.save_run(&mut run) {
             return fail(&err.to_string());
         }
@@ -1134,6 +1164,24 @@ fn close_line(elapsed: Duration, result: &AgentResult, outcome: &str) -> String 
         _ => 0.0,
     };
     format!("  {outcome} in {}s, est ${cost:.2}", elapsed.as_secs())
+}
+
+/// `Graph: <graph_sha | no graph> at <commit>`. `graph_sha` is set only when
+/// the refresh status is `built`. A skipped or failed refresh says `no graph`.
+fn graph_prompt_line(refresh: &crate::gate::GraphRefresh) -> String {
+    let shown = refresh
+        .graph_sha
+        .as_deref()
+        .unwrap_or(crate::graphify::NO_GRAPH);
+    format!("Graph: {shown} at {}", refresh.commit_sha)
+}
+
+fn append_graph_prompt(prompt: &mut String, refresh: &crate::gate::GraphRefresh) {
+    if !prompt.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str(&graph_prompt_line(refresh));
+    prompt.push('\n');
 }
 
 fn plan_line(run: &Run) -> String {
