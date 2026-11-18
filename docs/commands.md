@@ -109,6 +109,8 @@ relaybook run stop
 relaybook run complete
 ```
 
+`relaybook status` on a gated ledger also prints the reviewer line: active reviewer, Codex (`available`, `limited until <t>`, or `probing`), fallback, and how many Codex re-reviews are pending. Classic status omits that object. `relaybook review show <slug>` prints the latest task review. `relaybook review show --release` prints the latest release review. Both show `reviewer_model`, `fallback_reason`, and `rereview_of` when those columns are set. `relaybook release status` prints the same three fields for the release review at HEAD.
+
 `relaybook run` adopts open and claimed tasks that have no run. `--new-only` skips that. `relaybook run add` links unfinished tasks to the active run. A done task is rejected. `--quiet` prints phase headers and the closing summary. `relaybook run watch` prints `.relaybook/runs/<id>/live.log` and follows it until the run pauses or ends. `relaybook status` appends the latest live lines while a run is active. With `workflow=gated`, the run does not push until HEAD is authorized at `gate_release`. While a push claim is held, `relaybook run complete`, `relaybook run stop`, and `relaybook run add` are refused and do not change the run. If the publishing process dies, the run stays at `publishing`. The push result is unknown. The manual steps are in [Known limits](auto-mode.md#known-limits). See [auto-mode.md](auto-mode.md#gated-workflow).
 
 ## Install and setup

@@ -371,6 +371,14 @@ enum ReviewCmd {
         #[arg(long, allow_hyphen_values = true)]
         text: String,
     },
+    /// Show the latest task review, or the release review with `--release`.
+    Show {
+        /// Task slug. Omit this with `--release`.
+        slug: Option<String>,
+        /// Show the latest release review.
+        #[arg(long)]
+        release: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -659,6 +667,9 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             verdict,
             text,
         }) => review_record(&cwd, slug.as_deref(), release, &by, &sha, &verdict, &text),
+        Command::Review(ReviewCmd::Show { slug, release }) => {
+            review_show(&cwd, slug.as_deref(), release)
+        }
         Command::Release(ReleaseCmd::Authorize { sha }) => release_authorize(&cwd, &sha),
         Command::Release(ReleaseCmd::Status) => release_status(&cwd),
         Command::Mode { value } => match value {
@@ -1137,6 +1148,7 @@ fn range_text(range: &gitinfo::ReleaseRange) -> String {
 fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
     let sha = sha.trim();
     let mut ledger = open_ledger(cwd)?;
+    gate::refuse_pending_rereview(&ledger)?;
     gate::allow_release_authorize(&ledger)?;
     let first = gate::prepare_authorize(&ledger, cwd, sha)?;
     if let gate::PublishScreen::Present(message) =
@@ -1262,11 +1274,52 @@ fn release_status(cwd: &Path) -> Result<Outcome, Fail> {
     json_outcome(
         data,
         format!(
-            "{}{}",
+            "{}{}{}",
             render::line(&format!("release {label} {}", range.head)),
-            render::line(&remote_line)
+            render::line(&remote_line),
+            review_extra_lines(review.as_ref())
         ),
     )
+}
+
+fn review_show(cwd: &Path, slug: Option<&str>, release: bool) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let review = if release {
+        ledger.latest_review("release", None)?
+    } else {
+        let slug = slug.ok_or_else(|| invalid_setting("review show requires a task slug"))?;
+        ledger.latest_review("task", Some(slug))?
+    };
+    let Some(review) = review else {
+        return Err(invalid_setting("no review"));
+    };
+    let human = format!(
+        "{}{}",
+        render::line(&format!(
+            "review {} {}",
+            review.reviewer,
+            review.verdict.as_deref().unwrap_or("pending")
+        )),
+        review_extra_lines(Some(&review))
+    );
+    json_outcome(review, human)
+}
+
+fn review_extra_lines(review: Option<&relaybook_core::Review>) -> String {
+    let Some(review) = review else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if let Some(model) = &review.reviewer_model {
+        out.push_str(&render::line(&format!("reviewer_model {model}")));
+    }
+    if let Some(reason) = &review.fallback_reason {
+        out.push_str(&render::line(&format!("fallback_reason {reason}")));
+    }
+    if let Some(id) = review.rereview_of {
+        out.push_str(&render::line(&format!("rereview_of {id}")));
+    }
+    out
 }
 
 fn remote_status(ledger: &Ledger) -> Result<serde_json::Value, Fail> {
@@ -1603,6 +1656,35 @@ fn signoff_change_confirmed(
     Ok(true)
 }
 
+fn fallback_change_confirmed(
+    ledger: &Ledger,
+    cwd: &Path,
+    key: &str,
+    value: &str,
+) -> Result<bool, Fail> {
+    let settings = ledger.settings()?;
+    let (ask, verb) = match key {
+        "review_fallback" if value.trim() == "sonnet" && settings.review_fallback != "sonnet" => {
+            ("Allow Sonnet to review when Codex is limited?", "sonnet")
+        }
+        "fallback_rereview" if value.trim() == "off" && settings.fallback_rereview != "off" => {
+            ("Turn off Codex re-review before release?", "off")
+        }
+        _ => return Ok(false),
+    };
+    if !ledger.live_gated_runs()?.is_empty() {
+        return Err(invalid_setting("a gated run is already live"));
+    }
+    signoff::confirm(&signoff::Challenge {
+        ask,
+        verb,
+        token: signoff::confirmation_token(cwd),
+        missing_tty: "loosening reviewer fallback requires confirmation at a TTY",
+        declined: "reviewer fallback change was not confirmed",
+    })?;
+    Ok(true)
+}
+
 fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
     if key == "workflow" {
@@ -1611,10 +1693,11 @@ fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
     let leave_confirmed = workflow_leave_confirmed(&ledger, cwd, key, value)?;
     let remote_confirmed = remote_local_confirmed(&ledger, cwd, key, value)?;
     let signoff_confirmed = signoff_change_confirmed(&ledger, cwd, key, value)?;
+    let fallback_confirmed = fallback_change_confirmed(&ledger, cwd, key, value)?;
     let settings = ledger.set_setting_with(
         key,
         value,
-        leave_confirmed || remote_confirmed || signoff_confirmed,
+        leave_confirmed || remote_confirmed || signoff_confirmed || fallback_confirmed,
     )?;
     let shown = relaybook_core::configured_value(&settings, key)?;
     json_outcome(settings, render::line(&format!("{key} {shown}")))

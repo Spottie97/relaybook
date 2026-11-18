@@ -15,11 +15,12 @@ mod settings;
 
 pub use error::Error;
 pub use ledger::{
-    Absorb, AnchoredClaim, ClaimAnchor, GraphBuild, LEDGER_CHANGED_DURING_REVIEW, Ledger,
-    OwnedReviewExpect, OwnedReviewSnapshot, OwnedRunAdvance, REPORT_CHANGED_DURING_REFRESH,
-    ReleaseAuthorization, RemoteCheck, RemoteCheckDraft, Review, ReviewInvocationAction,
-    ReviewInvocationOutcome, STALE_REVIEW_INVOCATION, ScopedTask, TaskReport,
-    apply_review_invocation,
+    Absorb, AnchoredClaim, ClaimAnchor, CodexAvailability, GraphBuild,
+    LEDGER_CHANGED_DURING_REVIEW, Ledger, OwnedReviewExpect, OwnedReviewSnapshot, OwnedRunAdvance,
+    PendingRereviewRow, ProbeClaim, ProbeOutcome, REPORT_CHANGED_DURING_REFRESH,
+    ReleaseAuthorization, RemoteCheck, RemoteCheckDraft, Review, ReviewColumnExtras,
+    ReviewInvocationAction, ReviewInvocationOutcome, RunReviewLine, STALE_REVIEW_INVOCATION,
+    ScopedTask, TaskReport, apply_review_invocation,
 };
 pub use legacy::{LegacyMove, migrate_legacy_ledger};
 pub use model::{
@@ -32,6 +33,7 @@ pub use runs::{
     unfinished as unfinished_run,
 };
 pub use settings::{
-    DEFAULT_CODEX_MODEL, RunView, Snapshot as Settings, StatusView, configured_value,
-    format_config, format_status, parse_codex_model,
+    DEFAULT_CODEX_BACKOFF_MIN, DEFAULT_CODEX_MODEL, PendingRereview, ReviewerStatus, RunView,
+    SONNET_REVIEW_MODEL, Snapshot as Settings, StatusView, configured_value, format_config,
+    format_status, parse_codex_model,
 };

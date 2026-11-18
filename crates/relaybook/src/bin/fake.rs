@@ -33,6 +33,10 @@ fn role_name() -> String {
         .unwrap_or_else(|| "fake".to_string())
 }
 
+fn codex_kind() -> String {
+    env::var("RELAYBOOK_FAKE_CODEX_KIND").unwrap_or_else(|_| kind())
+}
+
 fn kind() -> String {
     env::var("RELAYBOOK_FAKE_KIND").unwrap_or_default()
 }
@@ -126,6 +130,10 @@ fn gh(args: &[String]) {
 fn claude(args: &[String]) {
     if args.first().map(String::as_str) == Some("auth") {
         println!("logged in");
+        return;
+    }
+    if args.iter().any(|arg| arg == "--tools") {
+        claude_reviewer(args);
         return;
     }
     if let Ok(log) = env::var("LOG") {
@@ -280,6 +288,86 @@ fn cursor(args: &[String]) {
     emit_stream(r#"{"type":"result","subtype":"success","ok":true}"#);
 }
 
+fn claude_reviewer(args: &[String]) {
+    if let Ok(log) = env::var("LOG") {
+        append(
+            &PathBuf::from(log).join("claude.args").display().to_string(),
+            &args.join(" "),
+        );
+    }
+    let mut packet = String::new();
+    let _ = std::io::stdin().read_to_string(&mut packet);
+    if let Ok(log) = env::var("LOG") {
+        append(
+            &PathBuf::from(log)
+                .join("claude.stdin")
+                .display()
+                .to_string(),
+            &packet,
+        );
+    }
+    if let Ok(dir) = env::var("RELAYBOOK_CLAUDE_REVIEW_HOLD") {
+        let seq = claim_hold_slot(&dir);
+        if seq == 0 {
+            eprintln!("claude review hold slot failed");
+            std::process::exit(98);
+        }
+        let root = PathBuf::from(&dir);
+        let _ = fs::write(root.join(format!("started-{seq}")), "claude-review\n");
+        let release = root.join(format!("release-{seq}"));
+        for _ in 0..1600 {
+            if release.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !release.is_file() {
+            eprintln!("claude review hold timed out");
+            std::process::exit(98);
+        }
+    }
+    let mode = env::var("RELAYBOOK_FAKE_CLAUDE_REVIEW").unwrap_or_else(|_| "approve".to_string());
+    match mode.as_str() {
+        "fail" => std::process::exit(1),
+        "garbage" => {
+            println!("not json");
+        }
+        "wrong-model" => {
+            let result = verdict_json(args, "approved");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "result",
+                    "result": result.trim(),
+                    "model": "claude-haiku-0",
+                })
+            );
+        }
+        "changes" => {
+            let result = verdict_json(args, "changes-requested");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "result",
+                    "result": result.trim(),
+                    "model": "claude-sonnet-5-5",
+                })
+            );
+        }
+        _ => {
+            let result = verdict_json(args, "approved");
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "result",
+                    "result": result.trim(),
+                    "model": "claude-sonnet-5-5",
+                })
+            );
+        }
+    }
+}
+
 fn codex(args: &[String]) {
     if args.first().map(String::as_str) == Some("login") {
         if env::var("RELAYBOOK_FAKE_CODEX_AUTH").ok().as_deref() == Some("missing") {
@@ -287,6 +375,20 @@ fn codex(args: &[String]) {
             std::process::exit(1);
         }
         println!("Logged in using ChatGPT");
+        return;
+    }
+    if args.first().map(String::as_str) == Some("--version") {
+        if let Ok(log) = env::var("LOG") {
+            append(
+                &PathBuf::from(log).join("codex.args").display().to_string(),
+                &args.join(" "),
+            );
+        }
+        println!(
+            "{}",
+            env::var("RELAYBOOK_FAKE_CODEX_VERSION")
+                .unwrap_or_else(|_| "codex-cli 0.169.0".to_string())
+        );
         return;
     }
     if let Ok(log) = env::var("LOG") {
@@ -304,7 +406,51 @@ fn codex(args: &[String]) {
         );
     }
     let out = flag_value(args, "-o").or_else(|| flag_value(args, "--output-last-message"));
-    match kind().as_str() {
+    match codex_kind().as_str() {
+        "limit" | "limit-stdout" | "plain429" | "auth401" | "too-large" | "limit-then-ok" => {
+            if codex_kind() == "limit-then-ok" && args.iter().any(|arg| arg.starts_with("Probe.")) {
+                write_out(out.as_deref(), "{\"ok\":true}\n");
+                return;
+            }
+            let stderr = match codex_kind().as_str() {
+                "plain429" => "ERROR: exceeded retry limit, last status: 429 Too Many Requests\n",
+                "auth401" => {
+                    "ERROR: Reconnecting... 1/1\nERROR: unexpected status 401 Unauthorized: bad key, url: …\n"
+                }
+                "too-large" => {
+                    "ERROR: Input exceeds the maximum length of 1048576 characters (input_error_code input_too_large, max_chars 1048576, actual_chars 4194123)\n"
+                }
+                "limit-stdout" => "",
+                _ => {
+                    "ERROR: You\u{2019}ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 6:39 AM.\n"
+                }
+            };
+            write_out(out.as_deref(), "");
+            if codex_kind() == "limit-stdout" {
+                println!(
+                    "ERROR: You\u{2019}ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 6:39 AM."
+                );
+            } else {
+                eprint!("{stderr}");
+            }
+            std::process::exit(1);
+        }
+        "probe-ok-changes" => {
+            if args.iter().any(|arg| arg.starts_with("Probe.")) {
+                write_out(out.as_deref(), "{\"ok\":true}\n");
+                return;
+            }
+            write_out(out.as_deref(), &verdict_json(args, "changes-requested"));
+            return;
+        }
+        "sleep" => {
+            let secs = env::var("RELAYBOOK_CODEX_TIMEOUT_SECS")
+                .ok()
+                .and_then(|text| text.parse::<u64>().ok())
+                .unwrap_or(1)
+                .saturating_add(30);
+            thread::sleep(Duration::from_secs(secs));
+        }
         "edit" => {
             let _ = fs::write("reviewer-edit.txt", "edited\n");
         }
@@ -488,7 +634,9 @@ fn flag_value(args: &[String], flag: &str) -> Option<String> {
 }
 
 fn verdict_json(args: &[String], verdict: &str) -> String {
-    let release = args.iter().any(|arg| arg.contains("Release review"));
+    let release = args
+        .iter()
+        .any(|arg| arg.contains("Release review") || arg.contains("Re-review release"));
     if release {
         format!(
             "{{\"verdict\":\"{verdict}\",\"body\":{{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"prd_covered\":[],\"gaps\":[]}}}}\n"

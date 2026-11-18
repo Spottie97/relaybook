@@ -339,6 +339,11 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<i64, String> {
     {
         return Err("a run is already publishing".to_string());
     }
+    if approve
+        && crate::gate::rereview_blocks_approve(&ledger, &run).map_err(|err| err.to_string())?
+    {
+        return Err("codex re-review pending".to_string());
+    }
     if approve && run.status != "waiting" {
         return Err("run is not waiting".to_string());
     }
@@ -348,6 +353,9 @@ fn reopen_run(db: &Path, cwd: &Path, approve: bool) -> Result<i64, String> {
         return Err(output.text.trim_end().to_string());
     }
     if is_gated(&run) {
+        if let Some(message) = codex_resume_refusal(&ledger, &run).map_err(|err| err.to_string())? {
+            return Err(message);
+        }
         agents::require_codex()?;
     }
     if run.stage == "gate_release" {
@@ -558,7 +566,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
                     return halt(cwd, &mut ledger, &mut run, "no task to review");
                 };
                 drop(ledger);
-                match review_with_codex(
+                match review_gated(
                     db,
                     cwd,
                     quiet,
@@ -680,7 +688,7 @@ fn drive(db: &Path, cwd: &Path, quiet: bool, run_id: i64) -> RunOutput {
                 return halt(cwd, &mut ledger, &mut run, "release review is unavailable");
             }
             drop(ledger);
-            match review_with_codex(
+            match review_gated(
                 db,
                 cwd,
                 quiet,
@@ -1221,6 +1229,40 @@ fn report_body(ledger: &Ledger, run_id: i64) -> String {
             let verdict = verdict.unwrap_or_else(|| "open".to_string());
             body.push_str(&format!("- {} {verdict} ({bytes} B)\n", task.slug));
         }
+    }
+    body
+}
+
+fn reviews_section(ledger: &Ledger, run_id: i64) -> String {
+    let Ok(lines) = ledger.run_review_lines(run_id) else {
+        return String::new();
+    };
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut body = String::from("\n## Reviews\n");
+    for line in lines {
+        let slug = line.slug.unwrap_or_else(|| {
+            if line.scope == "release" {
+                "release".to_string()
+            } else {
+                format!("review {}", line.id)
+            }
+        });
+        let model = line.reviewer_model.as_deref().unwrap_or("unset");
+        let fallback = line.fallback_reason.as_deref().unwrap_or("none");
+        let verdict = line.verdict.as_deref().unwrap_or("pending");
+        let state = if let Some(id) = line.rereview_of {
+            format!("re-review of {id}")
+        } else if line.reviewer == "claude" {
+            "awaiting Codex re-review".to_string()
+        } else {
+            "codex".to_string()
+        };
+        body.push_str(&format!(
+            "- {slug}: {reviewer} {model}; fallback: {fallback}; {verdict}; {state}\n",
+            reviewer = line.reviewer
+        ));
     }
     body
 }
@@ -1768,6 +1810,157 @@ enum CodexScope {
     Release,
 }
 
+enum ReviewerMode {
+    Codex,
+    Sonnet { until: String, version: String },
+}
+
+fn codex_resume_refusal(
+    ledger: &Ledger,
+    run: &Run,
+) -> Result<Option<String>, relaybook_core::Error> {
+    let limited = match ledger.codex_availability()? {
+        relaybook_core::CodexAvailability::Limited {
+            retry_after,
+            due: false,
+        } => Some(retry_after),
+        _ => None,
+    };
+    let Some(retry_after) = limited else {
+        return Ok(None);
+    };
+    let reason = run.stop_reason.as_deref().unwrap_or("");
+    if reason.starts_with("codex|") || reason.starts_with("codex-rereview|") {
+        return Ok(Some(format!("codex limited until {retry_after}")));
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)] // the drive loop's session and transcript stay with the caller
+fn review_gated(
+    db: &Path,
+    cwd: &Path,
+    quiet: bool,
+    run_id: i64,
+    session: &mut Option<crate::live::Session>,
+    transcript: &mut u32,
+    scope: CodexScope,
+) -> Control {
+    let mut ledger = match Ledger::open(db) {
+        Ok(ledger) => ledger,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    if let Err(err) = load_live(&ledger, run_id) {
+        return Control::Return(fail(&err));
+    }
+    let settings = match ledger.settings() {
+        Ok(settings) => settings,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let availability = match ledger.codex_availability() {
+        Ok(availability) => availability,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let release = matches!(scope, CodexScope::Release);
+    match availability {
+        relaybook_core::CodexAvailability::Limited {
+            retry_after,
+            due: false,
+        } => {
+            if release && settings.fallback_rereview != "off" {
+                return pause_for_rereview(cwd, &mut ledger, run_id, &retry_after);
+            }
+            if settings.review_fallback == "sonnet" {
+                let version = agents::codex_version();
+                drop(ledger);
+                return review_with_codex(
+                    db,
+                    cwd,
+                    quiet,
+                    run_id,
+                    session,
+                    transcript,
+                    scope,
+                    ReviewerMode::Sonnet {
+                        until: retry_after,
+                        version,
+                    },
+                );
+            }
+            pause_for_limit(cwd, &mut ledger, run_id, &retry_after)
+        }
+        relaybook_core::CodexAvailability::Limited { due: true, .. } => {
+            drop(ledger);
+            probe_codex(db, cwd, quiet, run_id, session)
+        }
+        relaybook_core::CodexAvailability::Available => {
+            let pending = match ledger.pending_rereviews(run_id) {
+                Ok(pending) => pending,
+                Err(err) => return Control::Return(fail(&err.to_string())),
+            };
+            if let Some(original) = pending.into_iter().next() {
+                drop(ledger);
+                return review_rereview(
+                    db,
+                    cwd,
+                    quiet,
+                    run_id,
+                    session,
+                    transcript,
+                    original,
+                    settings.codex_model,
+                    settings.codex_sandbox,
+                );
+            }
+            drop(ledger);
+            review_with_codex(
+                db,
+                cwd,
+                quiet,
+                run_id,
+                session,
+                transcript,
+                scope,
+                ReviewerMode::Codex,
+            )
+        }
+    }
+}
+
+fn pause_for_limit(cwd: &Path, ledger: &mut Ledger, run_id: i64, retry_after: &str) -> Control {
+    let mut run = match load_live(ledger, run_id) {
+        Ok(run) => run,
+        Err(err) => return Control::Return(fail(&err)),
+    };
+    run.status = "paused".to_string();
+    run.failure_streak = 0;
+    run.stop_reason = Some(format!("codex|{retry_after}"));
+    if let Err(err) = ledger.save_run(&mut run) {
+        return Control::Return(fail(&err.to_string()));
+    }
+    let _ = cwd;
+    Control::Return(ok(&codex_pause_line(&run)))
+}
+
+fn pause_for_rereview(cwd: &Path, ledger: &mut Ledger, run_id: i64, retry_after: &str) -> Control {
+    let pending = match ledger.pending_rereviews(run_id) {
+        Ok(rows) => rows.len(),
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let mut run = match load_live(ledger, run_id) {
+        Ok(run) => run,
+        Err(err) => return Control::Return(fail(&err)),
+    };
+    run.status = "paused".to_string();
+    run.failure_streak = 0;
+    run.stop_reason = Some(format!("codex-rereview|{pending}|{retry_after}"));
+    if let Err(err) = ledger.save_run(&mut run) {
+        return Control::Return(fail(&err.to_string()));
+    }
+    let _ = cwd;
+    Control::Return(ok(&codex_pause_line(&run)))
+}
+
 #[allow(clippy::too_many_arguments)] // the drive loop's session and transcript stay with the caller
 fn review_with_codex(
     db: &Path,
@@ -1777,6 +1970,7 @@ fn review_with_codex(
     session: &mut Option<crate::live::Session>,
     transcript: &mut u32,
     scope: CodexScope,
+    mode: ReviewerMode,
 ) -> Control {
     let mut ledger = match Ledger::open(db) {
         Ok(ledger) => ledger,
@@ -1803,9 +1997,12 @@ fn review_with_codex(
             Err(err) => return Control::Return(halt(cwd, &mut ledger, &mut run, &err)),
         }
     }
+    let choice = reviewer_choice(&settings, &mode);
     let prepared = match &scope {
-        CodexScope::Task(slug) => crate::gate::start_task_review(&mut ledger, cwd, &run, slug),
-        CodexScope::Release => crate::gate::start_release_review(&mut ledger, cwd, &run),
+        CodexScope::Task(slug) => {
+            crate::gate::start_task_review(&mut ledger, cwd, &run, slug, &choice)
+        }
+        CodexScope::Release => crate::gate::start_release_review(&mut ledger, cwd, &run, &choice),
     };
     let prepared = match prepared {
         Ok(prepared) => prepared,
@@ -1861,19 +2058,29 @@ fn review_with_codex(
     };
     drop(ledger);
     let live = live_session(session, cwd, run_id, quiet);
-    live.begin(&format!("● Reviewing {label} (codex)"));
+    live.begin(&review_live_line(&label, &mode));
     let started = Instant::now();
-    let result = agents::call_codex(
-        cwd,
-        &prompt,
-        &packet,
-        &out,
-        run_id,
-        live,
-        sandbox,
-        release,
-        &settings.codex_model,
-    );
+    let schema = if release {
+        agents::release_codex_schema()
+    } else {
+        agents::task_codex_schema()
+    };
+    let result = match &mode {
+        ReviewerMode::Codex => agents::call_codex(
+            cwd,
+            &prompt,
+            &packet,
+            &out,
+            run_id,
+            live,
+            sandbox,
+            schema,
+            &settings.codex_model,
+        ),
+        ReviewerMode::Sonnet { .. } => {
+            agents::call_claude_reviewer(cwd, &prompt, &packet, run_id, live)
+        }
+    };
     let elapsed = started.elapsed();
     let _ = agents::write_transcript(
         cwd,
@@ -1914,15 +2121,37 @@ fn review_with_codex(
                 reason: "timeout".to_string(),
             }));
         }
-        AgentResult::UsageLimit { reset_at, .. } => {
+        AgentResult::UsageLimit { .. } => {
             close_live(session, cwd, run_id, quiet, elapsed, &result, "paused");
-            let reason = match reset_at {
-                Some(time) => format!("codex|{time}"),
-                None => "codex".to_string(),
+            if !matches!(mode, ReviewerMode::Codex) {
+                return Control::Return(invocation(
+                    relaybook_core::ReviewInvocationAction::FailureStreak,
+                ));
+            }
+            let Some(detail) = agents::codex_limit_detail(&result) else {
+                return Control::Return(invocation(
+                    relaybook_core::ReviewInvocationAction::FailureStreak,
+                ));
             };
-            return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Pause {
-                reason,
-            }));
+            let ledger = match Ledger::open(db) {
+                Ok(ledger) => ledger,
+                Err(err) => return Control::Return(fail(&err.to_string())),
+            };
+            let advisory = agents::parse_codex_retry_after(&detail.stderr);
+            let (retry_after, source) =
+                match ledger.resolve_retry_after(advisory.as_deref(), settings.codex_backoff_min) {
+                    Ok(resolved) => resolved,
+                    Err(err) => return Control::Return(fail(&err.to_string())),
+                };
+            let evidence = format!("{}: {}", detail.signature, detail.stderr);
+            return Control::Return(invocation(
+                relaybook_core::ReviewInvocationAction::CodexLimited {
+                    retry_after,
+                    source: source.to_string(),
+                    evidence,
+                    version: detail.version,
+                },
+            ));
         }
         AgentResult::Failed { .. } => {
             close_live(session, cwd, run_id, quiet, elapsed, &result, "failed");
@@ -1961,6 +2190,7 @@ fn review_with_codex(
             review_id,
             &invocation_token,
             generation,
+            &choice,
             advance.clone(),
         ),
         CodexScope::Release => crate::gate::record_owned_release_review(
@@ -1972,6 +2202,7 @@ fn review_with_codex(
             review_id,
             &invocation_token,
             generation,
+            &choice,
             advance.clone(),
         ),
     };
@@ -2025,6 +2256,402 @@ fn review_with_codex(
         };
         return Control::Return(ok(&message));
     }
+    Control::Stay
+}
+
+fn reviewer_choice(
+    settings: &relaybook_core::Settings,
+    mode: &ReviewerMode,
+) -> crate::gate::ReviewerChoice {
+    match mode {
+        ReviewerMode::Codex => crate::gate::ReviewerChoice::codex(&settings.codex_model),
+        ReviewerMode::Sonnet { until, version } => crate::gate::ReviewerChoice {
+            reviewer: "claude".to_string(),
+            model: Some(relaybook_core::SONNET_REVIEW_MODEL.to_string()),
+            fallback_reason: Some(format!("codex usage limit until {until}")),
+            note_fallback: true,
+            fallback_retry_after: Some(until.clone()),
+            codex_version: Some(version.clone()),
+            rereview_of: None,
+            accept_approved_task: true,
+            reopen_on_changes: true,
+        },
+    }
+}
+
+fn review_live_line(label: &str, mode: &ReviewerMode) -> String {
+    match mode {
+        ReviewerMode::Codex => format!("● Reviewing {label} (codex)"),
+        ReviewerMode::Sonnet { until, .. } => format!(
+            "● Reviewing {label} ({} — fallback: codex usage limit until {until})",
+            relaybook_core::SONNET_REVIEW_MODEL
+        ),
+    }
+}
+
+fn probe_codex(
+    db: &Path,
+    cwd: &Path,
+    quiet: bool,
+    run_id: i64,
+    session: &mut Option<crate::live::Session>,
+) -> Control {
+    let mut ledger = match Ledger::open(db) {
+        Ok(ledger) => ledger,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let run = match load_live(&ledger, run_id) {
+        Ok(run) => run,
+        Err(err) => return Control::Return(fail(&err)),
+    };
+    let settings = match ledger.settings() {
+        Ok(settings) => settings,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let sandbox = if settings.codex_sandbox == "isolated" {
+        agents::CodexSandbox::Isolated
+    } else {
+        agents::CodexSandbox::ReadOnly
+    };
+    let claim = match ledger.begin_probe(run_id, run.write_stamp, &run.stage, run.agent_calls + 1) {
+        Ok(claim) => claim,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let stage = run.stage.clone();
+    let branch = run.branch.clone();
+    let before = match gated_snap(cwd, &branch) {
+        Ok(before) => before,
+        Err(err) => {
+            let _ = ledger.record_probe(
+                run_id,
+                claim.generation,
+                &claim.token,
+                &stage,
+                relaybook_core::ProbeOutcome::Halt {
+                    reason: err.clone(),
+                },
+            );
+            return Control::Return(fail(&err));
+        }
+    };
+    drop(ledger);
+    let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let out = agents::codex_output_file(&root, run_id, 0, claim.generation);
+    let live = live_session(session, cwd, run_id, quiet);
+    live.begin("● Probing Codex");
+    let result = agents::call_codex_probe(cwd, &out, run_id, live, sandbox, &settings.codex_model);
+    let outcome = if let Err(reason) = guard_reviewer(cwd, &before) {
+        relaybook_core::ProbeOutcome::Halt { reason }
+    } else {
+        match &result {
+            AgentResult::Finished { .. } => relaybook_core::ProbeOutcome::Ok {
+                version: agents::codex_version(),
+            },
+            AgentResult::UsageLimit { .. } => {
+                if let Some(detail) = agents::codex_limit_detail(&result) {
+                    let ledger = match Ledger::open(db) {
+                        Ok(ledger) => ledger,
+                        Err(err) => return Control::Return(fail(&err.to_string())),
+                    };
+                    let (retry_after, source) = match ledger.resolve_retry_after(
+                        agents::parse_codex_retry_after(&detail.stderr).as_deref(),
+                        settings.codex_backoff_min,
+                    ) {
+                        Ok(resolved) => resolved,
+                        Err(err) => return Control::Return(fail(&err.to_string())),
+                    };
+                    relaybook_core::ProbeOutcome::Limited {
+                        retry_after,
+                        source: source.to_string(),
+                        evidence: format!("{}: {}", detail.signature, detail.stderr),
+                        version: detail.version,
+                    }
+                } else {
+                    relaybook_core::ProbeOutcome::Failed {
+                        evidence: result_text(&result),
+                        version: agents::codex_version(),
+                    }
+                }
+            }
+            AgentResult::Unavailable { cli } => relaybook_core::ProbeOutcome::Failed {
+                evidence: format!("{cli} unavailable"),
+                version: agents::codex_version(),
+            },
+            AgentResult::TimedOut => relaybook_core::ProbeOutcome::Failed {
+                evidence: "timeout".to_string(),
+                version: agents::codex_version(),
+            },
+            AgentResult::Failed { .. } => relaybook_core::ProbeOutcome::Failed {
+                evidence: result_text(&result),
+                version: agents::codex_version(),
+            },
+        }
+    };
+    let mut ledger = match Ledger::open(db) {
+        Ok(ledger) => ledger,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let limited_until = match &outcome {
+        relaybook_core::ProbeOutcome::Limited { retry_after, .. } => Some(retry_after.clone()),
+        _ => None,
+    };
+    let failed = matches!(
+        outcome,
+        relaybook_core::ProbeOutcome::Failed { .. } | relaybook_core::ProbeOutcome::Halt { .. }
+    );
+    if let Err(err) = ledger.record_probe(run_id, claim.generation, &claim.token, &stage, outcome) {
+        return Control::Return(fail(&err.to_string()));
+    }
+    if failed {
+        let run = ledger.run_by_id(run_id).ok();
+        let reason = run
+            .and_then(|run| run.stop_reason)
+            .unwrap_or_else(|| "codex probe failed (not a usage limit)".to_string());
+        return Control::Return(fail(&format!("stopped: {reason}; relaybook run --resume")));
+    }
+    if let Some(until) = limited_until {
+        println!("● Codex still limited until {until}");
+        return Control::Stay;
+    }
+    println!("● Codex probe ok");
+    println!("● Switched back to Codex");
+    let _ = quiet;
+    Control::Stay
+}
+
+#[allow(clippy::too_many_arguments)] // one re-review keeps the same session as the driver
+fn review_rereview(
+    db: &Path,
+    cwd: &Path,
+    quiet: bool,
+    run_id: i64,
+    session: &mut Option<crate::live::Session>,
+    transcript: &mut u32,
+    original: relaybook_core::PendingRereviewRow,
+    model: String,
+    sandbox_name: String,
+) -> Control {
+    let mut ledger = match Ledger::open(db) {
+        Ok(ledger) => ledger,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let mut run = match load_live(&ledger, run_id) {
+        Ok(run) => run,
+        Err(err) => return Control::Return(fail(&err)),
+    };
+    let prepared = match crate::gate::start_rereview(&mut ledger, cwd, &run, &original, &model) {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            if err.to_string() == relaybook_core::STALE_REVIEW_INVOCATION {
+                return Control::Return(fail(relaybook_core::STALE_REVIEW_INVOCATION));
+            }
+            return Control::Return(halt(cwd, &mut ledger, &mut run, &err.to_string()));
+        }
+    };
+    let mut run = match load_live(&ledger, run_id) {
+        Ok(run) => run,
+        Err(err) => return Control::Return(fail(&err)),
+    };
+    if run.write_stamp != prepared.run_generation {
+        return Control::Return(fail(relaybook_core::STALE_REVIEW_INVOCATION));
+    }
+    let packet = match review_packet(cwd, &prepared) {
+        Ok(packet) => packet,
+        Err(err) => return Control::Return(halt(cwd, &mut ledger, &mut run, &err)),
+    };
+    let release = original.scope == "release";
+    let label = prepared
+        .slug
+        .clone()
+        .unwrap_or_else(|| "release".to_string());
+    let prompt = format!(
+        "Re-review {label}. Use only the packet on stdin. Return the JSON verdict. Body fields are arrays of strings."
+    );
+    if agents::review_input_too_large(&prompt, &packet) {
+        return Control::Return(halt(
+            cwd,
+            &mut ledger,
+            &mut run,
+            "diff too large for auto review; review manually",
+        ));
+    }
+    let sandbox = if sandbox_name == "isolated" {
+        agents::CodexSandbox::Isolated
+    } else {
+        agents::CodexSandbox::ReadOnly
+    };
+    let commit_sha = prepared.commit_sha.clone();
+    let review_id = prepared.review_id;
+    let generation = prepared.run_generation;
+    let invocation_token = prepared.invocation_token.clone();
+    let stage = run.stage.clone();
+    let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let out = agents::codex_output_file(&root, run_id, review_id, generation);
+    let before = match gated_snap(cwd, &run.branch) {
+        Ok(before) => before,
+        Err(err) => return Control::Return(halt(cwd, &mut ledger, &mut run, &err)),
+    };
+    drop(ledger);
+    let live = live_session(session, cwd, run_id, quiet);
+    live.begin(&format!("● Re-reviewing {label} (codex)"));
+    let schema = if release {
+        agents::release_codex_schema()
+    } else {
+        agents::task_codex_schema()
+    };
+    let result = agents::call_codex(
+        cwd, &prompt, &packet, &out, run_id, live, sandbox, schema, &model,
+    );
+    let _ = agents::write_transcript(
+        cwd,
+        run_id,
+        *transcript,
+        Role::Reviewer,
+        &result_text(&result),
+    );
+    *transcript += 1;
+    let invocation = |action| {
+        apply_codex_invocation(
+            db,
+            cwd,
+            quiet,
+            run_id,
+            review_id,
+            generation,
+            &invocation_token,
+            action,
+        )
+    };
+    if let Err(reason) = guard_reviewer(cwd, &before) {
+        return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Halt {
+            reason,
+        }));
+    }
+    match &result {
+        AgentResult::Unavailable { cli } => {
+            return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Halt {
+                reason: format!("{cli} unavailable"),
+            }));
+        }
+        AgentResult::TimedOut => {
+            return Control::Return(invocation(relaybook_core::ReviewInvocationAction::Halt {
+                reason: "timeout".to_string(),
+            }));
+        }
+        AgentResult::UsageLimit { .. } => {
+            let Some(detail) = agents::codex_limit_detail(&result) else {
+                return Control::Return(invocation(
+                    relaybook_core::ReviewInvocationAction::FailureStreak,
+                ));
+            };
+            let ledger = match Ledger::open(db) {
+                Ok(ledger) => ledger,
+                Err(err) => return Control::Return(fail(&err.to_string())),
+            };
+            let backoff = ledger
+                .settings()
+                .map(|item| item.codex_backoff_min)
+                .unwrap_or(relaybook_core::DEFAULT_CODEX_BACKOFF_MIN);
+            let (retry_after, source) = match ledger.resolve_retry_after(None, backoff) {
+                Ok(resolved) => resolved,
+                Err(err) => return Control::Return(fail(&err.to_string())),
+            };
+            return Control::Return(invocation(
+                relaybook_core::ReviewInvocationAction::CodexLimited {
+                    retry_after,
+                    source: source.to_string(),
+                    evidence: format!("{}: {}", detail.signature, detail.stderr),
+                    version: detail.version,
+                },
+            ));
+        }
+        AgentResult::Failed { .. } => {
+            return Control::Return(invocation(
+                relaybook_core::ReviewInvocationAction::FailureStreak,
+            ));
+        }
+        AgentResult::Finished { .. } => {}
+    }
+    let (verdict, body) = match agents::parse_review_verdict(&result_text(&result), release) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            return Control::Return(invocation(
+                relaybook_core::ReviewInvocationAction::FailureStreak,
+            ));
+        }
+    };
+    let mut ledger = match Ledger::open(db) {
+        Ok(ledger) => ledger,
+        Err(err) => return Control::Return(fail(&err.to_string())),
+    };
+    let run = match load_live(&ledger, run_id) {
+        Ok(run) => run,
+        Err(err) => return Control::Return(fail(&err)),
+    };
+    let mut choice = crate::gate::ReviewerChoice::codex(&model);
+    choice.accept_approved_task = false;
+    choice.reopen_on_changes = false;
+    choice.rereview_of = Some(original.review_id);
+    let advance = if verdict == "approved" {
+        relaybook_core::OwnedRunAdvance {
+            stage: stage.clone(),
+            status: "active".to_string(),
+            failure_streak: 0,
+            stop_reason: None,
+        }
+    } else {
+        relaybook_core::OwnedRunAdvance {
+            stage: stage.clone(),
+            status: "stopped".to_string(),
+            failure_streak: 0,
+            stop_reason: Some(format!("codex re-review requested changes on {label}")),
+        }
+    };
+    let recorded = if release {
+        crate::gate::record_owned_release_review(
+            &mut ledger,
+            cwd,
+            &commit_sha,
+            &verdict,
+            &body,
+            review_id,
+            &invocation_token,
+            generation,
+            &choice,
+            advance.clone(),
+        )
+    } else {
+        crate::gate::record_owned_task_review(
+            &mut ledger,
+            cwd,
+            &label,
+            &commit_sha,
+            &verdict,
+            &body,
+            review_id,
+            &invocation_token,
+            generation,
+            &choice,
+            advance.clone(),
+        )
+    };
+    if let Err(err) = recorded {
+        let message = err.to_string();
+        if message == relaybook_core::STALE_REVIEW_INVOCATION
+            || message == relaybook_core::LEDGER_CHANGED_DURING_REVIEW
+        {
+            return Control::Return(fail(&message));
+        }
+        return Control::Return(invocation(
+            relaybook_core::ReviewInvocationAction::FailureStreak,
+        ));
+    }
+    if advance.status == "stopped" {
+        let reason = advance.stop_reason.unwrap_or_else(|| "stopped".to_string());
+        return Control::Return(fail(&format!("stopped: {reason}; relaybook run --resume")));
+    }
+    println!("{}", codex_review_line(&run, &label, "re-reviewed"));
+    let _ = quiet;
     Control::Stay
 }
 
@@ -2180,6 +2807,13 @@ fn apply_codex_invocation(
 
 fn codex_pause_line(run: &Run) -> String {
     match run.stop_reason.as_deref() {
+        Some(reason) if reason.starts_with("codex-rereview|") => {
+            let mut parts = reason.splitn(3, '|');
+            let _ = parts.next();
+            let pending = parts.next().unwrap_or("0");
+            let time = parts.next().unwrap_or("");
+            format!("waiting for Codex re-review ({pending} pending, retry after {time})")
+        }
         Some(reason) => match reason.split_once('|') {
             Some((cli, time)) if !time.is_empty() => {
                 format!("usage limit reached on {cli}; relaybook run --resume after {time}")
@@ -2194,9 +2828,13 @@ fn codex_pause_line(run: &Run) -> String {
 fn review_packet(cwd: &Path, prepared: &crate::gate::PreparedReview) -> Result<String, String> {
     let guide = crate::guide::render(Some(crate::guide::Role::Reviewer));
     let handoff = serde_json::to_string_pretty(&prepared.handoff).map_err(|err| err.to_string())?;
-    let spec = match prepared.base_sha.as_deref() {
-        Some(base) => format!("{base}..{}", prepared.commit_sha),
-        None => format!("{sha}^..{sha}", sha = prepared.commit_sha),
+    let spec = if let Some(spec) = &prepared.diff_spec {
+        spec.clone()
+    } else {
+        match prepared.base_sha.as_deref() {
+            Some(base) => format!("{base}..{}", prepared.commit_sha),
+            None => format!("{sha}^..{sha}", sha = prepared.commit_sha),
+        }
     };
     let diff = git(cwd, &["diff", "--end-of-options", &spec])?;
     Ok(format!("{guide}\n{handoff}\n{diff}"))
@@ -2263,7 +2901,10 @@ fn publish(cwd: &Path, ledger: &mut Ledger, run: &mut Run) -> RunOutput {
     if let Err(err) = git(cwd, &["push", "--no-follow-tags", "-u", "origin", &spec]) {
         return halt(cwd, ledger, run, &err);
     }
-    let body = report_body(ledger, run.id);
+    let mut body = report_body(ledger, run.id);
+    if is_gated(run) {
+        body.push_str(&reviews_section(ledger, run.id));
+    }
     let title = format!("Relaybook run {}", run.branch);
     match gh_pr(cwd, &run.branch, &title, &body) {
         Ok(url) => {

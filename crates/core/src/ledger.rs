@@ -71,6 +71,15 @@ pub struct Review {
     pub bytes: Option<i64>,
     pub started_at: String,
     pub recorded_at: Option<String>,
+    /// Codex model that was passed, or the pinned Sonnet model. Empty when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
+    /// Why a non-Codex reviewer ran, for example a Codex usage limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    /// Approved Claude review this Codex row re-reviews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rereview_of: Option<i64>,
 }
 
 /// Latest task report, including the SHAs stored at completion.
@@ -95,6 +104,18 @@ pub struct OwnedReviewExpect {
     pub agent_calls: i64,
     pub report_id: Option<i64>,
     pub report_body: Option<String>,
+}
+
+/// Optional review columns written when a row is started.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewColumnExtras {
+    pub reviewer_model: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub rereview_of: Option<i64>,
+    /// Record `switched_to_fallback` once for this run, in the start write.
+    pub note_fallback: bool,
+    pub fallback_retry_after: Option<String>,
+    pub codex_version: Option<String>,
 }
 
 /// Review row and invocation values captured by one start write.
@@ -681,6 +702,7 @@ impl Ledger {
             authorize_workflow_change(conn, key, value, terminal_confirmed)?;
             authorize_remote_check_change(conn, key, value, terminal_confirmed)?;
             authorize_signoff_change(conn, key, value, terminal_confirmed)?;
+            authorize_fallback_change(conn, key, value, terminal_confirmed)?;
             crate::settings::set(conn, key, value)
         })
     }
@@ -768,7 +790,12 @@ impl Ledger {
     }
 
     pub fn status_view(&self) -> Result<crate::settings::StatusView, Error> {
-        crate::settings::status(&self.conn)
+        let mut view = crate::settings::status(&self.conn)?;
+        if view_is_gated(&self.conn)? {
+            let run_id = view.run.as_ref().map(|run| run.id);
+            view.reviewer = Some(reviewer_status(&self.conn, run_id)?);
+        }
+        Ok(view)
     }
 
     pub fn hook_wait_line(&self) -> Result<Option<String>, Error> {
@@ -1064,6 +1091,7 @@ impl Ledger {
             fingerprint,
             false,
             None,
+            &ReviewColumnExtras::default(),
         )
         .map(|started| started.review)
     }
@@ -1086,6 +1114,7 @@ impl Ledger {
         graph_sha: Option<&str>,
         fingerprint: &str,
         expect: &OwnedReviewExpect,
+        extras: &ReviewColumnExtras,
     ) -> Result<OwnedReviewSnapshot, Error> {
         let started = self.start_review_inner(
             scope,
@@ -1099,6 +1128,7 @@ impl Ledger {
             fingerprint,
             true,
             Some(expect),
+            extras,
         )?;
         Ok(OwnedReviewSnapshot {
             review: started.review,
@@ -1123,6 +1153,7 @@ impl Ledger {
         fingerprint: &str,
         allow_owner: bool,
         expect: Option<&OwnedReviewExpect>,
+        extras: &ReviewColumnExtras,
     ) -> Result<StartedReview, Error> {
         let scope = review_scope(scope)?;
         let branch = required_text("branch", branch)?;
@@ -1167,9 +1198,11 @@ impl Ledger {
             conn.execute(
                 "INSERT INTO reviews (
                     scope, task_id, report_id, run_id, branch, reviewer, reviewer_override,
-                    base_sha, commit_sha, graph_sha, ledger_mark, started_at, invocation_token
+                    base_sha, commit_sha, graph_sha, ledger_mark, started_at, invocation_token,
+                    reviewer_model, fallback_reason, rereview_of
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11, lower(hex(randomblob(16)))
+                    ?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11, lower(hex(randomblob(16))),
+                    ?12, ?13, ?14
                  )",
                 params![
                     scope,
@@ -1183,9 +1216,22 @@ impl Ledger {
                     graph_sha,
                     ledger_mark,
                     started_at,
+                    extras.reviewer_model,
+                    extras.fallback_reason,
+                    extras.rereview_of,
                 ],
             )?;
             let id = conn.last_insert_rowid();
+            if extras.note_fallback {
+                note_switched_to_fallback(
+                    conn,
+                    run_id,
+                    id,
+                    extras.fallback_retry_after.as_deref(),
+                    extras.codex_version.as_deref(),
+                    extras.fallback_reason.as_deref(),
+                )?;
+            }
             let invocation_token = require_invocation_token(conn, id)?;
             let (run_generation, stage, report_body) = if let Some(prepared) = prepared {
                 let generation = claim_owned_generation(conn, owner_run, &prepared)?;
@@ -1301,6 +1347,7 @@ impl Ledger {
         invocation_token: &str,
         run_generation: i64,
         accept_approved_task: bool,
+        reopen_on_changes: bool,
         advance: OwnedRunAdvance,
         revalidate: impl FnOnce() -> Result<(), Error>,
     ) -> Result<Review, Error> {
@@ -1321,6 +1368,7 @@ impl Ledger {
                 invocation_token: invocation_token.to_string(),
                 run_generation,
                 accept_approved_task,
+                reopen_on_changes,
             }),
             Some(advance),
             revalidate,
@@ -1418,7 +1466,11 @@ impl Ledger {
             if bound_update && updated != 1 {
                 return Err(stale_review());
             }
-            if scope == "task"
+            let reopen = invocation
+                .as_ref()
+                .is_none_or(|bound| bound.reopen_on_changes);
+            if reopen
+                && scope == "task"
                 && verdict == "changes_requested"
                 && let Some(slug) = task.as_deref()
             {
@@ -2055,6 +2107,215 @@ impl Ledger {
         Ok(events)
     }
 
+    pub fn codex_availability(&self) -> Result<CodexAvailability, Error> {
+        codex_availability(&self.conn)
+    }
+
+    pub fn pending_rereviews(&self, run_id: i64) -> Result<Vec<PendingRereviewRow>, Error> {
+        pending_rereview_rows(&self.conn, run_id)
+    }
+
+    pub fn run_review_lines(&self, run_id: i64) -> Result<Vec<RunReviewLine>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT reviews.id, reviews.scope, tasks.slug, reviews.reviewer,
+                    reviews.reviewer_model, reviews.fallback_reason, reviews.rereview_of,
+                    reviews.verdict
+             FROM reviews
+             LEFT JOIN tasks ON tasks.id = reviews.task_id
+             WHERE reviews.run_id = ?1 AND reviews.verdict IS NOT NULL
+             ORDER BY reviews.id",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(RunReviewLine {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                slug: row.get(2)?,
+                reviewer: row.get(3)?,
+                reviewer_model: row.get(4)?,
+                fallback_reason: row.get(5)?,
+                rereview_of: row.get(6)?,
+                verdict: row.get(7)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Error::from)
+    }
+
+    /// `now + minutes`, as a UTC timestamp SQLite can compare.
+    pub fn backoff_deadline(&self, minutes: i64) -> Result<String, Error> {
+        let minutes = minutes.clamp(0, 10_080);
+        self.conn
+            .query_row(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)",
+                params![format!("+{minutes} minutes")],
+                |row| row.get(0),
+            )
+            .map_err(Error::from)
+    }
+
+    /// Keep an advisory ISO timestamp only when it is in `(now, now + 7 days]`.
+    /// Anything else, including a missing value, becomes the configured backoff.
+    pub fn resolve_retry_after(
+        &self,
+        advisory: Option<&str>,
+        backoff_minutes: i64,
+    ) -> Result<(String, &'static str), Error> {
+        if let Some(advisory) = advisory.map(str::trim).filter(|text| !text.is_empty()) {
+            let kept: i64 = self.conn.query_row(
+                "SELECT ?1 > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    AND ?1 <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+7 days')",
+                params![advisory],
+                |row| row.get(0),
+            )?;
+            if kept != 0 {
+                return Ok((advisory.to_string(), "codex"));
+            }
+        }
+        Ok((self.backoff_deadline(backoff_minutes)?, "backoff"))
+    }
+
+    pub fn instant_elapsed(&self, instant: &str) -> Result<bool, Error> {
+        sqlite_due(&self.conn, instant)
+    }
+
+    /// Claim one probe. Checks the run generation and stage, then stores the
+    /// probe token in `stop_reason` and bumps `write_stamp`. `next_calls` is
+    /// the driver's `agent_calls + 1`.
+    pub fn begin_probe(
+        &mut self,
+        run_id: i64,
+        generation: i64,
+        stage: &str,
+        next_calls: i64,
+    ) -> Result<ProbeClaim, Error> {
+        self.transaction(|conn| {
+            let token: String =
+                conn.query_row("SELECT lower(hex(randomblob(16)))", [], |row| row.get(0))?;
+            let changed = conn.execute(
+                "UPDATE runs
+                 SET agent_calls = ?1, stop_reason = ?2, write_stamp = write_stamp + 1
+                 WHERE id = ?3 AND write_stamp = ?4 AND stage = ?5 AND status = 'active'
+                   AND agent_calls + 1 = ?1",
+                params![
+                    next_calls,
+                    format!("probe-token|{token}"),
+                    run_id,
+                    generation,
+                    stage,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(stale_review());
+            }
+            Ok(ProbeClaim {
+                generation: generation.checked_add(1).ok_or_else(stale_review)?,
+                token,
+            })
+        })
+    }
+
+    /// Record a probe that still holds `generation` and `token`.
+    pub fn record_probe(
+        &mut self,
+        run_id: i64,
+        generation: i64,
+        token: &str,
+        stage: &str,
+        outcome: ProbeOutcome,
+    ) -> Result<(), Error> {
+        self.transaction(|conn| {
+            let run = crate::runs::load(conn, run_id)?;
+            if run.write_stamp != generation || run.stage != stage || run.status != "active" {
+                return Err(stale_review());
+            }
+            let expected = format!("probe-token|{token}");
+            if run.stop_reason.as_deref() != Some(expected.as_str()) {
+                return Err(stale_review());
+            }
+            match outcome {
+                ProbeOutcome::Ok { version } => {
+                    insert_reviewer_event(
+                        conn,
+                        Some(run_id),
+                        None,
+                        "probe_ok",
+                        None,
+                        None,
+                        Some(&version),
+                        "probe ok",
+                    )?;
+                    insert_reviewer_event(
+                        conn,
+                        Some(run_id),
+                        None,
+                        "switched_to_codex",
+                        None,
+                        None,
+                        Some(&version),
+                        "probe ok",
+                    )?;
+                    let mut run = run;
+                    run.stop_reason = None;
+                    run.status = "active".to_string();
+                    crate::runs::save(conn, &mut run)?;
+                }
+                ProbeOutcome::Limited {
+                    retry_after,
+                    source,
+                    evidence,
+                    version,
+                } => {
+                    insert_reviewer_event(
+                        conn,
+                        Some(run_id),
+                        None,
+                        "probe_limited",
+                        Some(&retry_after),
+                        Some(&source),
+                        Some(&version),
+                        &evidence,
+                    )?;
+                    let mut run = run;
+                    run.stop_reason = None;
+                    run.failure_streak = 0;
+                    crate::runs::save(conn, &mut run)?;
+                }
+                ProbeOutcome::Failed { evidence, version } => {
+                    insert_reviewer_event(
+                        conn,
+                        Some(run_id),
+                        None,
+                        "probe_failed",
+                        None,
+                        None,
+                        Some(&version),
+                        &evidence,
+                    )?;
+                    let mut run = run;
+                    run.status = "stopped".to_string();
+                    run.stop_reason = Some("codex probe failed (not a usage limit)".to_string());
+                    crate::runs::save(conn, &mut run)?;
+                }
+                ProbeOutcome::Halt { reason } => {
+                    insert_reviewer_event(
+                        conn,
+                        Some(run_id),
+                        None,
+                        "probe_failed",
+                        None,
+                        None,
+                        None,
+                        &reason,
+                    )?;
+                    let mut run = run;
+                    run.status = "stopped".to_string();
+                    run.stop_reason = Some(reason);
+                    crate::runs::save(conn, &mut run)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn transaction<T>(
         &mut self,
         body: impl FnOnce(&Connection) -> Result<T, Error>,
@@ -2096,6 +2357,7 @@ struct OwnedInvocation {
     invocation_token: String,
     run_generation: i64,
     accept_approved_task: bool,
+    reopen_on_changes: bool,
 }
 
 fn stale_review() -> Error {
@@ -2127,6 +2389,15 @@ pub enum ReviewInvocationAction {
     Halt { reason: String },
     /// Pause for a usage limit. `reason` is `cli` or `cli|reset`.
     Pause { reason: String },
+    /// A classified Codex usage limit. Appends one `reviewer_events` row in
+    /// this same write. `review_fallback=off` pauses the run. `sonnet` leaves
+    /// it active so the driver can start a new review.
+    CodexLimited {
+        retry_after: String,
+        source: String,
+        evidence: String,
+        version: String,
+    },
 }
 
 /// Result of applying [`ReviewInvocationAction`] to the invocation that is still current.
@@ -2218,6 +2489,38 @@ pub fn apply_review_invocation(
                 run.failure_streak = 0;
                 run.stop_reason = Some(reason);
                 false
+            }
+            ReviewInvocationAction::CodexLimited {
+                retry_after,
+                source,
+                evidence,
+                version,
+            } => {
+                insert_reviewer_event(
+                    conn,
+                    Some(run.id),
+                    Some(review_id),
+                    "codex_limited",
+                    Some(&retry_after),
+                    Some(&source),
+                    Some(&version),
+                    &evidence,
+                )?;
+                run.failure_streak = 0;
+                let release_wait =
+                    run.stage == "release_review" && settings.fallback_rereview != "off";
+                if settings.review_fallback == "sonnet" && !release_wait {
+                    true
+                } else if release_wait {
+                    let pending = pending_rereview_rows(conn, run.id)?.len();
+                    run.status = "paused".to_string();
+                    run.stop_reason = Some(format!("codex-rereview|{pending}|{retry_after}"));
+                    false
+                } else {
+                    run.status = "paused".to_string();
+                    run.stop_reason = Some(format!("codex|{retry_after}"));
+                    false
+                }
             }
         };
         crate::runs::save(conn, &mut run)?;
@@ -2510,6 +2813,17 @@ fn sqlite_table_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
     Ok(found.is_some())
 }
 
+fn reviews_have_column(conn: &Connection, column: &str) -> Result<bool, Error> {
+    let mut statement = conn.prepare("PRAGMA table_info(reviews)")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        if row? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn reports_have_column(conn: &Connection, column: &str) -> Result<bool, Error> {
     let mut statement = conn.prepare("PRAGMA table_info(reports)")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -2566,6 +2880,299 @@ pub(crate) fn record_event(
     payload: serde_json::Value,
 ) -> Result<Event, Error> {
     insert_event(conn, kind, payload)
+}
+
+/// How Codex stands for the next review, from the latest `reviewer_events` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexAvailability {
+    Available,
+    Limited { retry_after: String, due: bool },
+}
+
+/// A probe the driver may run. `generation` is the `write_stamp` after the claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeClaim {
+    pub generation: i64,
+    pub token: String,
+}
+
+/// What a Codex probe returned. Recorded in the same write that checks the claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Ok {
+        version: String,
+    },
+    Limited {
+        retry_after: String,
+        source: String,
+        evidence: String,
+        version: String,
+    },
+    /// An ordinary probe failure. Stops the run. Does not fall back.
+    Failed {
+        evidence: String,
+        version: String,
+    },
+    /// A guard or binding failure. Stops the run with `reason`.
+    Halt {
+        reason: String,
+    },
+}
+
+/// One approved Claude review waiting for Codex.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRereviewRow {
+    pub review_id: i64,
+    pub scope: String,
+    pub slug: Option<String>,
+    pub base_sha: String,
+    pub commit_sha: String,
+    pub body: Option<String>,
+}
+
+/// A recorded review, for the gated pull-request body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunReviewLine {
+    pub id: i64,
+    pub scope: String,
+    pub slug: Option<String>,
+    pub reviewer: String,
+    pub reviewer_model: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub rereview_of: Option<i64>,
+    pub verdict: Option<String>,
+}
+
+fn authorize_fallback_change(
+    conn: &Connection,
+    key: &str,
+    value: &str,
+    terminal_confirmed: bool,
+) -> Result<(), Error> {
+    let loosening = match key {
+        "review_fallback" => value.trim() == "sonnet",
+        "fallback_rereview" => value.trim() == "off",
+        _ => return Ok(()),
+    };
+    if !loosening {
+        return Ok(());
+    }
+    let settings = crate::settings::load(conn)?;
+    let already = match key {
+        "review_fallback" => settings.review_fallback == "sonnet",
+        "fallback_rereview" => settings.fallback_rereview == "off",
+        _ => false,
+    };
+    if already {
+        return Ok(());
+    }
+    if !crate::runs::live_gated(conn)?.is_empty() {
+        return Err(Error::InvalidSetting(
+            "a gated run is already live".to_string(),
+        ));
+    }
+    if !terminal_confirmed {
+        let which = if key == "review_fallback" {
+            "review_fallback"
+        } else {
+            "fallback_rereview"
+        };
+        return Err(Error::InvalidSetting(format!(
+            "loosening {which} requires confirmation at a TTY"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // one argument per reviewer_events column
+fn insert_reviewer_event(
+    conn: &Connection,
+    run_id: Option<i64>,
+    review_id: Option<i64>,
+    kind: &str,
+    retry_after: Option<&str>,
+    retry_source: Option<&str>,
+    codex_version: Option<&str>,
+    evidence: &str,
+) -> Result<(), Error> {
+    let ts = now(conn)?;
+    let evidence = truncate_evidence(evidence);
+    conn.execute(
+        "INSERT INTO reviewer_events (
+            ts, run_id, review_id, kind, retry_after, retry_source, codex_version, evidence
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            ts,
+            run_id,
+            review_id,
+            kind,
+            retry_after,
+            retry_source,
+            codex_version,
+            evidence,
+        ],
+    )?;
+    Ok(())
+}
+
+fn truncate_evidence(text: &str) -> String {
+    let mut end = text.len().min(512);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+fn note_switched_to_fallback(
+    conn: &Connection,
+    run_id: Option<i64>,
+    review_id: i64,
+    retry_after: Option<&str>,
+    version: Option<&str>,
+    reason: Option<&str>,
+) -> Result<(), Error> {
+    let Some(run_id) = run_id else {
+        return Ok(());
+    };
+    let already: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM reviewer_events
+         WHERE run_id = ?1 AND kind = 'switched_to_fallback'",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    if already > 0 {
+        return Ok(());
+    }
+    insert_reviewer_event(
+        conn,
+        Some(run_id),
+        Some(review_id),
+        "switched_to_fallback",
+        retry_after,
+        Some("backoff"),
+        version,
+        reason.unwrap_or("codex usage limit"),
+    )
+}
+
+fn view_is_gated(conn: &Connection) -> Result<bool, Error> {
+    Ok(crate::settings::load(conn)?.workflow == "gated")
+}
+
+fn reviewer_status(
+    conn: &Connection,
+    run_id: Option<i64>,
+) -> Result<crate::settings::ReviewerStatus, Error> {
+    let settings = crate::settings::load(conn)?;
+    let availability = codex_availability(conn)?;
+    let probing = run_id
+        .map(|id| probe_token_held(conn, id))
+        .transpose()?
+        .unwrap_or(false);
+    let codex = match (&availability, probing) {
+        (_, true) => "probing".to_string(),
+        (CodexAvailability::Limited { due: true, .. }, _) => "probing".to_string(),
+        (CodexAvailability::Limited { retry_after, .. }, _) => {
+            format!("limited until {retry_after}")
+        }
+        (CodexAvailability::Available, _) => "available".to_string(),
+    };
+    let active = match &availability {
+        CodexAvailability::Limited { due: false, .. } if settings.review_fallback == "sonnet" => {
+            crate::settings::SONNET_REVIEW_MODEL.to_string()
+        }
+        _ => "codex".to_string(),
+    };
+    let pending = match run_id {
+        Some(id) => pending_rereview_rows(conn, id)?,
+        None => Vec::new(),
+    };
+    Ok(crate::settings::ReviewerStatus {
+        active,
+        codex,
+        fallback: settings.review_fallback,
+        pending_rereviews: pending
+            .into_iter()
+            .map(|row| crate::settings::PendingRereview {
+                review_id: row.review_id,
+                slug: row.slug,
+            })
+            .collect(),
+    })
+}
+
+fn probe_token_held(conn: &Connection, run_id: i64) -> Result<bool, Error> {
+    let reason: Option<String> = conn
+        .query_row(
+            "SELECT stop_reason FROM runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with("probe-token|")))
+}
+
+fn codex_availability(conn: &Connection) -> Result<CodexAvailability, Error> {
+    let row = conn
+        .query_row(
+            "SELECT kind, retry_after FROM reviewer_events ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+    let Some((kind, retry_after)) = row else {
+        return Ok(CodexAvailability::Available);
+    };
+    match kind.as_str() {
+        "probe_ok" | "switched_to_codex" | "probe_failed" => Ok(CodexAvailability::Available),
+        "codex_limited" | "probe_limited" | "switched_to_fallback" => {
+            let retry_after = retry_after.unwrap_or_default();
+            let due = retry_after.is_empty() || sqlite_due(conn, &retry_after)?;
+            Ok(CodexAvailability::Limited { retry_after, due })
+        }
+        _ => Ok(CodexAvailability::Available),
+    }
+}
+
+fn sqlite_due(conn: &Connection, instant: &str) -> Result<bool, Error> {
+    let due: i64 = conn.query_row(
+        "SELECT ?1 <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+        params![instant],
+        |row| row.get(0),
+    )?;
+    Ok(due != 0)
+}
+
+fn pending_rereview_rows(conn: &Connection, run_id: i64) -> Result<Vec<PendingRereviewRow>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT reviews.id, reviews.scope, tasks.slug, reviews.base_sha, reviews.commit_sha,
+                reviews.body
+         FROM reviews
+         LEFT JOIN tasks ON tasks.id = reviews.task_id
+         WHERE reviews.run_id = ?1
+           AND reviews.reviewer = 'claude'
+           AND reviews.verdict = 'approved'
+           AND NOT EXISTS (
+               SELECT 1 FROM reviews AS codex
+               WHERE codex.rereview_of = reviews.id
+                 AND codex.reviewer = 'codex'
+                 AND codex.verdict = 'approved'
+           )
+         ORDER BY reviews.id",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        Ok(PendingRereviewRow {
+            review_id: row.get(0)?,
+            scope: row.get(1)?,
+            slug: row.get(2)?,
+            base_sha: row.get(3)?,
+            commit_sha: row.get(4)?,
+            body: row.get(5)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Error::from)
 }
 
 fn now(conn: &Connection) -> Result<String, Error> {
@@ -3440,38 +4047,51 @@ struct ReviewRow {
     bytes: Option<i64>,
     started_at: String,
     recorded_at: Option<String>,
+    reviewer_model: Option<String>,
+    fallback_reason: Option<String>,
+    rereview_of: Option<i64>,
 }
 
 fn load_review(conn: &Connection, id: i64) -> Result<Review, Error> {
+    // A read-only open does not migrate. A v6 `reviews` table has none of the
+    // fallback columns, so those fields stay absent instead of failing the read.
+    let extras = reviews_have_column(conn, "reviewer_model")?;
+    let sql = if extras {
+        "SELECT id, scope, task_id, report_id, run_id, branch, reviewer, reviewer_override,
+                base_sha, commit_sha, graph_sha, ledger_mark, verdict, body, bytes,
+                started_at, recorded_at, reviewer_model, fallback_reason, rereview_of
+         FROM reviews WHERE id = ?1"
+    } else {
+        "SELECT id, scope, task_id, report_id, run_id, branch, reviewer, reviewer_override,
+                base_sha, commit_sha, graph_sha, ledger_mark, verdict, body, bytes,
+                started_at, recorded_at
+         FROM reviews WHERE id = ?1"
+    };
     let row = conn
-        .query_row(
-            "SELECT id, scope, task_id, report_id, run_id, branch, reviewer, reviewer_override,
-                    base_sha, commit_sha, graph_sha, ledger_mark, verdict, body, bytes,
-                    started_at, recorded_at
-             FROM reviews WHERE id = ?1",
-            params![id],
-            |row| {
-                Ok(ReviewRow {
-                    id: row.get(0)?,
-                    scope: row.get(1)?,
-                    task_id: row.get(2)?,
-                    report_id: row.get(3)?,
-                    run_id: row.get(4)?,
-                    branch: row.get(5)?,
-                    reviewer: row.get(6)?,
-                    reviewer_override: row.get(7)?,
-                    base_sha: row.get(8)?,
-                    commit_sha: row.get(9)?,
-                    graph_sha: row.get(10)?,
-                    ledger_mark: row.get(11)?,
-                    verdict: row.get(12)?,
-                    body: row.get(13)?,
-                    bytes: row.get(14)?,
-                    started_at: row.get(15)?,
-                    recorded_at: row.get(16)?,
-                })
-            },
-        )
+        .query_row(sql, params![id], |row| {
+            Ok(ReviewRow {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                task_id: row.get(2)?,
+                report_id: row.get(3)?,
+                run_id: row.get(4)?,
+                branch: row.get(5)?,
+                reviewer: row.get(6)?,
+                reviewer_override: row.get(7)?,
+                base_sha: row.get(8)?,
+                commit_sha: row.get(9)?,
+                graph_sha: row.get(10)?,
+                ledger_mark: row.get(11)?,
+                verdict: row.get(12)?,
+                body: row.get(13)?,
+                bytes: row.get(14)?,
+                started_at: row.get(15)?,
+                recorded_at: row.get(16)?,
+                reviewer_model: if extras { row.get(17)? } else { None },
+                fallback_reason: if extras { row.get(18)? } else { None },
+                rereview_of: if extras { row.get(19)? } else { None },
+            })
+        })
         .optional()?;
     let Some(row) = row else {
         return Err(Error::InvalidSetting(format!("no such review: {id}")));
@@ -3502,6 +4122,9 @@ fn load_review(conn: &Connection, id: i64) -> Result<Review, Error> {
         bytes: row.bytes,
         started_at: row.started_at,
         recorded_at: row.recorded_at,
+        reviewer_model: row.reviewer_model,
+        fallback_reason: row.fallback_reason,
+        rereview_of: row.rereview_of,
     })
 }
 

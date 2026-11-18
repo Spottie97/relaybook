@@ -4,7 +4,8 @@ use crate::error::Error;
 use crate::schema::{
     GUARD_MESSAGE, GUARD_NAMES, GUARDS, MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4,
     MIGRATE_V5_TO_V6, MIGRATE_V6_TO_V7, MIGRATE_V7_TO_V8, ONE_LIVE_GATED_INDEX,
-    REVIEW_INVOCATION_INDEX, SCHEMA, SCHEMA_VERSION,
+    REREVIEW_AUTHORIZE_TRIGGER, REVIEW_INVOCATION_INDEX, REVIEWER_EVENTS_TABLE, SCHEMA,
+    SCHEMA_VERSION,
 };
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
@@ -112,6 +113,7 @@ fn migrate_locked(conn: &Connection) -> Result<(), Error> {
         conn.execute_batch(MIGRATE_V7_TO_V8)?;
         conn.execute_batch(GUARDS)?;
         ensure_review_invocation_token(conn)?;
+        ensure_reviewer_fallback(conn)?;
     }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
@@ -120,6 +122,8 @@ fn migrate_locked(conn: &Connection) -> Result<(), Error> {
 pub(crate) fn apply_current_schema(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch(GUARDS)?;
+    conn.execute_batch(REVIEWER_EVENTS_TABLE)?;
+    conn.execute_batch(REREVIEW_AUTHORIZE_TRIGGER)?;
     Ok(())
 }
 
@@ -187,6 +191,72 @@ fn restore_review_invocation_token(conn: &Connection) -> Result<(), Error> {
     }
     if table_exists(conn, "reviews")? && !index_exists(conn, "reviews_invocation_token")? {
         conn.execute_batch(REVIEW_INVOCATION_INDEX)?;
+    }
+    Ok(())
+}
+
+/// Add the reviewer-fallback columns, event log, and re-review trigger.
+///
+/// `user_version` stays 8. A ledger already at schema 8 gains them on the
+/// next read-write open. The v7-to-v8 migration adds them too.
+///
+/// The restore takes `BEGIN IMMEDIATE` when something is missing and this
+/// connection is not already in a transaction, then checks again. Two opens
+/// that both saw a column missing wait on that lock instead of both running
+/// `ALTER`.
+pub(crate) fn ensure_reviewer_fallback(conn: &Connection) -> Result<(), Error> {
+    if !reviewer_fallback_needed(conn)? {
+        return Ok(());
+    }
+    if conn.is_autocommit() {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = restore_reviewer_fallback(conn);
+        return match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        };
+    }
+    restore_reviewer_fallback(conn)
+}
+
+fn reviewer_fallback_needed(conn: &Connection) -> Result<bool, Error> {
+    if table_exists(conn, "reviews")? {
+        for column in ["reviewer_model", "fallback_reason", "rereview_of"] {
+            if !column_exists(conn, "reviews", column)? {
+                return Ok(true);
+            }
+        }
+    }
+    if !table_exists(conn, "reviewer_events")? {
+        return Ok(true);
+    }
+    Ok(!trigger_exists(conn, "relaybook_guard_rereview_authorize")?)
+}
+
+fn restore_reviewer_fallback(conn: &Connection) -> Result<(), Error> {
+    if table_exists(conn, "reviews")? && !column_exists(conn, "reviews", "reviewer_model")? {
+        conn.execute("ALTER TABLE reviews ADD COLUMN reviewer_model TEXT", [])?;
+    }
+    if table_exists(conn, "reviews")? && !column_exists(conn, "reviews", "fallback_reason")? {
+        conn.execute("ALTER TABLE reviews ADD COLUMN fallback_reason TEXT", [])?;
+    }
+    if table_exists(conn, "reviews")? && !column_exists(conn, "reviews", "rereview_of")? {
+        conn.execute(
+            "ALTER TABLE reviews ADD COLUMN rereview_of INTEGER REFERENCES reviews(id)",
+            [],
+        )?;
+    }
+    if !table_exists(conn, "reviewer_events")? {
+        conn.execute_batch(REVIEWER_EVENTS_TABLE)?;
+    }
+    if !trigger_exists(conn, "relaybook_guard_rereview_authorize")? {
+        conn.execute_batch(REREVIEW_AUTHORIZE_TRIGGER)?;
     }
     Ok(())
 }
@@ -260,6 +330,7 @@ pub(crate) fn ensure_guards(conn: &Connection) -> Result<bool, Error> {
     );
     ensure_one_live_gated(conn)?;
     ensure_review_invocation_token(conn)?;
+    ensure_reviewer_fallback(conn)?;
     let mut missing = false;
     for name in GUARD_NAMES {
         if !trigger_exists(conn, name)? {

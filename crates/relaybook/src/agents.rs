@@ -277,6 +277,63 @@ const RELEASE_CODEX_SCHEMA: &str = r#"{
 }
 "#;
 
+pub(crate) fn task_codex_schema() -> &'static str {
+    TASK_CODEX_SCHEMA
+}
+
+pub(crate) fn release_codex_schema() -> &'static str {
+    RELEASE_CODEX_SCHEMA
+}
+
+/// Probe output. Strict object with one boolean. Success is exactly `{"ok":true}`.
+const PROBE_CODEX_SCHEMA: &str = r#"{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ok"],
+  "properties": {
+    "ok": { "type": "boolean" }
+  }
+}
+"#;
+
+/// Stderr phrases captured from codex-cli 0.169.0 in codex-verification-v3 E2.
+/// The apostrophe in the first phrase is U+2019. Nothing else is a limit.
+const CODEX_LIMIT_SIGNATURES: &[(&str, &str)] = &[
+    ("usage_limit", "You\u{2019}ve hit your usage limit"),
+    (
+        "quota_exceeded",
+        "Quota exceeded. Check your plan and billing details.",
+    ),
+];
+
+/// `codex --version` lines this build will treat as a usage limit.
+const CODEX_VERIFIED_VERSIONS: &[&str] = &["codex-cli 0.169.0"];
+
+/// Stderr phrases that stay on the ordinary failure path even if a limit phrase is also present.
+const CODEX_ORDINARY_SIGNATURES: &[&str] = &["401", "input_too_large", "Not logged in"];
+
+/// Read-only tools the Sonnet reviewer is allowed to name.
+const SONNET_REVIEW_TOOLS: &str = "Read,Grep,Glob";
+
+const SONNET_DISALLOWED_TOOLS: &str = "Edit,Write,NotebookEdit,Bash,WebFetch,WebSearch";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CodexExit {
+    Ok,
+    Limited { signature: String },
+    Ordinary,
+}
+
+/// A classified Codex usage limit. `retry_after` is always `None`: the E2
+/// text is a zone-less local clock ("try again at 6:39 AM"), so the driver
+/// uses the configured backoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexLimit {
+    pub signature: String,
+    pub version: String,
+    pub stderr: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexSandbox {
     ReadOnly,
@@ -369,7 +426,15 @@ fn path_is_inside(root: &Path, path: &Path) -> bool {
 /// One JSON object matching the task or release schema. Extra properties are
 /// rejected. Each body field is an array of strings. The body text is what
 /// `review_body` checks again.
+pub(crate) fn parse_review_verdict(text: &str, release: bool) -> Result<(String, String), String> {
+    parse_review_verdict_inner(text, release)
+}
+
 pub(crate) fn parse_codex_verdict(text: &str, release: bool) -> Result<(String, String), String> {
+    parse_review_verdict_inner(text, release)
+}
+
+fn parse_review_verdict_inner(text: &str, release: bool) -> Result<(String, String), String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("codex output is empty".to_string());
@@ -698,7 +763,7 @@ pub(crate) fn call_codex(
     run_id: i64,
     live: &mut Session,
     sandbox: CodexSandbox,
-    release: bool,
+    schema_text: &str,
     model: &str,
 ) -> AgentResult {
     let Some(program) = crate::exe::Program::resolve("codex") else {
@@ -708,11 +773,6 @@ pub(crate) fn call_codex(
     };
     let root = crate::gitinfo::toplevel(cwd).unwrap_or_else(|| cwd.to_path_buf());
     let schema = out.with_file_name("codex-schema.json");
-    let schema_text = if release {
-        RELEASE_CODEX_SCHEMA
-    } else {
-        TASK_CODEX_SCHEMA
-    };
     let share_user = if sandbox == CodexSandbox::Isolated {
         std::env::var("RELAYBOOK_CODEX_USER")
             .ok()
@@ -776,6 +836,376 @@ pub(crate) fn call_codex(
         }
         text
     });
+    let status = match wait_codex(&mut child) {
+        Ok(status) => status,
+        Err(result) => {
+            let _ = stdin_thread.join();
+            let _ = stdout_thread.join();
+            let _ = stderr_thread.join();
+            return result;
+        }
+    };
+    let _ = stdin_thread.join();
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    if let Some(line) = stdout.lines().find(|line| !line.trim().is_empty()) {
+        live.observe(&crate::stream::Piece::Text(line.to_string()));
+    }
+    if !status.success() {
+        return classify_codex_failure(status.code(), &stdout, &stderr, out);
+    }
+    match read_codex_output(out, share_user.as_deref()) {
+        Ok(text) => AgentResult::Finished {
+            session_id: None,
+            est_cost_usd: 0.0,
+            output: text,
+        },
+        Err(err) => AgentResult::Failed {
+            output: format!("{err}\n{stderr}"),
+        },
+    }
+}
+
+/// `child.wait()`, unless `RELAYBOOK_CODEX_TIMEOUT_SECS` is set. That variable
+/// is a test seam. Production waits until Codex exits.
+fn wait_codex(child: &mut std::process::Child) -> Result<std::process::ExitStatus, AgentResult> {
+    let Some(limit) = std::env::var("RELAYBOOK_CODEX_TIMEOUT_SECS")
+        .ok()
+        .and_then(|text| text.parse::<u64>().ok())
+    else {
+        return child.wait().map_err(|err| AgentResult::Failed {
+            output: err.to_string(),
+        });
+    };
+    let deadline = Instant::now() + Duration::from_secs(limit);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(AgentResult::TimedOut);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(err) => {
+                return Err(AgentResult::Failed {
+                    output: err.to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn classify_codex_failure(
+    code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    out: &Path,
+) -> AgentResult {
+    let file = match std::fs::read_to_string(out) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => "unreadable".to_string(),
+    };
+    let version = codex_version();
+    match classify_codex_exit(code, stderr, stdout, &file, &version) {
+        CodexExit::Limited { signature } => AgentResult::UsageLimit {
+            cli: "codex".to_string(),
+            reset_at: None,
+            output: format!("{signature}\n{version}\n{stderr}"),
+        },
+        CodexExit::Ok | CodexExit::Ordinary => AgentResult::Failed {
+            output: format!("codex exited {}\n{stdout}\n{stderr}", code.unwrap_or(-1)),
+        },
+    }
+}
+
+pub(crate) fn codex_limit_detail(result: &AgentResult) -> Option<CodexLimit> {
+    let AgentResult::UsageLimit { cli, output, .. } = result else {
+        return None;
+    };
+    if cli != "codex" {
+        return None;
+    }
+    let mut lines = output.splitn(3, '\n');
+    let signature = lines.next()?.to_string();
+    let version = lines.next()?.to_string();
+    let stderr = lines.next().unwrap_or("").to_string();
+    if !CODEX_LIMIT_SIGNATURES
+        .iter()
+        .any(|(id, _)| *id == signature)
+    {
+        return None;
+    }
+    Some(CodexLimit {
+        signature,
+        version,
+        stderr,
+    })
+}
+
+/// `codex --version`, trimmed. Empty when the binary cannot be run.
+/// The classifier uses this string and does not look at `-m`.
+pub(crate) fn codex_version() -> String {
+    let Some(program) = crate::exe::Program::resolve("codex") else {
+        return String::new();
+    };
+    let Ok(output) = program.command().arg("--version").output() else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A usage limit only when every signal is present. Stdout is ignored.
+/// The `-o` text is `out`. A phrase in stdout or in `out` is not a limit.
+pub(crate) fn classify_codex_exit(
+    code: Option<i32>,
+    stderr: &str,
+    stdout: &str,
+    out: &str,
+    version: &str,
+) -> CodexExit {
+    let _ = stdout;
+    if code == Some(0) && !out.trim().is_empty() {
+        return CodexExit::Ok;
+    }
+    let version_ok = CODEX_VERIFIED_VERSIONS
+        .iter()
+        .any(|item| version.trim() == *item);
+    let signature = CODEX_LIMIT_SIGNATURES
+        .iter()
+        .find(|(_, phrase)| stderr.contains(phrase));
+    let ordinary = CODEX_ORDINARY_SIGNATURES
+        .iter()
+        .any(|phrase| stderr.contains(phrase));
+    if code == Some(1)
+        && out.trim().is_empty()
+        && version_ok
+        && !ordinary
+        && let Some((id, _)) = signature
+    {
+        return CodexExit::Limited {
+            signature: (*id).to_string(),
+        };
+    }
+    CodexExit::Ordinary
+}
+
+/// E2 prints only a zone-less local clock. That text is not a timestamp.
+/// Returns `None` for every captured line. Callers use the configured backoff.
+pub(crate) fn parse_codex_retry_after(stderr: &str) -> Option<String> {
+    let _ = stderr;
+    None
+}
+
+/// Tiny Codex exec used to see whether the limit window has ended.
+/// Empty stdin. The prompt starts with `Probe.` so a test double can tell it
+/// from a review. The sandbox is the configured one, and `-m` is `model`.
+pub(crate) fn call_codex_probe(
+    cwd: &Path,
+    out: &Path,
+    run_id: i64,
+    live: &mut Session,
+    sandbox: CodexSandbox,
+    model: &str,
+) -> AgentResult {
+    let result = call_codex(
+        cwd,
+        "Probe. Return {\"ok\":true}.",
+        "",
+        out,
+        run_id,
+        live,
+        sandbox,
+        PROBE_CODEX_SCHEMA,
+        model,
+    );
+    match result {
+        AgentResult::Finished { output, .. } => match parse_probe_output(&output) {
+            Ok(()) => AgentResult::Finished {
+                session_id: None,
+                est_cost_usd: 0.0,
+                output,
+            },
+            Err(err) => AgentResult::Failed { output: err },
+        },
+        other => other,
+    }
+}
+
+fn parse_probe_output(text: &str) -> Result<(), String> {
+    let text = text.trim();
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| "probe output is not one JSON object".to_string())?;
+    let Some(object) = value.as_object() else {
+        return Err("probe output is not one JSON object".to_string());
+    };
+    if object.len() != 1 || object.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("probe output is not {\"ok\":true}".to_string());
+    }
+    Ok(())
+}
+
+/// Sonnet review argv. Flags were checked against `claude --help` (2.1.325):
+/// `-p`, `--model`, `--permission-mode dontAsk`, `--tools`, `--allowedTools`,
+/// `--disallowedTools`, `--no-session-persistence`, `--output-format json`,
+/// `--strict-mcp-config`, and `--restricted`.
+pub(crate) fn sonnet_review_args(prompt: &str) -> Vec<String> {
+    vec![
+        "-p".to_string(),
+        prompt.to_string(),
+        "--model".to_string(),
+        relaybook_core::SONNET_REVIEW_MODEL.to_string(),
+        "--permission-mode".to_string(),
+        "dontAsk".to_string(),
+        "--tools".to_string(),
+        SONNET_REVIEW_TOOLS.to_string(),
+        "--allowedTools".to_string(),
+        SONNET_REVIEW_TOOLS.to_string(),
+        "--disallowedTools".to_string(),
+        SONNET_DISALLOWED_TOOLS.to_string(),
+        "--no-session-persistence".to_string(),
+        "--output-format".to_string(),
+        "json".to_string(),
+        "--strict-mcp-config".to_string(),
+        "--restricted".to_string(),
+    ]
+}
+
+/// Refuse before spawn when the argv could edit, run a shell, or use the web.
+/// `--strict-mcp-config` is not `--mcp-config`.
+pub(crate) fn forbidden_claude_review_arg(args: &[String]) -> Option<String> {
+    let mut saw_dont_ask = false;
+    let mut saw_tools = false;
+    let mut saw_allowed = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg.starts_with("--dangerously")
+            || arg == "--add-dir"
+            || arg == "--resume"
+            || arg == "--continue"
+            || arg == "-c"
+            || arg == "--fallback-model"
+            || arg == "--mcp-config"
+        {
+            return Some(arg.to_string());
+        }
+        if arg == "--permission-mode" {
+            let mode = args.get(index + 1).map(String::as_str);
+            if mode != Some("dontAsk") {
+                return Some("--permission-mode".to_string());
+            }
+            saw_dont_ask = true;
+            index += 2;
+            continue;
+        }
+        if arg == "--tools" || arg == "--allowedTools" || arg == "--allowed-tools" {
+            let listed = args.get(index + 1).map(String::as_str).unwrap_or("");
+            if !review_tools_only(listed) {
+                return Some(arg.to_string());
+            }
+            if arg == "--tools" {
+                saw_tools = true;
+            } else {
+                saw_allowed = true;
+            }
+            index += 2;
+            continue;
+        }
+        index += 1;
+    }
+    if !saw_dont_ask {
+        return Some("--permission-mode dontAsk".to_string());
+    }
+    if !saw_tools {
+        return Some("--tools".to_string());
+    }
+    if !saw_allowed {
+        return Some("--allowedTools".to_string());
+    }
+    None
+}
+
+fn review_tools_only(listed: &str) -> bool {
+    let mut any = false;
+    for tool in listed.split(',') {
+        let tool = tool.trim();
+        if tool.is_empty() {
+            continue;
+        }
+        any = true;
+        if tool != "Read" && tool != "Grep" && tool != "Glob" {
+            return false;
+        }
+    }
+    any
+}
+
+/// Read-only Claude review. A forbidden argv is refused before the process
+/// is resolved. An error, a limit, or a model other than the pin is `Failed`.
+pub(crate) fn call_claude_reviewer(
+    cwd: &Path,
+    prompt: &str,
+    packet: &str,
+    run_id: i64,
+    live: &mut Session,
+) -> AgentResult {
+    let args = sonnet_review_args(prompt);
+    if let Some(flag) = forbidden_claude_review_arg(&args) {
+        return AgentResult::Failed {
+            output: format!("refusing claude flag {flag}"),
+        };
+    }
+    let Some(program) = crate::exe::Program::resolve("claude") else {
+        return AgentResult::Unavailable {
+            cli: "claude".to_string(),
+        };
+    };
+    let mut command = program.command();
+    command
+        .current_dir(cwd)
+        .args(&args)
+        .env("RELAYBOOK_RUN_ID", run_id.to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return AgentResult::Unavailable {
+                cli: "claude".to_string(),
+            };
+        }
+        Err(err) => {
+            return AgentResult::Failed {
+                output: err.to_string(),
+            };
+        }
+    };
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let packet = packet.to_string();
+    let stdin_thread = std::thread::spawn(move || {
+        if let Some(mut stdin) = stdin {
+            let _ = stdin.write_all(packet.as_bytes());
+        }
+    });
+    let stdout_thread = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stdout) = stdout {
+            let _ = stdout.read_to_string(&mut text);
+        }
+        text
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut text);
+        }
+        text
+    });
     let status = match child.wait() {
         Ok(status) => status,
         Err(err) => {
@@ -793,21 +1223,51 @@ pub(crate) fn call_codex(
     if !status.success() {
         return AgentResult::Failed {
             output: format!(
-                "codex exited {}\n{stdout}\n{stderr}",
+                "claude exited {}\n{stdout}\n{stderr}",
                 status.code().unwrap_or(-1)
             ),
         };
     }
-    match read_codex_output(out, share_user.as_deref()) {
-        Ok(text) => AgentResult::Finished {
-            session_id: None,
-            est_cost_usd: 0.0,
-            output: text,
-        },
+    match parse_claude_review_envelope(&stdout) {
+        Ok((result, model)) => {
+            if let Some(model) = model.as_deref()
+                && model != relaybook_core::SONNET_REVIEW_MODEL
+            {
+                return AgentResult::Failed {
+                    output: format!("claude model {model} is not the pinned reviewer"),
+                };
+            }
+            AgentResult::Finished {
+                session_id: None,
+                est_cost_usd: 0.0,
+                output: result,
+            }
+        }
         Err(err) => AgentResult::Failed {
             output: format!("{err}\n{stderr}"),
         },
     }
+}
+
+fn parse_claude_review_envelope(stdout: &str) -> Result<(String, Option<String>), String> {
+    let text = stdout.trim();
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|_| "claude output is not one JSON object".to_string())?;
+    let Some(object) = value.as_object() else {
+        return Err("claude output is not one JSON object".to_string());
+    };
+    if object.get("is_error").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err("claude reported an error".to_string());
+    }
+    let result = object
+        .get("result")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "claude output has no result".to_string())?;
+    let model = object
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Ok((result.to_string(), model))
 }
 
 fn forbidden_codex_arg(args: &[String]) -> Option<&str> {
@@ -1075,10 +1535,11 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        AccountKind, Accounts, AgentResult, CodexSandbox, account_line, classify, claude_account,
-        codex_args, codex_login_status_args, codex_output_file, forbidden_codex_arg,
-        parse_codex_verdict, path_is_inside, prepare_codex_output, read_codex_output,
-        review_input_too_large,
+        AccountKind, Accounts, AgentResult, CodexExit, CodexSandbox, account_line, classify,
+        classify_codex_exit, claude_account, codex_args, codex_login_status_args,
+        codex_output_file, forbidden_claude_review_arg, forbidden_codex_arg,
+        parse_codex_retry_after, parse_codex_verdict, path_is_inside, prepare_codex_output,
+        read_codex_output, review_input_too_large, sonnet_review_args,
     };
 
     #[test]
@@ -1249,6 +1710,7 @@ mod tests {
     fn codex_output_schemas_are_strict() {
         assert_strict_schema("TASK_CODEX_SCHEMA", super::TASK_CODEX_SCHEMA);
         assert_strict_schema("RELEASE_CODEX_SCHEMA", super::RELEASE_CODEX_SCHEMA);
+        assert_strict_schema("PROBE_CODEX_SCHEMA", super::PROBE_CODEX_SCHEMA);
     }
 
     #[test]
@@ -1481,5 +1943,110 @@ mod tests {
         assert!(review_input_too_large(prompt, &"a".repeat(64 * 1024 + 1)));
         let packet = "a".repeat(1_048_576);
         assert!(review_input_too_large(prompt, &packet));
+    }
+
+    const USAGE: &str = "ERROR: You\u{2019}ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 6:39 AM.";
+    const QUOTA: &str = "ERROR: Quota exceeded. Check your plan and billing details.";
+    const VERSION: &str = "codex-cli 0.169.0";
+
+    #[test]
+    fn codex_limit_needs_every_signal() {
+        assert!(matches!(
+            classify_codex_exit(Some(1), USAGE, "", "", VERSION),
+            CodexExit::Limited { signature } if signature == "usage_limit"
+        ));
+        assert!(matches!(
+            classify_codex_exit(Some(1), QUOTA, "", "", VERSION),
+            CodexExit::Limited { signature } if signature == "quota_exceeded"
+        ));
+        assert!(matches!(
+            classify_codex_exit(Some(2), USAGE, "", "", VERSION),
+            CodexExit::Ordinary
+        ));
+        assert!(matches!(
+            classify_codex_exit(Some(1), USAGE, "", "{\"ok\":true}", VERSION),
+            CodexExit::Ordinary
+        ));
+        assert!(matches!(
+            classify_codex_exit(Some(1), "ERROR: something else", "", "", VERSION),
+            CodexExit::Ordinary
+        ));
+        let with_auth = format!("{USAGE}\nERROR: unexpected status 401 Unauthorized");
+        assert!(matches!(
+            classify_codex_exit(Some(1), &with_auth, "", "", VERSION),
+            CodexExit::Ordinary
+        ));
+        assert!(matches!(
+            classify_codex_exit(Some(1), USAGE, "", "", "codex-cli 0.1.0"),
+            CodexExit::Ordinary
+        ));
+        assert!(matches!(
+            classify_codex_exit(Some(1), "", USAGE, "", VERSION),
+            CodexExit::Ordinary
+        ));
+        assert!(matches!(
+            classify_codex_exit(Some(1), "", "", USAGE, VERSION),
+            CodexExit::Ordinary
+        ));
+        assert!(matches!(
+            classify_codex_exit(
+                Some(1),
+                "ERROR: exceeded retry limit, last status: 429 Too Many Requests",
+                "",
+                "",
+                VERSION
+            ),
+            CodexExit::Ordinary
+        ));
+        assert_eq!(parse_codex_retry_after(USAGE), None);
+        assert_eq!(parse_codex_retry_after(QUOTA), None);
+        assert_eq!(
+            parse_codex_retry_after(
+                "ERROR: You\u{2019}ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again later."
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sonnet_argv_never_grants_edit() {
+        let args = sonnet_review_args("Review the packet on stdin.");
+        assert!(forbidden_claude_review_arg(&args).is_none());
+        assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
+        assert!(args.iter().any(|arg| arg == "--restricted"));
+        assert!(!args.iter().any(|arg| arg == "--mcp-config"));
+        for forbidden in [
+            "--dangerously-skip-permissions",
+            "--add-dir",
+            "--resume",
+            "--continue",
+            "--fallback-model",
+            "--mcp-config",
+        ] {
+            let mut bad = args.clone();
+            bad.push(forbidden.to_string());
+            assert!(forbidden_claude_review_arg(&bad).is_some(), "{forbidden}");
+        }
+        for tools in ["--tools", "--allowedTools"] {
+            let mut bad = args.clone();
+            let index = bad.iter().position(|arg| arg == tools).expect(tools);
+            bad[index + 1] = "Read,Bash".to_string();
+            assert!(forbidden_claude_review_arg(&bad).is_some(), "{tools}");
+        }
+        let mut mode = args.clone();
+        let index = mode
+            .iter()
+            .position(|arg| arg == "--permission-mode")
+            .expect("mode");
+        mode[index + 1] = "acceptEdits".to_string();
+        assert!(forbidden_claude_review_arg(&mode).is_some());
+        let mut missing = args.clone();
+        let index = missing
+            .iter()
+            .position(|arg| arg == "--permission-mode")
+            .expect("mode");
+        missing.remove(index);
+        missing.remove(index);
+        assert!(forbidden_claude_review_arg(&missing).is_some());
     }
 }

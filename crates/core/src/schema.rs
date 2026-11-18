@@ -139,6 +139,9 @@ CREATE TABLE IF NOT EXISTS reviews (
     started_at TEXT NOT NULL,
     recorded_at TEXT,
     invocation_token TEXT,
+    reviewer_model TEXT,
+    fallback_reason TEXT,
+    rereview_of INTEGER REFERENCES reviews(id),
     CHECK ((scope = 'task') = (task_id IS NOT NULL))
 );
 
@@ -208,6 +211,59 @@ pub(crate) const REVIEW_INVOCATION_INDEX: &str = "
 CREATE UNIQUE INDEX IF NOT EXISTS reviews_invocation_token
 ON reviews (invocation_token)
 WHERE invocation_token IS NOT NULL;
+";
+
+/// Append-only Codex availability log. A read-write open creates it on an
+/// existing schema 8 ledger. `user_version` stays 8.
+pub(crate) const REVIEWER_EVENTS_TABLE: &str = "
+CREATE TABLE IF NOT EXISTS reviewer_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    run_id INTEGER,
+    review_id INTEGER,
+    kind TEXT NOT NULL CHECK (
+        kind IN (
+            'codex_limited',
+            'probe_ok',
+            'probe_limited',
+            'probe_failed',
+            'switched_to_fallback',
+            'switched_to_codex'
+        )
+    ),
+    retry_after TEXT,
+    retry_source TEXT CHECK (retry_source IS NULL OR retry_source IN ('codex', 'backoff')),
+    codex_version TEXT,
+    evidence TEXT
+);
+";
+
+/// Stops an older schema 8 binary from authorizing a release while a Claude
+/// approval still has no approved Codex re-review. A missing setting is the
+/// same as `before-release`. `fallback_rereview=off` does not fire.
+pub(crate) const REREVIEW_AUTHORIZE_TRIGGER: &str = "
+CREATE TRIGGER IF NOT EXISTS relaybook_guard_rereview_authorize
+BEFORE INSERT ON release_authorizations
+WHEN (
+    (SELECT value FROM settings WHERE key = 'fallback_rereview') IS NULL
+    OR (SELECT value FROM settings WHERE key = 'fallback_rereview') = 'before-release'
+)
+ AND NEW.run_id IS NOT NULL
+ AND EXISTS (
+    SELECT 1 FROM reviews AS sonnet
+    WHERE sonnet.run_id = NEW.run_id
+      AND sonnet.reviewer = 'claude'
+      AND sonnet.verdict = 'approved'
+      AND NOT EXISTS (
+          SELECT 1 FROM reviews AS codex
+          WHERE codex.rereview_of = sonnet.id
+            AND codex.reviewer = 'codex'
+            AND codex.verdict = 'approved'
+      )
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'codex re-review pending');
+END;
 ";
 
 /// Triggers installed for schema 8. They only `RAISE`; they do not write.

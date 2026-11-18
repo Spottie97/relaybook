@@ -71,6 +71,9 @@ relaybook config set workflow gated
 | `reviewer` | `claude` | `claude` or `codex` |
 | `codex_sandbox` | `read-only` | `read-only` or `isolated` |
 | `codex_model` | `gpt-6.1-sol` | 1–64 characters, no leading `-`, only `A-Za-z0-9._:-` |
+| `review_fallback` | `off` | `off` or `sonnet` |
+| `codex_backoff_min` | 60 | integer from 5 to 1440 |
+| `fallback_rereview` | `before-release` | `before-release` or `off` |
 | `workflow` | `classic` | `classic` or `gated` |
 | `remote_check` | `online` | `online` or `local` |
 | `signoff` | `typed` | `typed` or `signed-tag` |
@@ -79,6 +82,8 @@ relaybook config set workflow gated
 | `max_agent_calls` | 60 | integer, at least 1 |
 | `cursor_timeout_min` | 30 | integer, at least 1 |
 | `est_cost_cap_usd` | unset | a number greater than 0, or `unset` to clear it |
+
+`review_fallback` defaults to `off`. `sonnet` lets a gated run call Claude `claude-sonnet-5-5` after a classified Codex usage limit. That model id is not a setting. `relaybook config set review_fallback sonnet` asks `Allow Sonnet to review when Codex is limited?` and requires the typed challenge. The line starts with `sonnet`. Without a terminal it fails with `loosening reviewer fallback requires confirmation at a TTY`. A live gated run fails with `a gated run is already live` before that prompt. Setting `off`, or setting `sonnet` when it is already `sonnet`, does not ask. `codex_backoff_min` is the wait after a limit, in minutes, from 5 to 1440, default 60. Changing it does not ask. `fallback_rereview` defaults to `before-release`. `relaybook config set fallback_rereview off` asks `Turn off Codex re-review before release?` and requires the typed challenge. The line starts with `off`. The same terminal and live-run rules apply. Setting `before-release` does not ask. See [Reviewer fallback](auto-mode.md#reviewer-fallback).
 
 `codex_model` defaults to `gpt-6.1-sol`. Gated review passes it as `-m` on `codex exec`. `relaybook config` prints it. `relaybook config get codex_model` prints that one value. `relaybook config set codex_model gpt-6.1-sol` stores another model. The value is trimmed. It must be non-empty, at most 64 characters, must not start with `-`, and may contain only `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. Changing it does not ask for a terminal, including while `workflow=gated`. It is not a loosening change, so it follows `codex_sandbox`: the write does not use the typed challenge. `codex login status` does not take `-m`.
 

@@ -4,7 +4,11 @@ use serde::Serialize;
 use crate::error::Error;
 
 pub const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-sol";
+
+/// Pinned Claude API id for the fallback reviewer. Not a setting.
+pub const SONNET_REVIEW_MODEL: &str = "claude-sonnet-5-5";
 pub const CODEX_MODEL_MAX_LEN: usize = 64;
+pub const DEFAULT_CODEX_BACKOFF_MIN: i64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Snapshot {
@@ -15,6 +19,12 @@ pub struct Snapshot {
     pub codex_sandbox: String,
     /// Model passed to `codex exec -m`. Default `gpt-6.1-sol`.
     pub codex_model: String,
+    /// `off` or `sonnet`. Default `off`. The Sonnet model is not configurable.
+    pub review_fallback: String,
+    /// Minutes to wait after a classified Codex limit. 5 to 1440, default 60.
+    pub codex_backoff_min: i64,
+    /// `before-release` or `off`. Default `before-release`.
+    pub fallback_rereview: String,
     pub workflow: String,
     pub remote_check: String,
     pub signoff: String,
@@ -39,6 +49,23 @@ pub struct RunView {
     pub status: String,
 }
 
+/// One Claude approval that still needs an approved Codex re-review.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PendingRereview {
+    pub review_id: i64,
+    pub slug: Option<String>,
+}
+
+/// Gated reviewer state. Omitted from classic status JSON.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReviewerStatus {
+    pub active: String,
+    /// `available`, `limited until <t>`, or `probing`.
+    pub codex: String,
+    pub fallback: String,
+    pub pending_rereviews: Vec<PendingRereview>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatusView {
     pub mode: String,
@@ -50,6 +77,9 @@ pub struct StatusView {
     pub est_cost_cap_usd: Option<String>,
     pub run: Option<RunView>,
     pub waiting_on: Option<String>,
+    /// Present only when `workflow=gated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<ReviewerStatus>,
 }
 
 struct RunRow {
@@ -71,6 +101,9 @@ pub fn load(conn: &Connection) -> Result<Snapshot, Error> {
         reviewer: value_or(conn, "reviewer", "claude")?,
         codex_sandbox: value_or(conn, "codex_sandbox", "read-only")?,
         codex_model: value_or(conn, "codex_model", DEFAULT_CODEX_MODEL)?,
+        review_fallback: value_or(conn, "review_fallback", "off")?,
+        codex_backoff_min: number_or(conn, "codex_backoff_min", DEFAULT_CODEX_BACKOFF_MIN)?,
+        fallback_rereview: value_or(conn, "fallback_rereview", "before-release")?,
         workflow: value_or(conn, "workflow", "classic")?,
         remote_check: value_or(conn, "remote_check", "online")?,
         signoff: value_or(conn, "signoff", "typed")?,
@@ -131,6 +164,7 @@ pub fn status(conn: &Connection) -> Result<StatusView, Error> {
             status: row.status,
         }),
         waiting_on,
+        reviewer: None,
     })
 }
 
@@ -147,12 +181,15 @@ pub fn hook_wait_line(conn: &Connection) -> Result<Option<String>, Error> {
 
 pub fn format_config(settings: &Snapshot) -> String {
     format!(
-        "mode {}\ngates {}\nreviewer {}\ncodex_sandbox {}\ncodex_model {}\nworkflow {}\nremote_check {}\nsignoff {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
+        "mode {}\ngates {}\nreviewer {}\ncodex_sandbox {}\ncodex_model {}\nreview_fallback {}\ncodex_backoff_min {}\nfallback_rereview {}\nworkflow {}\nremote_check {}\nsignoff {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
         settings.mode,
         settings.gates,
         settings.reviewer,
         settings.codex_sandbox,
         settings.codex_model,
+        settings.review_fallback,
+        settings.codex_backoff_min,
+        settings.fallback_rereview,
         settings.workflow,
         settings.remote_check,
         settings.signoff,
@@ -197,6 +234,18 @@ pub fn format_status(view: &StatusView) -> String {
     }
     if let Some(waiting) = &view.waiting_on {
         writeln_line(&mut out, &format!("waiting on {waiting}"));
+    }
+    if let Some(reviewer) = &view.reviewer {
+        writeln_line(
+            &mut out,
+            &format!(
+                "reviewer active {} codex {} fallback {} pending {}",
+                reviewer.active,
+                reviewer.codex,
+                reviewer.fallback,
+                reviewer.pending_rereviews.len()
+            ),
+        );
     }
     out
 }
@@ -289,6 +338,19 @@ fn validate(conn: &Connection, key: &str, value: &str) -> Result<String, Error> 
         "reviewer" => one_of(key, value, &["claude", "codex"])?,
         "codex_sandbox" => one_of(key, value, &["read-only", "isolated"])?,
         "codex_model" => parse_codex_model(value)?,
+        "review_fallback" => one_of(key, value, &["off", "sonnet"])?,
+        "codex_backoff_min" => {
+            let parsed = value
+                .parse::<i64>()
+                .map_err(|_| Error::InvalidSetting(format!("invalid {key}: {value}")))?;
+            if !(5..=1440).contains(&parsed) {
+                return Err(Error::InvalidSetting(
+                    "codex_backoff_min must be from 5 to 1440".to_string(),
+                ));
+            }
+            parsed.to_string()
+        }
+        "fallback_rereview" => one_of(key, value, &["before-release", "off"])?,
         "workflow" => one_of(key, value, &["classic", "gated"])?,
         "remote_check" => one_of(key, value, &["online", "local"])?,
         "signoff" => one_of(key, value, &["typed", "signed-tag"])?,
@@ -379,6 +441,9 @@ pub fn configured_value(settings: &Snapshot, key: &str) -> Result<String, Error>
         "reviewer" => Ok(settings.reviewer.clone()),
         "codex_sandbox" => Ok(settings.codex_sandbox.clone()),
         "codex_model" => Ok(settings.codex_model.clone()),
+        "review_fallback" => Ok(settings.review_fallback.clone()),
+        "codex_backoff_min" => Ok(settings.codex_backoff_min.to_string()),
+        "fallback_rereview" => Ok(settings.fallback_rereview.clone()),
         "workflow" => Ok(settings.workflow.clone()),
         "remote_check" => Ok(settings.remote_check.clone()),
         "signoff" => Ok(settings.signoff.clone()),

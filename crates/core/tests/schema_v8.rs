@@ -202,6 +202,7 @@ fn fresh_ledger_is_v8_with_guards() {
         names,
         vec![
             "relaybook_guard_claim_base_sha".to_string(),
+            "relaybook_guard_rereview_authorize".to_string(),
             "relaybook_guard_run_insert".to_string(),
             "relaybook_guard_run_update".to_string(),
             "relaybook_guard_task_accept".to_string(),
@@ -217,7 +218,11 @@ fn fresh_ledger_is_v8_with_guards() {
                 |row| row.get(0),
             )
             .expect("sql");
-        assert!(sql.contains(GUARD), "{name}");
+        if name == "relaybook_guard_rereview_authorize" {
+            assert!(sql.contains("codex re-review pending"), "{name}");
+        } else {
+            assert!(sql.contains(GUARD), "{name}");
+        }
         assert!(sql.contains("SELECT RAISE"), "{name}");
     }
 }
@@ -418,7 +423,7 @@ fn v7_ledger_migrates_to_v8_with_payloads_unchanged() {
     let ledger = Ledger::open(&path).expect("migrate");
     drop(ledger);
     assert_eq!(user_version(&path), 8);
-    assert_eq!(trigger_names(&path).len(), 5);
+    assert_eq!(trigger_names(&path).len(), 6);
     let conn = Connection::open(&path).expect("reopen");
     let stored_event: String = conn
         .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
@@ -518,7 +523,7 @@ fn v1_and_v6_migrate_to_v8() {
     }
     drop(Ledger::open(&path).expect("migrate v1"));
     assert_eq!(user_version(&path), 8);
-    assert_eq!(trigger_names(&path).len(), 5);
+    assert_eq!(trigger_names(&path).len(), 6);
     let conn = Connection::open(&path).expect("reopen");
     let stored: String = conn
         .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
@@ -569,7 +574,7 @@ fn v1_and_v6_migrate_to_v8() {
     }
     drop(Ledger::open(&path).expect("migrate v6"));
     assert_eq!(user_version(&path), 8);
-    assert_eq!(trigger_names(&path).len(), 5);
+    assert_eq!(trigger_names(&path).len(), 6);
     let columns = column_names(&path, "reports");
     for column in ["commit_sha", "base_sha", "graph_sha"] {
         assert!(columns.iter().any(|name| name == column), "{column}");
@@ -1153,5 +1158,98 @@ fn newer_than_schema_is_refused() {
     };
     assert_eq!(readonly.to_string(), "this ledger needs a newer relaybook");
     assert_eq!(user_version(&path), 9);
-    assert_eq!(trigger_names(&path).len(), 5);
+    assert_eq!(trigger_names(&path).len(), 6);
+}
+
+#[test]
+fn fallback_schema_idempotent_at_v8() {
+    let (_dir, path) = fresh_path();
+    drop(Ledger::initialize(&path).expect("init"));
+    assert_eq!(user_version(&path), 8);
+    let again = Ledger::open(&path).expect("second open");
+    drop(again);
+    assert_eq!(user_version(&path), 8);
+    let columns = column_names(&path, "reviews");
+    for name in ["reviewer_model", "fallback_reason", "rereview_of"] {
+        assert!(columns.iter().any(|column| column == name), "{name}");
+    }
+    assert!(
+        trigger_names(&path)
+            .iter()
+            .any(|name| name == "relaybook_guard_rereview_authorize")
+    );
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.pragma_update(None, "user_version", 9)
+            .expect("version");
+    }
+    let opened = match Ledger::open(&path) {
+        Ok(_) => panic!("newer ledger opened"),
+        Err(err) => err,
+    };
+    assert_eq!(opened.to_string(), "this ledger needs a newer relaybook");
+}
+
+#[test]
+fn rereview_trigger_blocks_authorization_insert() {
+    let (_dir, path) = fresh_path();
+    let mut ledger = Ledger::initialize(&path).expect("init");
+    gate(&mut ledger);
+    let run = ledger
+        .start_run("prd.md", "digest", "feature", Some("gated"))
+        .expect("run");
+    drop(ledger);
+    let conn = Connection::open(&path).expect("open");
+    conn.execute(
+        "INSERT INTO tasks (slug, title, status, created_at, updated_at, run_id)
+         VALUES ('work', 'Work', 'done', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', ?1)",
+        [run.id],
+    )
+    .expect("task");
+    let task_id: i64 = conn
+        .query_row("SELECT id FROM tasks WHERE slug = 'work'", [], |row| {
+            row.get(0)
+        })
+        .expect("task id");
+    conn.execute(
+        "INSERT INTO reviews (
+            scope, task_id, run_id, branch, reviewer, base_sha, commit_sha, ledger_mark,
+            verdict, body, bytes, started_at, recorded_at
+         ) VALUES (
+            'task', ?1, ?2, 'feature', 'claude', 'a', 'b', 'mark',
+            'approved', '{}', 2, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+         )",
+        rusqlite::params![task_id, run.id],
+    )
+    .expect("review");
+    let review_id = conn.last_insert_rowid();
+    let err = conn
+        .execute(
+            "INSERT INTO release_authorizations (
+                run_id, branch, commit_sha, review_id, authorized_by, created_at
+             ) VALUES (?1, 'feature', 'b', ?2, 'maintainer', '2026-01-01T00:00:00.000Z')",
+            rusqlite::params![run.id, review_id],
+        )
+        .expect_err("trigger");
+    assert!(err.to_string().contains("codex re-review pending"), "{err}");
+}
+
+#[test]
+fn retry_after_from_error_is_ignored_and_advisory_iso_is_clamped() {
+    let (_dir, path) = fresh_path();
+    let ledger = Ledger::initialize(&path).expect("init");
+    let past = ledger
+        .resolve_retry_after(Some("2000-01-01T00:00:00.000Z"), 60)
+        .expect("past");
+    assert_eq!(past.1, "backoff");
+    let far = ledger
+        .resolve_retry_after(Some("2999-01-01T00:00:00.000Z"), 60)
+        .expect("far");
+    assert_eq!(far.1, "backoff");
+    let soon = ledger.backoff_deadline(1).expect("soon");
+    let kept = ledger.resolve_retry_after(Some(&soon), 60).expect("kept");
+    assert_eq!(kept.1, "codex");
+    assert_eq!(kept.0, soon);
+    let missing = ledger.resolve_retry_after(None, 60).expect("missing");
+    assert_eq!(missing.1, "backoff");
 }

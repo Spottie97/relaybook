@@ -423,6 +423,47 @@ pub(crate) fn review_record_release(
     )
 }
 
+/// Who records the next owned review. Codex is the default. Sonnet is only
+/// the fallback reviewer, and a re-review never accepts or reopens a task.
+pub(crate) struct ReviewerChoice {
+    pub reviewer: String,
+    pub model: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub note_fallback: bool,
+    pub fallback_retry_after: Option<String>,
+    pub codex_version: Option<String>,
+    pub rereview_of: Option<i64>,
+    pub accept_approved_task: bool,
+    pub reopen_on_changes: bool,
+}
+
+impl ReviewerChoice {
+    pub(crate) fn codex(model: &str) -> Self {
+        Self {
+            reviewer: "codex".to_string(),
+            model: Some(model.to_string()),
+            fallback_reason: None,
+            note_fallback: false,
+            fallback_retry_after: None,
+            codex_version: None,
+            rereview_of: None,
+            accept_approved_task: true,
+            reopen_on_changes: true,
+        }
+    }
+
+    fn extras(&self) -> relaybook_core::ReviewColumnExtras {
+        relaybook_core::ReviewColumnExtras {
+            reviewer_model: self.model.clone(),
+            fallback_reason: self.fallback_reason.clone(),
+            rereview_of: self.rereview_of,
+            note_fallback: self.note_fallback,
+            fallback_retry_after: self.fallback_retry_after.clone(),
+            codex_version: self.codex_version.clone(),
+        }
+    }
+}
+
 /// Packet fields for one auto review. The runner records this review itself.
 pub(crate) struct PreparedReview {
     pub review_id: i64,
@@ -431,6 +472,9 @@ pub(crate) struct PreparedReview {
     pub slug: Option<String>,
     pub base_sha: Option<String>,
     pub commit_sha: String,
+    /// When set, the packet diffs this spec instead of `base_sha..commit_sha`.
+    /// Re-reviews keep the original range while `commit_sha` is current HEAD.
+    pub diff_spec: Option<String>,
     pub handoff: serde_json::Value,
 }
 
@@ -445,6 +489,7 @@ pub(crate) fn start_task_review(
     cwd: &Path,
     run: &Run,
     slug: &str,
+    choice: &ReviewerChoice,
 ) -> Result<PreparedReview, Error> {
     if ledger.settings()?.workflow != "gated" {
         return Err(Error::InvalidSetting(
@@ -511,12 +556,13 @@ pub(crate) fn start_task_review(
         Some(slug),
         Some(run_id),
         &branch,
-        "codex",
+        &choice.reviewer,
         base_sha.as_deref(),
         &commit_sha,
         refresh.graph_sha.as_deref(),
         &fingerprint,
         &expect,
+        &choice.extras(),
     )?;
     let report_body = match started.report_body.as_deref() {
         Some(body) => {
@@ -545,6 +591,7 @@ pub(crate) fn start_task_review(
         slug: Some(slug.to_string()),
         base_sha,
         commit_sha,
+        diff_spec: None,
         handoff,
     })
 }
@@ -558,6 +605,7 @@ pub(crate) fn start_release_review(
     ledger: &mut Ledger,
     cwd: &Path,
     run: &Run,
+    choice: &ReviewerChoice,
 ) -> Result<PreparedReview, Error> {
     if ledger.settings()?.workflow != "gated" {
         return Err(Error::InvalidSetting(
@@ -608,12 +656,13 @@ pub(crate) fn start_release_review(
         None,
         Some(run_id),
         &checkout.branch,
-        "codex",
+        &choice.reviewer,
         Some(base_sha.as_str()),
         &commit_sha,
         refresh.graph_sha.as_deref(),
         &fingerprint,
         &expect,
+        &choice.extras(),
     )?;
     let range = format!("{base_sha}..{commit_sha}");
     let handoff = serde_json::json!({
@@ -634,6 +683,100 @@ pub(crate) fn start_release_review(
         slug: None,
         base_sha: Some(base_sha),
         commit_sha,
+        diff_spec: None,
+        handoff,
+    })
+}
+
+/// Start a Codex re-review of one approved fallback review.
+///
+/// The row's `commit_sha` is current HEAD. The packet diff is the original
+/// review's `base_sha..commit_sha`, with graph context `no graph`. No graph
+/// refresh. The row does not accept or reopen a task.
+pub(crate) fn start_rereview(
+    ledger: &mut Ledger,
+    cwd: &Path,
+    run: &Run,
+    original: &relaybook_core::PendingRereviewRow,
+    model: &str,
+) -> Result<PreparedReview, Error> {
+    if ledger.settings()?.workflow != "gated" {
+        return Err(Error::InvalidSetting(
+            "review start requires workflow=gated".to_string(),
+        ));
+    }
+    if run.stage != "review" && run.stage != "release_review" {
+        return Err(Error::InvalidSetting(
+            relaybook_core::STALE_REVIEW_INVOCATION.to_string(),
+        ));
+    }
+    require_gated_clean_tree(cwd, ledger)?;
+    let root = repository_root(cwd)?;
+    let head = gitinfo::verified_head(&root).ok_or_else(|| {
+        Error::InvalidSetting("review start requires a commit at HEAD".to_string())
+    })?;
+    let run_id = run.id;
+    let (report_id, report_body) = if original.scope == "task" {
+        let slug = original.slug.as_deref().ok_or_else(|| {
+            Error::InvalidSetting("task is required for a task review".to_string())
+        })?;
+        let report = ledger.latest_task_report(slug)?.ok_or(Error::NotDone)?;
+        (Some(report.id), Some(report.body))
+    } else {
+        (None, None)
+    };
+    let expect = OwnedReviewExpect {
+        generation: run.write_stamp,
+        stage: run.stage.clone(),
+        agent_calls: run.agent_calls + 1,
+        report_id,
+        report_body,
+    };
+    hold_owned_review_prepare()?;
+    let fingerprint = crate::git::worktree_fingerprint(&root).map_err(Error::InvalidSetting)?;
+    let branch = gitinfo::branch(&root)
+        .ok_or_else(|| Error::InvalidSetting("review start requires a branch".to_string()))?;
+    let mut choice = ReviewerChoice::codex(model);
+    choice.accept_approved_task = false;
+    choice.reopen_on_changes = false;
+    choice.rereview_of = Some(original.review_id);
+    let task = if original.scope == "task" {
+        original.slug.as_deref()
+    } else {
+        None
+    };
+    let started = ledger.start_owned_review(
+        &original.scope,
+        task,
+        Some(run_id),
+        &branch,
+        "codex",
+        Some(original.base_sha.as_str()),
+        &head,
+        None,
+        &fingerprint,
+        &expect,
+        &choice.extras(),
+    )?;
+    let diff_spec = Some(format!("{}..{}", original.base_sha, original.commit_sha));
+    let handoff = serde_json::json!({
+        "slug": original.slug,
+        "base_sha": original.base_sha,
+        "commit_sha": head,
+        "reviewed_commit": original.commit_sha,
+        "range": diff_spec,
+        "rereview_of": original.review_id,
+        "report": original.body,
+        "graph_context": crate::graphify::NO_GRAPH,
+    });
+    Ok(PreparedReview {
+        review_id: started.review.id,
+        invocation_token: started.invocation_token,
+        run_generation: started.run_generation,
+        slug: original.slug.clone(),
+        base_sha: Some(original.base_sha.clone()),
+        commit_sha: head,
+        diff_spec,
         handoff,
     })
 }
@@ -665,6 +808,7 @@ pub(crate) fn record_owned_task_review(
     review_id: i64,
     invocation_token: &str,
     run_generation: i64,
+    choice: &ReviewerChoice,
     advance: relaybook_core::OwnedRunAdvance,
 ) -> Result<Review, Error> {
     if ledger.settings()?.workflow != "gated" {
@@ -681,10 +825,12 @@ pub(crate) fn record_owned_task_review(
     let fingerprint = crate::git::worktree_fingerprint(&root).map_err(Error::InvalidSetting)?;
     let sha_owned = sha.trim().to_string();
     let fingerprint_now = fingerprint.clone();
+    let accept = choice.accept_approved_task;
+    let reopen = choice.reopen_on_changes;
     ledger.record_owned_review(
         "task",
         Some(slug),
-        "codex",
+        &choice.reviewer,
         sha,
         &head,
         &fingerprint,
@@ -695,7 +841,8 @@ pub(crate) fn record_owned_task_review(
         review_id,
         invocation_token,
         run_generation,
-        true,
+        accept,
+        reopen,
         advance,
         move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
     )
@@ -711,6 +858,7 @@ pub(crate) fn record_owned_release_review(
     review_id: i64,
     invocation_token: &str,
     run_generation: i64,
+    choice: &ReviewerChoice,
     advance: relaybook_core::OwnedRunAdvance,
 ) -> Result<Review, Error> {
     if ledger.settings()?.workflow != "gated" {
@@ -736,10 +884,11 @@ pub(crate) fn record_owned_release_review(
     let fingerprint_now = fingerprint.clone();
     let root = checkout.root.clone();
     let commits = checkout.range.commits.clone();
+    let reopen = choice.reopen_on_changes;
     ledger.record_owned_review(
         "release",
         None,
-        "codex",
+        &choice.reviewer,
         sha,
         &checkout.range.head,
         &fingerprint,
@@ -751,6 +900,7 @@ pub(crate) fn record_owned_release_review(
         invocation_token,
         run_generation,
         false,
+        reopen,
         advance,
         move || recheck_review_record(&root, &sha_owned, &fingerprint_now),
     )
@@ -788,6 +938,7 @@ pub(crate) fn prepare_authorize(
         return Err(Error::InvalidSetting("sha does not match HEAD".to_string()));
     }
     ledger.accepted_tasks_in_scope(&checkout.range.commits)?;
+    refuse_pending_rereview(ledger)?;
     match ledger.release_review_at(sha)? {
         Some(review) if review.verdict.as_deref() == Some("approved") => {}
         _ => {
@@ -924,6 +1075,38 @@ pub(crate) fn refuse_live_workflow(ledger: &Ledger) -> Result<(), Error> {
 
 /// `release authorize` is allowed when no gated run is live, or when that run
 /// is waiting at `gate_release`.
+/// `before-release` refuses while an approved Claude review has no approved
+/// Codex re-review. The database trigger is the backstop for the insert.
+pub(crate) fn refuse_pending_rereview(ledger: &Ledger) -> Result<(), Error> {
+    if ledger.settings()?.fallback_rereview == "off" {
+        return Ok(());
+    }
+    for run in live_gated_runs(ledger)? {
+        if !ledger.pending_rereviews(run.id)?.is_empty() {
+            return Err(Error::InvalidSetting("codex re-review pending".to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// True when approve must not pass a release checkpoint while Codex still
+/// owes a re-review. Plan and task-review checkpoints stay open.
+pub(crate) fn rereview_blocks_approve(ledger: &Ledger, run: &Run) -> Result<bool, Error> {
+    if ledger.settings()?.fallback_rereview == "off" {
+        return Ok(false);
+    }
+    let release_stage = run.stage == "gate_release"
+        || run.stage == "release_review"
+        || run
+            .stop_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("codex-rereview|"));
+    if !release_stage {
+        return Ok(false);
+    }
+    Ok(!ledger.pending_rereviews(run.id)?.is_empty())
+}
+
 pub(crate) fn allow_release_authorize(ledger: &Ledger) -> Result<(), Error> {
     match live_gated_runs(ledger)?.as_slice() {
         [] => Ok(()),
