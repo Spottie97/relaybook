@@ -2025,6 +2025,21 @@ fn assert_codex_argv(line: &str, read_only: bool) {
     assert!(args.contains(&"-C"), "{line}");
     assert!(args.contains(&"--output-schema"), "{line}");
     assert!(args.contains(&"-o"), "{line}");
+    let model = args
+        .windows(2)
+        .find(|pair| pair[0] == "-m")
+        .map(|pair| pair[1]);
+    let model = model.unwrap_or_else(|| panic!("codex argv is missing -m: {line}"));
+    assert!(
+        !model.is_empty() && !model.starts_with('-'),
+        "codex model is not one argv value: {line}"
+    );
+    assert!(
+        model
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-')),
+        "{line}"
+    );
     let sandbox = args.windows(2).any(|pair| pair == ["-s", "read-only"]);
     assert_eq!(sandbox, read_only, "{line}");
     if !read_only {
@@ -4173,7 +4188,7 @@ fn reused_review_id_cannot_approve_a_different_report() {
             if slot.is_file() && !release.is_file() {
                 fs::write(
                     &release,
-                    "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"prd_covered\":true,\"gaps\":[]}}\n",
+                    "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"prd_covered\":[],\"gaps\":[]}}\n",
                 )
                 .expect("release later codex");
             }

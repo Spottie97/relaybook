@@ -142,14 +142,112 @@ pub(crate) fn ensure_one_live_gated(conn: &Connection) -> Result<(), Error> {
 ///
 /// `user_version` stays 8. A ledger already at schema 8 gets the column on
 /// the next read-write open, and the v7-to-v8 migration adds it too.
+///
+/// The restore takes `BEGIN IMMEDIATE` when the column or index is missing
+/// and this connection is not already in a transaction, then checks both
+/// again. Two opens that both saw the column missing wait on that lock
+/// instead of both running `ALTER`. A ledger that already has both does
+/// not take the write lock.
 pub(crate) fn ensure_review_invocation_token(conn: &Connection) -> Result<(), Error> {
+    // Skip the write lock when a current ledger already has both. The check
+    // runs again after BEGIN IMMEDIATE, so two opens that both saw them
+    // missing cannot both ALTER.
+    if !invocation_token_restore_needed(conn)? {
+        return Ok(());
+    }
+    if conn.is_autocommit() {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = restore_review_invocation_token(conn);
+        return match result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        };
+    }
+    restore_review_invocation_token(conn)
+}
+
+fn invocation_token_restore_needed(conn: &Connection) -> Result<bool, Error> {
+    if !table_exists(conn, "reviews")? {
+        return Ok(false);
+    }
+    Ok(!column_exists(conn, "reviews", "invocation_token")?
+        || !index_exists(conn, "reviews_invocation_token")?)
+}
+
+fn restore_review_invocation_token(conn: &Connection) -> Result<(), Error> {
     if table_exists(conn, "reviews")? && !column_exists(conn, "reviews", "invocation_token")? {
+        pause_before_adding_invocation_token(conn);
         conn.execute("ALTER TABLE reviews ADD COLUMN invocation_token TEXT", [])?;
     }
-    if table_exists(conn, "reviews")? {
+    if table_exists(conn, "reviews")? && !index_exists(conn, "reviews_invocation_token")? {
         conn.execute_batch(REVIEW_INVOCATION_INDEX)?;
     }
     Ok(())
+}
+
+fn index_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [name],
+            |_| Ok(1_i64),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+#[cfg(test)]
+struct TokenRestoreHold {
+    path: String,
+    seen: std::sync::atomic::AtomicUsize,
+    release: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+fn token_restore_hold() -> &'static std::sync::Mutex<Option<TokenRestoreHold>> {
+    static HOLD: std::sync::Mutex<Option<TokenRestoreHold>> = std::sync::Mutex::new(None);
+    &HOLD
+}
+
+fn pause_before_adding_invocation_token(conn: &Connection) {
+    #[cfg(test)]
+    {
+        let Some(path) = conn.path() else {
+            return;
+        };
+        let path = path.to_string();
+        {
+            let hold = token_restore_hold().lock().expect("token restore hold");
+            let Some(hold) = hold.as_ref() else {
+                return;
+            };
+            if hold.path != path {
+                return;
+            }
+            hold.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        for _ in 0..400 {
+            let released = token_restore_hold()
+                .lock()
+                .expect("token restore hold")
+                .as_ref()
+                .is_none_or(|hold| hold.release.load(std::sync::atomic::Ordering::SeqCst));
+            if released {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = conn;
+    }
 }
 
 /// Recreate any missing schema-8 trigger. Returns whether one was missing.
@@ -399,5 +497,90 @@ mod tests {
             })
             .expect("event");
         assert_eq!(payload, "{}");
+    }
+
+    #[test]
+    fn concurrent_v8_opens_restore_invocation_token_once() {
+        use std::sync::atomic::Ordering;
+
+        use crate::ledger::Ledger;
+
+        let (_dir, path) = file();
+        drop(Ledger::initialize(&path).expect("init"));
+        {
+            let conn = Connection::open(&path).expect("open");
+            conn.execute("DROP INDEX reviews_invocation_token", [])
+                .expect("drop index");
+            conn.execute("ALTER TABLE reviews DROP COLUMN invocation_token", [])
+                .expect("drop column");
+        }
+        let path_text = path.to_string_lossy().to_string();
+        {
+            let mut hold = super::token_restore_hold().lock().expect("hold");
+            *hold = Some(super::TokenRestoreHold {
+                path: path_text,
+                seen: std::sync::atomic::AtomicUsize::new(0),
+                release: std::sync::atomic::AtomicBool::new(false),
+            });
+        }
+        struct ClearHold;
+        impl Drop for ClearHold {
+            fn drop(&mut self) {
+                if let Ok(mut hold) = super::token_restore_hold().lock() {
+                    *hold = None;
+                }
+            }
+        }
+        let _clear = ClearHold;
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let opened = path.clone();
+            handles.push(thread::spawn(move || Ledger::open(&opened)));
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let seen = super::token_restore_hold()
+                .lock()
+                .expect("hold")
+                .as_ref()
+                .expect("hold armed")
+                .seen
+                .load(Ordering::SeqCst);
+            if seen >= 1 || started.elapsed() > Duration::from_secs(5) {
+                thread::sleep(Duration::from_millis(200));
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        super::token_restore_hold()
+            .lock()
+            .expect("hold")
+            .as_mut()
+            .expect("hold armed")
+            .release
+            .store(true, Ordering::SeqCst);
+
+        for handle in handles {
+            handle.join().expect("thread").expect("concurrent open");
+        }
+        assert_eq!(version_of(&path), 8);
+        let conn = Connection::open(&path).expect("open");
+        let columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('reviews') WHERE name = 'invocation_token'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("column");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'reviews_invocation_token'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index");
+        assert_eq!(columns, 1);
+        assert_eq!(indexes, 1);
     }
 }

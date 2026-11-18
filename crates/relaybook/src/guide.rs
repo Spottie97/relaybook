@@ -38,6 +38,7 @@ mod tests {
         assert!(REVIEWER.contains("codex"));
         assert!(REVIEWER.contains("no graph"));
         assert!(REVIEWER.contains("findings"));
+        assert!(REVIEWER.contains("array of strings"));
         assert!(REVIEWER.contains("1,500 bytes"));
         let both = render(None);
         assert!(both.contains("# Planner"));

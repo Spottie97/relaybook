@@ -10,6 +10,6 @@ Never run `graphify extract`. When Graphify is available, look code up with `gra
 
 Review `range` and leave the tree as you found it. A later record fails with `reviewer changed the repository` or `ledger changed during review` if either changed.
 
-The verdict is `approved` or `changes-requested`. The body is one JSON object of at most 1,500 bytes. A task needs `findings`, `security`, `tests_checked`, and `not_checked`. A release review also needs `prd_covered` and `gaps`. Orca records it with `--by codex` and `--sha` equal to the checked-out commit. `changes-requested` reopens the task. A Claude review needs the maintainer at a terminal.
+The verdict is `approved` or `changes-requested`. The body is one JSON object of at most 1,500 bytes. A task needs `findings`, `security`, `tests_checked`, and `not_checked`. A release review also needs `prd_covered` and `gaps`. Each of those fields is an array of strings, and the body has no other keys. Orca records it with `--by codex` and `--sha` equal to the checked-out commit. `changes-requested` reopens the task. A Claude review needs the maintainer at a terminal.
 
 Nothing is published before `relaybook release authorize`. You do not push.

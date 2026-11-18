@@ -100,10 +100,17 @@ pub(crate) fn preflight() -> Result<Accounts, String> {
 
 /// Classic preflight, plus `codex` on PATH and `codex login status` exiting 0.
 /// Any non-zero status is not signed in. A usage-limit exit code is not special.
+/// `codex login status` does not accept `-m` (codex-cli 0.169.0 `--help`).
 pub(crate) fn preflight_gated() -> Result<Accounts, String> {
     let accounts = preflight()?;
     require_codex()?;
     Ok(accounts)
+}
+
+pub(crate) fn codex_login_status_args() -> [&'static str; 2] {
+    // codex-cli 0.169.0 `codex login status --help` lists `-c`, `--enable`,
+    // and `--disable`. It does not accept `-m`.
+    ["login", "status"]
 }
 
 pub(crate) fn require_codex() -> Result<(), String> {
@@ -112,7 +119,7 @@ pub(crate) fn require_codex() -> Result<(), String> {
     };
     let output = program
         .command()
-        .args(["login", "status"])
+        .args(codex_login_status_args())
         .stdin(Stdio::null())
         .output()
         .map_err(|err| {
@@ -234,13 +241,13 @@ const TASK_CODEX_SCHEMA: &str = r#"{
     "verdict": { "type": "string", "enum": ["approved", "changes-requested"] },
     "body": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": ["findings", "security", "tests_checked", "not_checked"],
       "properties": {
-        "findings": {},
-        "security": {},
-        "tests_checked": {},
-        "not_checked": {}
+        "findings": { "type": "array", "items": { "type": "string" } },
+        "security": { "type": "array", "items": { "type": "string" } },
+        "tests_checked": { "type": "array", "items": { "type": "string" } },
+        "not_checked": { "type": "array", "items": { "type": "string" } }
       }
     }
   }
@@ -255,15 +262,15 @@ const RELEASE_CODEX_SCHEMA: &str = r#"{
     "verdict": { "type": "string", "enum": ["approved", "changes-requested"] },
     "body": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": ["findings", "security", "tests_checked", "not_checked", "prd_covered", "gaps"],
       "properties": {
-        "findings": {},
-        "security": {},
-        "tests_checked": {},
-        "not_checked": {},
-        "prd_covered": {},
-        "gaps": {}
+        "findings": { "type": "array", "items": { "type": "string" } },
+        "security": { "type": "array", "items": { "type": "string" } },
+        "tests_checked": { "type": "array", "items": { "type": "string" } },
+        "not_checked": { "type": "array", "items": { "type": "string" } },
+        "prd_covered": { "type": "array", "items": { "type": "string" } },
+        "gaps": { "type": "array", "items": { "type": "string" } }
       }
     }
   }
@@ -301,8 +308,10 @@ pub(crate) fn codex_args(
     out: &Path,
     prompt: &str,
     sandbox: CodexSandbox,
-) -> Vec<String> {
-    let mut args = Vec::with_capacity(12);
+    model: &str,
+) -> Result<Vec<String>, String> {
+    let model = relaybook_core::parse_codex_model(model).map_err(|err| err.to_string())?;
+    let mut args = Vec::with_capacity(14);
     args.push("exec".to_string());
     if sandbox == CodexSandbox::ReadOnly {
         args.push("-s".to_string());
@@ -313,12 +322,14 @@ pub(crate) fn codex_args(
     args.push("never".to_string());
     args.push("-C".to_string());
     args.push(root.display().to_string());
+    args.push("-m".to_string());
+    args.push(model);
     args.push("--output-schema".to_string());
     args.push(schema.display().to_string());
     args.push("-o".to_string());
     args.push(out.display().to_string());
     args.push(prompt.to_string());
-    args
+    Ok(args)
 }
 
 /// `-o` path for one review. The directory is outside `root` so an isolated
@@ -355,8 +366,9 @@ fn path_is_inside(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }
 
-/// One JSON object matching the task or release schema. Extra outer properties
-/// are rejected. The body text is what `review_body` checks again.
+/// One JSON object matching the task or release schema. Extra properties are
+/// rejected. Each body field is an array of strings. The body text is what
+/// `review_body` checks again.
 pub(crate) fn parse_codex_verdict(text: &str, release: bool) -> Result<(String, String), String> {
     let text = text.trim();
     if text.is_empty() {
@@ -389,6 +401,18 @@ pub(crate) fn parse_codex_verdict(text: &str, release: bool) -> Result<(String, 
     for key in keys {
         if !body.contains_key(*key) {
             return Err(format!("codex output is missing {key}"));
+        }
+    }
+    if body.len() != keys.len() {
+        return Err("codex output does not match the schema".to_string());
+    }
+    for key in keys {
+        let value = body.get(*key).expect("key");
+        let items = value
+            .as_array()
+            .ok_or_else(|| format!("codex output {key} must be an array of strings"))?;
+        if items.iter().any(|item| !item.is_string()) {
+            return Err(format!("codex output {key} must be an array of strings"));
         }
     }
     let body = serde_json::to_string(object.get("body").expect("body"))
@@ -675,6 +699,7 @@ pub(crate) fn call_codex(
     live: &mut Session,
     sandbox: CodexSandbox,
     release: bool,
+    model: &str,
 ) -> AgentResult {
     let Some(program) = crate::exe::Program::resolve("codex") else {
         return AgentResult::Unavailable {
@@ -698,7 +723,10 @@ pub(crate) fn call_codex(
     if let Err(err) = prepare_codex_output(out, &schema, schema_text, share_user.as_deref()) {
         return AgentResult::Failed { output: err };
     }
-    let args = codex_args(&root, &schema, out, prompt, sandbox);
+    let args = match codex_args(&root, &schema, out, prompt, sandbox, model) {
+        Ok(args) => args,
+        Err(err) => return AgentResult::Failed { output: err },
+    };
     if let Some(flag) = forbidden_codex_arg(&args) {
         return AgentResult::Failed {
             output: format!("refusing codex flag {flag}"),
@@ -1048,8 +1076,9 @@ mod tests {
 
     use super::{
         AccountKind, Accounts, AgentResult, CodexSandbox, account_line, classify, claude_account,
-        codex_args, codex_output_file, forbidden_codex_arg, parse_codex_verdict, path_is_inside,
-        prepare_codex_output, read_codex_output, review_input_too_large,
+        codex_args, codex_login_status_args, codex_output_file, forbidden_codex_arg,
+        parse_codex_verdict, path_is_inside, prepare_codex_output, read_codex_output,
+        review_input_too_large,
     };
 
     #[test]
@@ -1121,9 +1150,12 @@ mod tests {
             Path::new("/tmp/codex-last.md"),
             "Review task work. Use only the packet on stdin.",
             CodexSandbox::ReadOnly,
-        );
+            "gpt-6.1-sol",
+        )
+        .expect("model");
         let joined = args.join(" ");
         assert!(joined.starts_with("exec -s read-only --ephemeral --color never -C /repo "));
+        assert!(joined.contains("-m gpt-6.1-sol"));
         assert!(joined.contains("--output-schema /tmp/codex-schema.json"));
         assert!(joined.contains("-o /tmp/codex-last.md"));
         assert!(forbidden_codex_arg(&args).is_none(), "{joined}");
@@ -1148,12 +1180,75 @@ mod tests {
             Path::new("/tmp/codex-last.md"),
             "Release review. Use only the packet on stdin.",
             CodexSandbox::Isolated,
-        );
+            "gpt-6.1-sol",
+        )
+        .expect("model");
         assert!(!args.iter().any(|arg| arg == "-s"));
         assert!(!args.iter().any(|arg| arg == "read-only"));
+        assert!(args.contains(&"-m".to_string()));
+        assert!(args.contains(&"gpt-6.1-sol".to_string()));
         assert!(args.contains(&"--ephemeral".to_string()));
         assert!(args.contains(&"--output-schema".to_string()));
         assert!(forbidden_codex_arg(&args).is_none());
+    }
+
+    fn assert_strict_schema(name: &str, text: &str) {
+        let schema: serde_json::Value = serde_json::from_str(text).expect(name);
+        fn walk(path: &str, node: &serde_json::Value) {
+            let Some(object) = node.as_object() else {
+                panic!("{path} is not a schema object");
+            };
+            if let Some(items) = object.get("items") {
+                walk(&format!("{path}.items"), items);
+            }
+            let is_object = object.get("type").and_then(serde_json::Value::as_str)
+                == Some("object")
+                || object.contains_key("properties");
+            if !is_object {
+                assert!(
+                    object.contains_key("type") || object.contains_key("enum"),
+                    "{path} has no type or enum"
+                );
+                return;
+            }
+            assert_eq!(
+                object
+                    .get("additionalProperties")
+                    .and_then(serde_json::Value::as_bool),
+                Some(false),
+                "{path} additionalProperties"
+            );
+            let properties = object
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+                .unwrap_or_else(|| panic!("{path} has no properties"));
+            let required = object
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("{path} has no required"));
+            let mut required_keys = std::collections::BTreeSet::new();
+            for item in required {
+                let key = item
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{path} required entry is not a string"));
+                assert!(required_keys.insert(key), "{path} repeats {key}");
+            }
+            let property_keys: std::collections::BTreeSet<_> =
+                properties.keys().map(String::as_str).collect();
+            assert_eq!(required_keys, property_keys, "{path} required");
+            for (key, child) in properties {
+                let typed = child.get("type").is_some() || child.get("enum").is_some();
+                assert!(typed, "{path}.{key} has no type or enum");
+                walk(&format!("{path}.{key}"), child);
+            }
+        }
+        walk(name, &schema);
+    }
+
+    #[test]
+    fn codex_output_schemas_are_strict() {
+        assert_strict_schema("TASK_CODEX_SCHEMA", super::TASK_CODEX_SCHEMA);
+        assert_strict_schema("RELEASE_CODEX_SCHEMA", super::RELEASE_CODEX_SCHEMA);
     }
 
     #[test]
@@ -1199,6 +1294,66 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            parse_codex_verdict(
+                "{\"verdict\":\"approved\",\"body\":{\"findings\":\"none\",\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}",
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_codex_verdict(
+                "{\"verdict\":\"approved\",\"body\":{\"findings\":[1],\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}",
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_codex_verdict(
+                "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"token\":\"kestrel\"}}",
+                false
+            )
+            .is_err()
+        );
+        let (verdict, body) = parse_codex_verdict(
+            "{\"verdict\":\"changes-requested\",\"body\":{\"findings\":[\"one\"],\"security\":[],\"tests_checked\":[\"cargo test\"],\"not_checked\":[],\"prd_covered\":[],\"gaps\":[\"gap\"]}}",
+            true,
+        )
+        .expect("release");
+        assert_eq!(verdict, "changes-requested");
+        assert!(body.contains("prd_covered"));
+        assert!(!body.contains("true"));
+    }
+
+    #[test]
+    fn codex_model_cannot_inject_argv() {
+        let bad = [
+            "-m",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "gpt 6",
+            "model/name",
+            "",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ];
+        for model in bad {
+            let err = codex_args(
+                Path::new("/repo"),
+                Path::new("/tmp/codex-schema.json"),
+                Path::new("/tmp/codex-last.md"),
+                "Review task work. Use only the packet on stdin.",
+                CodexSandbox::ReadOnly,
+                model,
+            )
+            .expect_err(model);
+            assert!(
+                err.contains("invalid codex_model")
+                    || err.contains("codex_model is required")
+                    || err.contains("at most 64"),
+                "{model}: {err}"
+            );
+        }
+        assert_eq!(codex_login_status_args(), ["login", "status"]);
+        assert!(!codex_login_status_args().contains(&"-m"));
     }
 
     #[test]

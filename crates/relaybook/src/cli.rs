@@ -400,7 +400,14 @@ enum RunAction {
 #[derive(Subcommand)]
 enum ConfigAction {
     /// Change one setting.
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        /// Setting value. A leading dash is part of the value.
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Print one setting.
+    Get { key: String },
 }
 
 #[derive(Subcommand)]
@@ -664,6 +671,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         },
         Command::Config { action } => match action {
             Some(ConfigAction::Set { key, value }) => set_config(&cwd, &key, &value),
+            Some(ConfigAction::Get { key }) => get_config(&cwd, &key),
             None => show_config(&cwd),
         },
         Command::Status => show_status(&cwd),
@@ -1608,24 +1616,18 @@ fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
         value,
         leave_confirmed || remote_confirmed || signoff_confirmed,
     )?;
-    let shown = match key {
-        "est_cost_cap_usd" => settings
-            .est_cost_cap_usd
-            .clone()
-            .unwrap_or_else(|| "unset".to_string()),
-        "mode" => settings.mode.clone(),
-        "gates" => settings.gates.clone(),
-        "reviewer" => settings.reviewer.clone(),
-        "workflow" => settings.workflow.clone(),
-        "remote_check" => settings.remote_check.clone(),
-        "signoff" => settings.signoff.clone(),
-        "max_cycles" => settings.max_cycles.to_string(),
-        "max_reopens_per_task" => settings.max_reopens_per_task.to_string(),
-        "max_agent_calls" => settings.max_agent_calls.to_string(),
-        "cursor_timeout_min" => settings.cursor_timeout_min.to_string(),
-        _ => value.to_string(),
-    };
+    let shown = relaybook_core::configured_value(&settings, key)?;
     json_outcome(settings, render::line(&format!("{key} {shown}")))
+}
+
+fn get_config(cwd: &Path, key: &str) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let settings = ledger.settings()?;
+    let shown = relaybook_core::configured_value(&settings, key)?;
+    json_outcome(
+        serde_json::json!({ key: shown }),
+        render::line(&format!("{key} {shown}")),
+    )
 }
 
 fn show_status(cwd: &Path) -> Result<Outcome, Fail> {

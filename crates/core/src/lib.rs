@@ -31,4 +31,7 @@ pub use runs::{
     Run, blocked_slug as blocked_run_slug, ready_slug as ready_run_slug,
     unfinished as unfinished_run,
 };
-pub use settings::{RunView, Snapshot as Settings, StatusView, format_config, format_status};
+pub use settings::{
+    DEFAULT_CODEX_MODEL, RunView, Snapshot as Settings, StatusView, configured_value,
+    format_config, format_status, parse_codex_model,
+};

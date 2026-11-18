@@ -491,7 +491,7 @@ fn verdict_json(args: &[String], verdict: &str) -> String {
     let release = args.iter().any(|arg| arg.contains("Release review"));
     if release {
         format!(
-            "{{\"verdict\":\"{verdict}\",\"body\":{{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"prd_covered\":true,\"gaps\":[]}}}}\n"
+            "{{\"verdict\":\"{verdict}\",\"body\":{{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"prd_covered\":[],\"gaps\":[]}}}}\n"
         )
     } else {
         format!(

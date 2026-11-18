@@ -413,7 +413,7 @@ smoke_codex() {
     exit 1
   fi
   codex_help=$(codex exec --help 2>&1 || true)
-  for flag in --ephemeral --output-schema --color --sandbox read-only; do
+  for flag in --ephemeral --output-schema --color --sandbox read-only -m; do
     if ! printf '%s\n' "$codex_help" | grep -F -q -- "$flag"; then
       echo "codex exec --help is missing $flag" >&2
       exit 1
@@ -430,7 +430,8 @@ smoke_codex() {
   run_in_repo "$codex_repo" "" git add src-main.rs
   run_in_repo "$codex_repo" "" git commit -q -m "tiny app"
   before=$(run_in_repo "$codex_repo" "" git status --porcelain)
-  cat >"$codex_schema" <<'EOF'
+  codex_model=gpt-6.1-sol
+  cat >"$codex_schema" <<'CODEX_TASK_SCHEMA'
 {
   "type": "object",
   "additionalProperties": false,
@@ -439,25 +440,67 @@ smoke_codex() {
     "verdict": { "type": "string", "enum": ["approved", "changes-requested"] },
     "body": {
       "type": "object",
-      "additionalProperties": true,
+      "additionalProperties": false,
       "required": ["findings", "security", "tests_checked", "not_checked"],
       "properties": {
-        "findings": {},
-        "security": {},
-        "tests_checked": {},
-        "not_checked": {}
+        "findings": { "type": "array", "items": { "type": "string" } },
+        "security": { "type": "array", "items": { "type": "string" } },
+        "tests_checked": { "type": "array", "items": { "type": "string" } },
+        "not_checked": { "type": "array", "items": { "type": "string" } }
       }
     }
   }
 }
-EOF
+CODEX_TASK_SCHEMA
   cat >"$smoke_tmp/check_verdict.py" <<'PY'
 import json
 import sys
 
-path = sys.argv[1]
+verdict_path, schema_path = sys.argv[1], sys.argv[2]
+
+def fail():
+    raise SystemExit(1)
+
+def check(schema, value):
+    if not isinstance(schema, dict):
+        fail()
+    if "enum" in schema and value not in schema["enum"]:
+        fail()
+    kind = schema.get("type")
+    if kind == "object":
+        if schema.get("additionalProperties") is not False:
+            fail()
+        if not isinstance(value, dict):
+            fail()
+        props = schema.get("properties")
+        required = schema.get("required")
+        if not isinstance(props, dict) or not isinstance(required, list):
+            fail()
+        if set(props) != set(required) or set(value) != set(required):
+            fail()
+        for key, child in props.items():
+            check(child, value[key])
+        return
+    if kind == "string":
+        if not isinstance(value, str):
+            fail()
+        return
+    if kind == "array":
+        if not isinstance(value, list):
+            fail()
+        items = schema.get("items")
+        if not isinstance(items, dict):
+            fail()
+        for item in value:
+            check(items, item)
+        return
+    if "enum" in schema:
+        return
+    fail()
+
 try:
-    raw = open(path, encoding="utf-8").read()
+    raw = open(verdict_path, encoding="utf-8").read()
+    schema = json.load(open(schema_path, encoding="utf-8"))
 except OSError:
     raise SystemExit(1)
 text = raw.strip()
@@ -467,26 +510,16 @@ try:
     value = json.loads(text)
 except json.JSONDecodeError:
     raise SystemExit(1)
-if not isinstance(value, dict) or set(value) != {"verdict", "body"}:
-    raise SystemExit(1)
-verdict = value["verdict"]
-if verdict not in ("approved", "changes-requested"):
-    raise SystemExit(1)
-body = value["body"]
-if not isinstance(body, dict):
-    raise SystemExit(1)
-for key in ("findings", "security", "tests_checked", "not_checked"):
-    if key not in body:
-        raise SystemExit(1)
+check(schema, value)
 PY
   printf '%s\n' "packet: leave the repository unchanged" >"$smoke_tmp/packet.txt"
-  codex_prompt="Answer with the output schema only: verdict approved, and body findings, security, tests_checked, and not_checked each the string none. Leave the repository unchanged."
+  codex_prompt="Answer with the output schema only: verdict approved, and body findings, security, tests_checked, and not_checked each an empty array of strings. Leave the repository unchanged."
   probe_prompt="Create a file named codex-wrote.txt in the working directory containing the word written."
   codex_rc=0
   (
     clear_git_repo_env
     cd "$codex_repo" || exit 1
-    timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" --output-schema "$codex_schema" -o "$codex_out" "$codex_prompt" <"$smoke_tmp/packet.txt"
+    timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" -m "$codex_model" --output-schema "$codex_schema" -o "$codex_out" "$codex_prompt" <"$smoke_tmp/packet.txt"
   ) >"$smoke_tmp/codex.out" 2>"$smoke_tmp/codex.err" || codex_rc=$?
   if [ "$codex_rc" -ne 0 ]; then
     if [ "$codex_rc" -eq 124 ]; then
@@ -501,7 +534,7 @@ PY
     codex_fail "codex review verdict is missing" "$codex_out"
   fi
   verdict_rc=0
-  python3 "$smoke_tmp/check_verdict.py" "$codex_out" || verdict_rc=$?
+  python3 "$smoke_tmp/check_verdict.py" "$codex_out" "$codex_schema" || verdict_rc=$?
   if [ "$verdict_rc" -ne 0 ]; then
     codex_fail "codex review verdict is not schema-valid" "$codex_out"
   fi
@@ -510,7 +543,7 @@ PY
   (
     clear_git_repo_env
     cd "$codex_repo" || exit 1
-    timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" -o "$probe_out" "$probe_prompt" </dev/null
+    timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" -m "$codex_model" -o "$probe_out" "$probe_prompt" </dev/null
   ) >"$smoke_tmp/codex.out" 2>"$smoke_tmp/codex.err" || codex_rc=$?
   if [ "$codex_rc" -ne 0 ]; then
     if [ "$codex_rc" -eq 124 ]; then

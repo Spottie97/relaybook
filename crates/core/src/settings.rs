@@ -3,6 +3,9 @@ use serde::Serialize;
 
 use crate::error::Error;
 
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-sol";
+pub const CODEX_MODEL_MAX_LEN: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Snapshot {
     pub mode: String,
@@ -10,6 +13,8 @@ pub struct Snapshot {
     pub reviewer: String,
     /// `read-only` or `isolated`. Only gated Codex reviews read this.
     pub codex_sandbox: String,
+    /// Model passed to `codex exec -m`. Default `gpt-6.1-sol`.
+    pub codex_model: String,
     pub workflow: String,
     pub remote_check: String,
     pub signoff: String,
@@ -65,6 +70,7 @@ pub fn load(conn: &Connection) -> Result<Snapshot, Error> {
         gates: value_or(conn, "gates", "plan")?,
         reviewer: value_or(conn, "reviewer", "claude")?,
         codex_sandbox: value_or(conn, "codex_sandbox", "read-only")?,
+        codex_model: value_or(conn, "codex_model", DEFAULT_CODEX_MODEL)?,
         workflow: value_or(conn, "workflow", "classic")?,
         remote_check: value_or(conn, "remote_check", "online")?,
         signoff: value_or(conn, "signoff", "typed")?,
@@ -141,11 +147,12 @@ pub fn hook_wait_line(conn: &Connection) -> Result<Option<String>, Error> {
 
 pub fn format_config(settings: &Snapshot) -> String {
     format!(
-        "mode {}\ngates {}\nreviewer {}\ncodex_sandbox {}\nworkflow {}\nremote_check {}\nsignoff {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
+        "mode {}\ngates {}\nreviewer {}\ncodex_sandbox {}\ncodex_model {}\nworkflow {}\nremote_check {}\nsignoff {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
         settings.mode,
         settings.gates,
         settings.reviewer,
         settings.codex_sandbox,
+        settings.codex_model,
         settings.workflow,
         settings.remote_check,
         settings.signoff,
@@ -281,6 +288,7 @@ fn validate(conn: &Connection, key: &str, value: &str) -> Result<String, Error> 
         "gates" => one_of(key, value, &["none", "plan", "plan,review"])?,
         "reviewer" => one_of(key, value, &["claude", "codex"])?,
         "codex_sandbox" => one_of(key, value, &["read-only", "isolated"])?,
+        "codex_model" => parse_codex_model(value)?,
         "workflow" => one_of(key, value, &["classic", "gated"])?,
         "remote_check" => one_of(key, value, &["online", "local"])?,
         "signoff" => one_of(key, value, &["typed", "signed-tag"])?,
@@ -339,6 +347,53 @@ fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<String, Error> {
     }
 }
 
+/// Accept a Codex model that can be passed as one argv value.
+///
+/// Non-empty after trim, no leading `-`, at most 64 bytes, and only
+/// `A-Za-z0-9._:-`. That keeps `-m` from becoming another flag.
+pub fn parse_codex_model(value: &str) -> Result<String, Error> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::InvalidSetting("codex_model is required".to_string()));
+    }
+    if value.len() > CODEX_MODEL_MAX_LEN {
+        return Err(Error::InvalidSetting(
+            "codex_model must be at most 64 characters".to_string(),
+        ));
+    }
+    let allowed = value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'));
+    if value.starts_with('-') || !allowed {
+        return Err(Error::InvalidSetting(format!(
+            "invalid codex_model: {value}"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+pub fn configured_value(settings: &Snapshot, key: &str) -> Result<String, Error> {
+    match key {
+        "mode" => Ok(settings.mode.clone()),
+        "gates" => Ok(settings.gates.clone()),
+        "reviewer" => Ok(settings.reviewer.clone()),
+        "codex_sandbox" => Ok(settings.codex_sandbox.clone()),
+        "codex_model" => Ok(settings.codex_model.clone()),
+        "workflow" => Ok(settings.workflow.clone()),
+        "remote_check" => Ok(settings.remote_check.clone()),
+        "signoff" => Ok(settings.signoff.clone()),
+        "max_cycles" => Ok(settings.max_cycles.to_string()),
+        "max_reopens_per_task" => Ok(settings.max_reopens_per_task.to_string()),
+        "max_agent_calls" => Ok(settings.max_agent_calls.to_string()),
+        "cursor_timeout_min" => Ok(settings.cursor_timeout_min.to_string()),
+        "est_cost_cap_usd" => Ok(settings
+            .est_cost_cap_usd
+            .clone()
+            .unwrap_or_else(|| "unset".to_string())),
+        _ => Err(Error::InvalidSetting(format!("unknown setting: {key}"))),
+    }
+}
+
 fn value_or(conn: &Connection, key: &str, default: &str) -> Result<String, Error> {
     Ok(optional_value(conn, key)?.unwrap_or_else(|| default.to_string()))
 }
@@ -368,4 +423,29 @@ fn now(conn: &Connection) -> Result<String, Error> {
         row.get(0)
     })?;
     Ok(ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_CODEX_MODEL, parse_codex_model};
+
+    #[test]
+    fn codex_model_accepts_the_default_and_rejects_argv_injection() {
+        assert_eq!(
+            parse_codex_model("  gpt-6.1-sol  ").expect("trim"),
+            DEFAULT_CODEX_MODEL
+        );
+        assert_eq!(
+            parse_codex_model("openai:gpt-6.1-sol").expect("colon"),
+            "openai:gpt-6.1-sol"
+        );
+        assert!(parse_codex_model("").is_err());
+        assert!(parse_codex_model("   ").is_err());
+        assert!(parse_codex_model("-m").is_err());
+        assert!(parse_codex_model("--dangerously-bypass-approvals-and-sandbox").is_err());
+        assert!(parse_codex_model("gpt 6").is_err());
+        assert!(parse_codex_model("model/name").is_err());
+        assert!(parse_codex_model(&"a".repeat(65)).is_err());
+        assert_eq!(parse_codex_model(&"a".repeat(64)).expect("bound").len(), 64);
+    }
 }

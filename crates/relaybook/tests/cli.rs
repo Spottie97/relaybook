@@ -4524,6 +4524,72 @@ fn task_report_verdict(dir: &Path) -> Option<String> {
     .expect("verdict")
 }
 
+#[test]
+fn codex_model_sets_and_gets_without_terminal_confirmation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    run(dir.path(), ["init"]).assert().success();
+    run(dir.path(), ["config", "get", "codex_model"])
+        .assert()
+        .success()
+        .stdout("codex_model gpt-6.1-sol\n");
+    run(dir.path(), ["config"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex_model gpt-6.1-sol"));
+    run(
+        dir.path(),
+        ["config", "set", "codex_model", " gpt-6.2-sol "],
+    )
+    .assert()
+    .success()
+    .stdout("codex_model gpt-6.2-sol\n");
+    run(dir.path(), ["config", "get", "codex_model"])
+        .assert()
+        .success()
+        .stdout("codex_model gpt-6.2-sol\n");
+    run(dir.path(), ["config", "set", "reviewer", "codex"])
+        .assert()
+        .success();
+    run(dir.path(), ["config", "set", "workflow", "gated"])
+        .assert()
+        .success();
+    run(
+        dir.path(),
+        ["config", "set", "codex_model", "openai:gpt-6.1-sol"],
+    )
+    .assert()
+    .success()
+    .stdout("codex_model openai:gpt-6.1-sol\n");
+    run(dir.path(), ["config", "set", "codex_model", "-m"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid codex_model"));
+    run(
+        dir.path(),
+        [
+            "config",
+            "set",
+            "codex_model",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ],
+    )
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("invalid codex_model"));
+    run(dir.path(), ["config", "set", "codex_model", "gpt 6"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid codex_model"));
+    run(dir.path(), ["config", "get", "codex_model"])
+        .assert()
+        .success()
+        .stdout("codex_model openai:gpt-6.1-sol\n");
+    run(dir.path(), ["config", "get", "not_a_setting"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown setting: not_a_setting"));
+}
+
 fn run(dir: &Path, args: impl IntoIterator<Item = &'static str>) -> Command {
     let mut cmd = command(dir);
     cmd.args(args);

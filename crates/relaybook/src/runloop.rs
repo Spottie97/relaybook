@@ -1829,10 +1829,10 @@ fn review_with_codex(
     };
     let prompt = match &scope {
         CodexScope::Task(slug) => {
-            format!("Review task {slug}. Use only the packet on stdin. Return the JSON verdict.")
+            format!("Review task {slug}. Use only the packet on stdin. Return the JSON verdict. Body fields findings, security, tests_checked, and not_checked are arrays of strings.")
         }
         CodexScope::Release => {
-            "Release review. Use only the packet on stdin. Return the JSON verdict.".to_string()
+            "Release review. Use only the packet on stdin. Return the JSON verdict. Body fields findings, security, tests_checked, not_checked, prd_covered, and gaps are arrays of strings.".to_string()
         }
     };
     if agents::review_input_too_large(&prompt, &packet) {
@@ -1863,7 +1863,17 @@ fn review_with_codex(
     let live = live_session(session, cwd, run_id, quiet);
     live.begin(&format!("● Reviewing {label} (codex)"));
     let started = Instant::now();
-    let result = agents::call_codex(cwd, &prompt, &packet, &out, run_id, live, sandbox, release);
+    let result = agents::call_codex(
+        cwd,
+        &prompt,
+        &packet,
+        &out,
+        run_id,
+        live,
+        sandbox,
+        release,
+        &settings.codex_model,
+    );
     let elapsed = started.elapsed();
     let _ = agents::write_transcript(
         cwd,

@@ -255,7 +255,7 @@ log=${SMOKE_CODEX_LOG:-}
 rc=${SMOKE_CODEX_RC:-1}
 err=${SMOKE_CODEX_ERR:-codex failed}
 verdict=${SMOKE_CODEX_VERDICT:-}
-valid='{"verdict":"approved","body":{"findings":"none","security":"none","tests_checked":"none","not_checked":"none"}}'
+valid='{"verdict":"approved","body":{"findings":[],"security":[],"tests_checked":[],"not_checked":[]}}'
 
 if [ "${1:-}" = "login" ]; then
   exit 0
@@ -265,7 +265,7 @@ if [ "${1:-}" = "--version" ]; then
   exit 0
 fi
 if [ "${1:-}" = "exec" ] && [ "${2:-}" = "--help" ]; then
-  printf '%s\n' "--ephemeral --output-schema --color --sandbox read-only"
+  printf '%s\n' "--ephemeral --output-schema --color --sandbox read-only -m"
   exit 0
 fi
 
@@ -460,9 +460,12 @@ fn codex_smoke_fails_when_verdict_not_schema_valid() {
         "not-json",
         "{\"verdict\":\"approved\"}",
         "{\"verdict\":\"approved\",\"body\":{\"findings\":\"none\"}}",
-        "{\"verdict\":\"yes\",\"body\":{\"findings\":\"none\",\"security\":\"none\",\"tests_checked\":\"none\",\"not_checked\":\"none\"}}",
-        "{\"verdict\":\"approved\",\"body\":{\"findings\":\"none\",\"security\":\"none\",\"tests_checked\":\"none\",\"not_checked\":\"none\"},\"extra\":true}",
-        "{\"verdict\":\"approved\",\"body\":{\"findings\":\"none\",\"security\":\"none\",\"tests_checked\":\"none\",\"not_checked\":\"none\"}}{\"verdict\":\"approved\"}",
+        "{\"verdict\":\"yes\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}",
+        "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[]},\"extra\":true}",
+        "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}{\"verdict\":\"approved\"}",
+        "{\"verdict\":\"approved\",\"body\":{\"findings\":\"none\",\"security\":\"none\",\"tests_checked\":\"none\",\"not_checked\":\"none\"}}",
+        "{\"verdict\":\"approved\",\"body\":{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"token\":\"kestrel\"}}",
+        "{\"verdict\":\"approved\",\"body\":{\"findings\":[1],\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}",
         "[]",
         "{\"verdict\":\"approved\",\"body\":[]}",
     ];
@@ -493,8 +496,8 @@ fn codex_smoke_fails_when_sandbox_probe_does_not_hold() {
 fn codex_smoke_accepts_valid_verdict_and_separate_denial() {
     let verdicts = [
         "",
-        r#"{"verdict":"approved","body":{"findings":"none","security":"none","tests_checked":"none","not_checked":"none"}}"#,
-        r#"{"verdict":"changes-requested","body":{"findings":[],"security":[],"tests_checked":[],"not_checked":[],"token":"kestrel"}}"#,
+        r#"{"verdict":"approved","body":{"findings":[],"security":[],"tests_checked":[],"not_checked":[]}}"#,
+        r#"{"verdict":"changes-requested","body":{"findings":["one"],"security":[],"tests_checked":["cargo test"],"not_checked":[]}}"#,
     ];
     for verdict in verdicts {
         let (output, log) = run_codex_smoke("ok", &[("SMOKE_CODEX_VERDICT", verdict)]);
@@ -523,6 +526,11 @@ fn codex_smoke_accepts_valid_verdict_and_separate_denial() {
             execs[0]
         );
         assert!(
+            execs[0].contains("-m gpt-6.1-sol"),
+            "review argv lost -m: {}",
+            execs[0]
+        );
+        assert!(
             !execs[0].contains("codex-wrote.txt"),
             "review prompt still asks for a write: {}",
             execs[0]
@@ -533,9 +541,40 @@ fn codex_smoke_accepts_valid_verdict_and_separate_denial() {
             execs[1]
         );
         assert!(
+            execs[1].contains("-m gpt-6.1-sol"),
+            "denial probe lost -m: {}",
+            execs[1]
+        );
+        assert!(
             !execs[1].contains("--output-schema"),
             "denial probe was schema-gated: {}",
             execs[1]
         );
     }
+}
+
+#[test]
+fn codex_smoke_schema_matches_production_task_schema() {
+    let script = fs::read_to_string(script_path()).expect("script");
+    let marker = "<<'CODEX_TASK_SCHEMA'\n";
+    let start = script.find(marker).expect("schema heredoc") + marker.len();
+    let rest = &script[start..];
+    let end = rest.find("\nCODEX_TASK_SCHEMA\n").expect("schema end");
+    let smoke: serde_json::Value = serde_json::from_str(&rest[..end]).expect("smoke schema");
+
+    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/agents.rs"))
+        .expect("agents.rs");
+    let const_marker = "const TASK_CODEX_SCHEMA: &str = r#\"";
+    let start = source.find(const_marker).expect("const") + const_marker.len();
+    let end = source[start..].find("\"#").expect("const end");
+    let production: serde_json::Value =
+        serde_json::from_str(&source[start..start + end]).expect("production schema");
+    assert_eq!(smoke, production);
+
+    let model = relaybook_core::DEFAULT_CODEX_MODEL;
+    assert!(script.contains(&format!("codex_model={model}")));
+    assert!(
+        script.matches("-m \"$codex_model\"").count() >= 2,
+        "review and probe must both pass -m"
+    );
 }
