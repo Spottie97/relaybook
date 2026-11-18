@@ -101,9 +101,22 @@ smoke_schema_v8() {
   run_in_repo "$_gated" "" "$_new" config set reviewer codex
   run_in_repo "$_gated" "" "$_new" config set workflow gated
   _db="$_gated/.relaybook/ledger.db"
-  _triggers=$(sqlite3 "$_db" "SELECT count(*) FROM sqlite_master WHERE type='trigger';")
-  if [ "$_triggers" != "5" ]; then
-    echo "sqlite3 3.45.1 saw $_triggers triggers, want 5" >&2
+  # schema.rs: five 0.3.3 guards plus the two re-review triggers. Sorted.
+  _want=$(printf '%s\n' \
+    relaybook_guard_rereview_authorize \
+    relaybook_guard_rereview_publish \
+    relaybook_guard_task_report_insert \
+    relaybook_guard_task_accept \
+    relaybook_guard_claim_base_sha \
+    relaybook_guard_run_insert \
+    relaybook_guard_run_update | LC_ALL=C sort)
+  _got=$(sqlite3 "$_db" "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name;")
+  if [ "$_got" != "$_want" ]; then
+    echo "sqlite3 3.45.1 trigger names differ" >&2
+    echo "saw:" >&2
+    printf '%s\n' "$_got" >&2
+    echo "want:" >&2
+    printf '%s\n' "$_want" >&2
     exit 1
   fi
   sqlite3 "$_db" "SELECT count(*) FROM tasks;" >/dev/null

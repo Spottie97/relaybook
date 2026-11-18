@@ -4,7 +4,7 @@ All notable changes to Relaybook are documented here. The format is based on [Ke
 
 ## [Unreleased]
 
-## [0.4.0] - Unreleased
+## [0.4.0] - 2026-11-18
 
 ### Added
 
