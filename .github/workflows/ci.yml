@@ -51,6 +51,7 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File scripts/test-windows-install.ps1 -Phase Finish
       - name: context budget
+        shell: bash
         run: scripts/measure-context.sh --check
       - name: docs commands
         run: python3 scripts/check-docs.py

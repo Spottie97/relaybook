@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use assert_cmd::prelude::*;
@@ -231,7 +231,8 @@ fn setup_keeps_a_global_merge_driver() {
     let global = root.path().join("global.gitconfig");
     fs::create_dir(&repo).expect("repo");
     fs::write(&global, "").expect("global gitconfig");
-    let home_before = home_gitconfig();
+    fs::create_dir(root.path().join("home")).expect("home");
+    let home_before = real_global_configs();
     let system_before = fs::read("/etc/gitconfig").ok();
 
     let custom_driver = "\"/usr/bin/python3\" -m graphify merge-driver %O %A %B";
@@ -270,7 +271,7 @@ fn setup_keeps_a_global_merge_driver() {
         "{attributes}"
     );
     assert!(
-        home_gitconfig() == home_before,
+        real_global_configs() == home_before,
         "real ~/.gitconfig was modified"
     );
     assert!(
@@ -321,12 +322,23 @@ fn setup(dir: &Path, args: &[&str]) {
     relaybook(dir).args(args).assert().success();
 }
 
+fn child_path() -> std::ffi::OsString {
+    if cfg!(windows) {
+        let dir = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .find(|dir| dir.join("git.exe").is_file())
+            .expect("git.exe on PATH");
+        std::env::join_paths([dir]).expect("git.exe on PATH")
+    } else {
+        "/usr/bin:/bin".into()
+    }
+}
+
 fn relaybook(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("relaybook").expect("relaybook binary");
     cmd.current_dir(dir);
     cmd.env_remove("GIT_DIR");
     cmd.env_remove("GIT_WORK_TREE");
-    cmd.env("PATH", "/usr/bin:/bin");
+    cmd.env("PATH", child_path());
     cmd
 }
 
@@ -360,6 +372,7 @@ fn git(dir: &Path, args: &[&str]) -> std::process::Output {
         .expect("git")
 }
 
+#[track_caller]
 fn git_ok(dir: &Path, args: &[&str]) {
     let output = git(dir, args);
     assert!(
@@ -370,6 +383,7 @@ fn git_ok(dir: &Path, args: &[&str]) {
     );
 }
 
+#[track_caller]
 fn config_get(dir: &Path, key: &str) -> String {
     let output = git(dir, &["config", "--local", "--get", key]);
     assert!(
@@ -384,27 +398,73 @@ fn config_get(dir: &Path, key: &str) -> String {
         .to_string()
 }
 
-fn home_gitconfig() -> Vec<u8> {
-    let home = std::env::var("HOME").expect("HOME");
-    fs::read(Path::new(&home).join(".gitconfig")).unwrap_or_default()
+fn real_global_configs() -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut dirs = Vec::new();
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            let dir = PathBuf::from(value);
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+    {
+        let mut joined = drive;
+        joined.push(path);
+        let dir = PathBuf::from(joined);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    assert!(
+        !dirs.is_empty(),
+        "no HOME, USERPROFILE or HOMEDRIVE+HOMEPATH"
+    );
+
+    let mut found = Vec::new();
+    for dir in dirs {
+        let path = dir.join(".gitconfig");
+        let bytes = fs::read(&path).ok();
+        found.push((path, bytes));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(xdg).join("git").join("config");
+        let bytes = fs::read(&path).ok();
+        found.push((path, bytes));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        let path = PathBuf::from(home)
+            .join(".config")
+            .join("git")
+            .join("config");
+        let bytes = fs::read(&path).ok();
+        found.push((path, bytes));
+    }
+    found
+}
+
+fn isolate(cmd: &mut Command, home: &Path) {
+    cmd.env("HOME", home);
+    cmd.env("USERPROFILE", home);
+    cmd.env("XDG_CONFIG_HOME", home);
 }
 
 fn git_global(dir: &Path, global: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .current_dir(dir)
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env("GIT_CONFIG_GLOBAL", global)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(args)
-        .output()
-        .expect("git")
+        .args(args);
+    isolate(&mut cmd, &global.parent().unwrap().join("home"));
+    cmd.output().expect("git")
 }
 
 fn write_global_config(global: &Path, key: &str, value: &str) {
-    let output = Command::new("git")
-        .env_remove("GIT_DIR")
+    let mut cmd = Command::new("git");
+    cmd.env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env("GIT_CONFIG_GLOBAL", global)
@@ -412,9 +472,9 @@ fn write_global_config(global: &Path, key: &str, value: &str) {
         .args(["config", "--file"])
         .arg(global)
         .arg(key)
-        .arg(value)
-        .output()
-        .expect("git config --file");
+        .arg(value);
+    isolate(&mut cmd, &global.parent().unwrap().join("home"));
+    let output = cmd.output().expect("git config --file");
     assert!(
         output.status.success(),
         "{} {}",
@@ -423,18 +483,19 @@ fn write_global_config(global: &Path, key: &str, value: &str) {
     );
 }
 
+#[track_caller]
 fn file_config(global: &Path, key: &str) -> String {
-    let output = Command::new("git")
-        .env_remove("GIT_DIR")
+    let mut cmd = Command::new("git");
+    cmd.env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .env("GIT_CONFIG_GLOBAL", global)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .args(["config", "--file"])
         .arg(global)
-        .args(["--get", key])
-        .output()
-        .expect("git config --file --get");
+        .args(["--get", key]);
+    isolate(&mut cmd, &global.parent().unwrap().join("home"));
+    let output = cmd.output().expect("git config --file --get");
     assert!(
         output.status.success(),
         "{} {}",
@@ -447,6 +508,7 @@ fn file_config(global: &Path, key: &str) -> String {
         .to_string()
 }
 
+#[track_caller]
 fn effective_config(dir: &Path, global: &Path, key: &str) -> String {
     let output = git_global(dir, global, &["config", "--get", key]);
     assert!(
@@ -461,6 +523,7 @@ fn effective_config(dir: &Path, global: &Path, key: &str) -> String {
         .to_string()
 }
 
+#[track_caller]
 fn assert_local_absent(dir: &Path, global: &Path, key: &str) {
     let output = git_global(dir, global, &["config", "--local", "--get", key]);
     assert!(
@@ -478,7 +541,8 @@ fn setup_with_global(dir: &Path, global: &Path, args: &[&str]) {
         .env_remove("GIT_INDEX_FILE")
         .env("GIT_CONFIG_GLOBAL", global)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", child_path())
         .args(args);
+    isolate(&mut cmd, &global.parent().unwrap().join("home"));
     cmd.assert().success();
 }
