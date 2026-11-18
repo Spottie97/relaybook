@@ -933,11 +933,14 @@ mod tests {
 
     #[test]
     fn redacts_authority_passwords_with_punctuation() {
-        for password in ["sec;ret", "sec,ret", "sec'ret", "sec(ret)", "sec)ret"] {
+        for (i, password) in ["sec;ret", "sec,ret", "sec'ret", "sec(ret)", "sec)ret"]
+            .into_iter()
+            .enumerate()
+        {
             let url = format!("https://user:{password}@host/repo");
             let redacted = redact_userinfo(&url);
-            assert_eq!(redacted, "https://***@host/repo", "{url} -> {redacted}");
-            assert!(!redacted.contains(password), "{redacted}");
+            assert_eq!(redacted, "https://***@host/repo", "case {i}");
+            assert!(!redacted.contains(password), "case {i}");
         }
     }
 

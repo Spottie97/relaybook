@@ -1381,10 +1381,8 @@ pub(crate) fn forbidden_claude_review_arg(args: &[String]) -> Option<String> {
 fn claude_option(arg: &str) -> Option<(&str, Option<&str>)> {
     let rest = if let Some(rest) = arg.strip_prefix("--") {
         rest
-    } else if let Some(rest) = arg.strip_prefix('-') {
-        rest
     } else {
-        return None;
+        arg.strip_prefix('-')?
     };
     if rest.is_empty() {
         return None;
