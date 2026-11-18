@@ -309,13 +309,16 @@ const CODEX_LIMIT_SIGNATURES: &[(&str, &str)] = &[
 /// `codex --version` lines this build will treat as a usage limit.
 const CODEX_VERIFIED_VERSIONS: &[&str] = &["codex-cli 0.169.0"];
 
-/// Phrases on an `ERROR: ` line that keep the failure ordinary.
-/// `exceeded retry limit` is the plain-429 line from V3 E2. `unexpected status`
-/// is the 401 line from that same capture. They veto on every remaining
-/// `ERROR: ` line, not only the last one.
+/// Phrases that keep a failure ordinary. They are matched on every remaining
+/// stderr line after the echoed prompt and packet are removed, with or
+/// without an `ERROR: ` prefix. `exceeded retry limit` is the plain-429 line
+/// from V3 E2. `unexpected status` is the 401 line from that same capture.
+/// `Input exceeds the maximum length` is the V2 row 4 sentence, which has no
+/// `ERROR:` prefix.
 const CODEX_ORDINARY_SIGNATURES: &[&str] = &[
     "401",
     "input_too_large",
+    "Input exceeds the maximum length",
     "Not logged in",
     "exceeded retry limit",
     "unexpected status",
@@ -611,22 +614,36 @@ fn codex_output_dir(out: &Path) -> Result<std::fs::Metadata, String> {
     Ok(parent_meta)
 }
 
-/// Metadata for `-o`. A symlink or other non-regular file is rejected before
-/// it is opened. A regular file is opened with the same ownership checks as a
-/// successful read. Nothing reads the bytes.
+/// Metadata for `-o`. Nothing reads the bytes.
+///
+/// On Unix the path is opened with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` and
+/// the descriptor is `fstat`ed. A stat of the path followed by a blocking
+/// open can hang when the path is replaced with a FIFO. A limit needs that
+/// descriptor to be a regular file of length 0 that passes the ownership
+/// checks. Anything else is an error, which a failed exit reports as an
+/// ordinary failure.
+///
+/// Other platforms keep the metadata check and do not follow a symlink.
 fn validated_codex_output(out: &Path, share_user: Option<&str>) -> Result<ValidatedOutput, String> {
     let parent_meta = codex_output_dir(out)?;
-    match std::fs::symlink_metadata(out) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ValidatedOutput { len: 0, file: None });
-        }
-        Err(err) => return Err(err.to_string()),
-        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
-            return Err("codex output is not a regular file".to_string());
-        }
-        Ok(_) => {}
+    #[cfg(unix)]
+    {
+        open_regular_codex_output(out, &parent_meta, share_user)
     }
-    open_regular_codex_output(out, &parent_meta, share_user)
+    #[cfg(not(unix))]
+    {
+        match std::fs::symlink_metadata(out) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ValidatedOutput { len: 0, file: None });
+            }
+            Err(err) => return Err(err.to_string()),
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => {
+                return Err("codex output is not a regular file".to_string());
+            }
+            Ok(_) => {}
+        }
+        open_regular_codex_output(out, &parent_meta, share_user)
+    }
 }
 
 #[cfg(unix)]
@@ -636,9 +653,10 @@ fn open_regular_codex_output(
     share_user: Option<&str>,
 ) -> Result<ValidatedOutput, String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // `.read(true)` is `O_RDONLY`. The extra flags are `O_NOFOLLOW | O_NONBLOCK`.
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(o_nofollow())
+        .custom_flags(o_nofollow() | o_nonblock())
         .open(out)
     {
         Ok(file) => file,
@@ -647,6 +665,9 @@ fn open_regular_codex_output(
         }
         Err(_) => return Err("codex output is not a regular file".to_string()),
     };
+    // `File::metadata` fstats this descriptor. It is not a path lookup, so a
+    // later replacement of the path does not change the check. A FIFO opened
+    // this way has length 0 and is still not a regular file.
     let meta = file.metadata().map_err(|err| err.to_string())?;
     if !meta.is_file() {
         return Err("codex output is not a regular file".to_string());
@@ -697,6 +718,27 @@ fn read_codex_output(out: &Path, share_user: Option<&str>) -> Result<String, Str
         return Err("codex output is empty".to_string());
     }
     Ok(text)
+}
+
+#[cfg(unix)]
+fn o_nonblock() -> i32 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        0x800
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        0x4
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        0
+    }
 }
 
 #[cfg(unix)]
@@ -1077,13 +1119,13 @@ pub(crate) fn codex_version() -> String {
 /// A phrase in stdout or in `out` is not a limit.
 ///
 /// `codex exec` prints the prompt, and the stdin packet inside `<stdin>`, on
-/// stderr (`user` plus that text). That echo is removed before matching.
-/// Only `ERROR: ` lines after the echo count. An ordinary signature on any
-/// of those lines vetoes a limit. The last of those lines must also itself
-/// be a limit signature. That last-line rule is extra and does not replace
-/// the veto. Zero copies of the echo is not an echo. More than one copy, or
-/// sent text that could spoof a limit when the echo cannot be found, is an
-/// ordinary failure.
+/// stderr (`user` plus that text). Only that echoed block is removed. Stderr
+/// before it and after it still counts. An ordinary signature on any
+/// remaining line vetoes a limit, whether or not the line starts with
+/// `ERROR: `. The last `ERROR: ` line must also itself be a limit signature.
+/// That last-line rule is extra and does not replace the veto. Zero copies
+/// of the echo is not an echo. More than one copy, or sent text that could
+/// spoof a limit when the echo cannot be found, is an ordinary failure.
 pub(crate) fn classify_codex_exit(
     code: Option<i32>,
     stderr: &str,
@@ -1104,19 +1146,23 @@ pub(crate) fn classify_codex_exit(
     if code != Some(1) || !out_empty || !version_ok {
         return CodexExit::Ordinary;
     }
-    let region = match stderr_after_codex_echo(stderr, prompt, packet) {
+    let region = match stderr_without_codex_echo(stderr, prompt, packet) {
         Some(region) => region,
         None => return CodexExit::Ordinary,
     };
-    let errors: Vec<&str> = region
+    let lines: Vec<&str> = region
         .lines()
         .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let errors: Vec<&str> = lines
+        .iter()
+        .copied()
         .filter(|line| line.starts_with("ERROR: "))
         .collect();
     let Some(last) = errors.last().copied() else {
         return CodexExit::Ordinary;
     };
-    if errors.iter().any(|line| {
+    if lines.iter().any(|line| {
         CODEX_ORDINARY_SIGNATURES
             .iter()
             .any(|phrase| line.contains(phrase))
@@ -1148,14 +1194,15 @@ fn codex_echoed_prompt(prompt: &str, packet: &str) -> String {
     combined
 }
 
-/// `Some` is the stderr that follows one unambiguous echo, or all of `stderr`
-/// when the prompt and packet were not echoed and cannot spoof a limit.
+/// `Some` is `stderr` with one unambiguous echo removed. Text before that
+/// block and text after it are kept. When the prompt and packet were not
+/// echoed and cannot spoof a limit, the result is all of `stderr`.
 /// `None` is fail closed: the echo appears more than once, or the sent text
 /// contains a limit phrase or an `ERROR: ` line and that echo is missing.
-fn stderr_after_codex_echo<'a>(stderr: &'a str, prompt: &str, packet: &str) -> Option<&'a str> {
+fn stderr_without_codex_echo(stderr: &str, prompt: &str, packet: &str) -> Option<String> {
     let echoed = codex_echoed_prompt(prompt, packet);
     if echoed.is_empty() {
-        return Some(stderr);
+        return Some(stderr.to_string());
     }
     let block = format!("user\n{echoed}");
     let mut from = 0;
@@ -1170,9 +1217,14 @@ fn stderr_after_codex_echo<'a>(stderr: &'a str, prompt: &str, packet: &str) -> O
         from += pos + block.len();
     }
     match start {
-        Some(start) => Some(&stderr[start + block.len()..]),
+        Some(start) => {
+            let mut kept = String::with_capacity(stderr.len() - block.len());
+            kept.push_str(&stderr[..start]);
+            kept.push_str(&stderr[start + block.len()..]);
+            Some(kept)
+        }
         None if sent_text_can_spoof_limit(prompt, packet) => None,
-        None => Some(stderr),
+        None => Some(stderr.to_string()),
     }
 }
 
@@ -2411,7 +2463,37 @@ mod tests {
         );
     }
 
-    /// `-o` on a failed exit is classified from metadata. The file is not read.
+    /// V2 row 4 has no `ERROR:` prefix. Text before the echo is not discarded.
+    /// An ordinary signature on either of those lines vetoes a later limit.
+    #[test]
+    fn ordinary_lines_outside_the_echo_veto_a_later_limit() {
+        // codex-verification-v2.md row 4. No `ERROR:` prefix.
+        let too_large = "Input exceeds the maximum length of 1048576 characters (input_error_code input_too_large, max_chars 1048576, actual_chars 4194123)";
+        let unprefixed = format!("{too_large}\n{QUOTA}");
+        assert!(
+            matches!(limit_of(&unprefixed, "", ""), CodexExit::Ordinary),
+            "unprefixed V2 input_too_large line then quota"
+        );
+        let prompt = "Review the diff.";
+        let packet = "diff\n";
+        let before = format!(
+            "ERROR: unexpected status 401 Unauthorized: bad key, url: \u{2026}\n{}",
+            echoed_transcript(prompt, packet, USAGE)
+        );
+        assert!(
+            matches!(limit_of(&before, prompt, packet), CodexExit::Ordinary),
+            "ordinary ERROR line before the echo, limit after"
+        );
+        assert!(
+            matches!(
+                limit_of(USAGE, "", ""),
+                CodexExit::Limited { signature } if signature == "usage_limit"
+            ),
+            "limit alone"
+        );
+    }
+
+    /// `-o` on a failed exit is classified from the opened descriptor. The file is not read.
     #[test]
     fn failed_codex_exit_classifies_output_from_metadata() {
         let dir = tempfile::tempdir().expect("temp");
@@ -2469,6 +2551,51 @@ mod tests {
                 "symlink must not be classified as a limit: {output}"
             );
         }
+    }
+
+    /// A FIFO at `-o` must not block the failed-exit check, and it is not a
+    /// limit. `O_RDONLY` without `O_NONBLOCK` waits forever for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn fifo_output_is_ordinary_without_blocking() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let mut permissions = std::fs::symlink_metadata(dir.path())
+            .expect("dir meta")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), permissions).expect("private dir");
+        let out = dir.path().join("codex-last.md");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&out)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success(), "mkfifo exited {made}");
+        let path = out.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result =
+                classify_failed_codex_exit(Some(1), "", USAGE, &path, "", "", VERSION, None);
+            let _ = tx.send(result);
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| {
+            panic!("FIFO -o check blocked; the open must be nonblocking");
+        });
+        let AgentResult::Failed { output } = result else {
+            panic!("FIFO must be ordinary, not a limit: {result:?}");
+        };
+        assert!(
+            output.contains("not a regular file"),
+            "FIFO must hit the output guard: {output}"
+        );
+        assert!(
+            !output.contains("usage_limit"),
+            "FIFO must not be classified as a limit: {output}"
+        );
     }
 
     /// `modelUsage` entry from claude-envelope-evidence.md. That capture used

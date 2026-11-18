@@ -203,6 +203,7 @@ fn fresh_ledger_is_v8_with_guards() {
         vec![
             "relaybook_guard_claim_base_sha".to_string(),
             "relaybook_guard_rereview_authorize".to_string(),
+            "relaybook_guard_rereview_publish".to_string(),
             "relaybook_guard_run_insert".to_string(),
             "relaybook_guard_run_update".to_string(),
             "relaybook_guard_task_accept".to_string(),
@@ -218,8 +219,11 @@ fn fresh_ledger_is_v8_with_guards() {
                 |row| row.get(0),
             )
             .expect("sql");
-        if name == "relaybook_guard_rereview_authorize" {
+        if name == "relaybook_guard_rereview_authorize"
+            || name == "relaybook_guard_rereview_publish"
+        {
             assert!(sql.contains("codex re-review pending"), "{name}");
+            assert!(sql.contains("selected.run_id"), "{name}");
         } else {
             assert!(sql.contains(GUARD), "{name}");
         }
@@ -423,7 +427,7 @@ fn v7_ledger_migrates_to_v8_with_payloads_unchanged() {
     let ledger = Ledger::open(&path).expect("migrate");
     drop(ledger);
     assert_eq!(user_version(&path), 8);
-    assert_eq!(trigger_names(&path).len(), 6);
+    assert_eq!(trigger_names(&path).len(), 7);
     let conn = Connection::open(&path).expect("reopen");
     let stored_event: String = conn
         .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
@@ -523,7 +527,7 @@ fn v1_and_v6_migrate_to_v8() {
     }
     drop(Ledger::open(&path).expect("migrate v1"));
     assert_eq!(user_version(&path), 8);
-    assert_eq!(trigger_names(&path).len(), 6);
+    assert_eq!(trigger_names(&path).len(), 7);
     let conn = Connection::open(&path).expect("reopen");
     let stored: String = conn
         .query_row("SELECT payload FROM events WHERE id = 7", [], |row| {
@@ -574,7 +578,7 @@ fn v1_and_v6_migrate_to_v8() {
     }
     drop(Ledger::open(&path).expect("migrate v6"));
     assert_eq!(user_version(&path), 8);
-    assert_eq!(trigger_names(&path).len(), 6);
+    assert_eq!(trigger_names(&path).len(), 7);
     let columns = column_names(&path, "reports");
     for column in ["commit_sha", "base_sha", "graph_sha"] {
         assert!(columns.iter().any(|name| name == column), "{column}");
@@ -1158,7 +1162,7 @@ fn newer_than_schema_is_refused() {
     };
     assert_eq!(readonly.to_string(), "this ledger needs a newer relaybook");
     assert_eq!(user_version(&path), 9);
-    assert_eq!(trigger_names(&path).len(), 6);
+    assert_eq!(trigger_names(&path).len(), 7);
 }
 
 #[test]
@@ -1405,6 +1409,119 @@ fn old_rereview_trigger_is_replaced_at_v8() {
         )
         .expect_err("upgraded trigger");
     assert!(err.to_string().contains("codex re-review pending"), "{err}");
+}
+
+/// The stamp-incrementing `UPDATE` from the R13 binary at `dd292e9`
+/// (`crates/core/src/runs.rs` `save`, the statement at line 172). Resume
+/// from `gate_release` binds stage `publish` and calls `claim_run`
+/// (`crates/relaybook/src/runloop.rs:369`). `publish` then binds stage
+/// `publishing` and calls `claim_run` again (`runloop.rs:2258`).
+fn r13_save(
+    conn: &Connection,
+    id: i64,
+    stage: &str,
+    status: &str,
+) -> Result<usize, rusqlite::Error> {
+    let (cycle, calls, cost, streak, slug, complete, stamp): (
+        i64,
+        i64,
+        f64,
+        i64,
+        Option<String>,
+        i64,
+        i64,
+    ) = conn.query_row(
+        "SELECT cycle, agent_calls, est_cost_usd, failure_streak, current_slug,
+                complete_requested, write_stamp
+         FROM runs WHERE id = ?1",
+        [id],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ))
+        },
+    )?;
+    conn.execute(
+        "UPDATE runs SET
+            stage = ?1, cycle = ?2, agent_calls = ?3, est_cost_usd = ?4, status = ?5,
+            stop_reason = ?6, failure_streak = ?7, current_slug = ?8, complete_requested = ?9,
+            write_stamp = write_stamp + 1
+         WHERE id = ?10 AND write_stamp = ?11",
+        rusqlite::params![
+            stage,
+            cycle,
+            calls,
+            cost,
+            status,
+            None::<String>,
+            streak,
+            slug,
+            complete,
+            id,
+            stamp
+        ],
+    )
+}
+
+/// Authorize a Sonnet release while re-review is off, tighten the policy,
+/// then replay the R13 update sequence. The move into `publishing` raises
+/// and the row stays at `publish`.
+#[test]
+fn r13_stamp_update_cannot_enter_publishing_while_rereview_is_pending() {
+    let (_dir, path) = fresh_path();
+    let run_id = {
+        let mut ledger = Ledger::initialize(&path).expect("init");
+        gate(&mut ledger);
+        ledger
+            .set_setting_with("fallback_rereview", "off", true)
+            .expect("off");
+        let run = ledger
+            .start_run("prd.md", "digest", "feature", Some("gated"))
+            .expect("run");
+        let mut waiting = ledger.run_by_id(run.id).expect("load");
+        waiting.stage = "gate_release".to_string();
+        waiting.status = "waiting".to_string();
+        ledger.save_run(&mut waiting).expect("gate");
+        run.id
+    };
+    assert_eq!(user_version(&path), 8);
+    let review_id = {
+        let conn = Connection::open(&path).expect("open");
+        claude_release_review(&conn, run_id, "abc")
+    };
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute(
+            "INSERT INTO release_authorizations (
+                run_id, branch, commit_sha, review_id, authorized_by, created_at
+             ) VALUES (?1, 'feature', 'abc', ?2, 'maintainer', '2026-01-01T00:00:00.000Z')",
+            rusqlite::params![run_id, review_id],
+        )
+        .expect("authorize while off");
+    }
+    {
+        let mut ledger = Ledger::open(&path).expect("open");
+        ledger
+            .set_setting("fallback_rereview", "before-release")
+            .expect("tighten");
+    }
+    let conn = Connection::open(&path).expect("open");
+    r13_save(&conn, run_id, "publish", "active").expect("R13 claim of stage publish");
+    let err = r13_save(&conn, run_id, "publishing", "active").expect_err("R13 publishing update");
+    assert!(err.to_string().contains("codex re-review pending"), "{err}");
+    let stage: String = conn
+        .query_row("SELECT stage FROM runs WHERE id = ?1", [run_id], |row| {
+            row.get(0)
+        })
+        .expect("stage");
+    assert_eq!(stage, "publish");
+    assert_eq!(user_version(&path), 8);
 }
 
 fn probe_event_count(path: &Path, kind: &str) -> i64 {

@@ -4,8 +4,8 @@ use crate::error::Error;
 use crate::schema::{
     GUARD_MESSAGE, GUARD_NAMES, GUARDS, MIGRATE_V1_TO_V2, MIGRATE_V2_TO_V3, MIGRATE_V3_TO_V4,
     MIGRATE_V5_TO_V6, MIGRATE_V6_TO_V7, MIGRATE_V7_TO_V8, ONE_LIVE_GATED_INDEX,
-    REREVIEW_AUTHORIZE_TRIGGER, REVIEW_INVOCATION_INDEX, REVIEWER_EVENTS_TABLE, SCHEMA,
-    SCHEMA_VERSION,
+    REREVIEW_AUTHORIZE_TRIGGER, REREVIEW_PUBLISH_TRIGGER, REVIEW_INVOCATION_INDEX,
+    REVIEWER_EVENTS_TABLE, SCHEMA, SCHEMA_VERSION,
 };
 
 pub(crate) fn migrate(conn: &mut Connection) -> Result<(), Error> {
@@ -124,6 +124,7 @@ pub(crate) fn apply_current_schema(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(GUARDS)?;
     conn.execute_batch(REVIEWER_EVENTS_TABLE)?;
     conn.execute_batch(REREVIEW_AUTHORIZE_TRIGGER)?;
+    conn.execute_batch(REREVIEW_PUBLISH_TRIGGER)?;
     Ok(())
 }
 
@@ -195,7 +196,7 @@ fn restore_review_invocation_token(conn: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-/// Add the reviewer-fallback columns, event log, and re-review trigger.
+/// Add the reviewer-fallback columns, event log, and re-review triggers.
 ///
 /// `user_version` stays 8. A ledger already at schema 8 gains them on the
 /// next read-write open. The v7-to-v8 migration adds them too.
@@ -236,7 +237,7 @@ fn reviewer_fallback_needed(conn: &Connection) -> Result<bool, Error> {
     if !table_exists(conn, "reviewer_events")? {
         return Ok(true);
     }
-    Ok(!rereview_trigger_current(conn)?)
+    Ok(!rereview_trigger_current(conn)? || !publish_trigger_current(conn)?)
 }
 
 fn restore_reviewer_fallback(conn: &Connection) -> Result<(), Error> {
@@ -262,6 +263,13 @@ fn restore_reviewer_fallback(conn: &Connection) -> Result<(), Error> {
         )?;
         conn.execute_batch(REREVIEW_AUTHORIZE_TRIGGER)?;
     }
+    if !publish_trigger_current(conn)? {
+        conn.execute(
+            "DROP TRIGGER IF EXISTS relaybook_guard_rereview_publish",
+            [],
+        )?;
+        conn.execute_batch(REREVIEW_PUBLISH_TRIGGER)?;
+    }
     Ok(())
 }
 
@@ -278,6 +286,21 @@ fn rereview_trigger_current(conn: &Connection) -> Result<bool, Error> {
         )
         .optional()?;
     Ok(sql.is_some_and(|sql| sql.contains("selected.run_id")))
+}
+
+/// True when the publishing guard derives coverage from the selected release
+/// review. A missing trigger, or one that does not, is installed on open.
+/// `user_version` stays 8.
+fn publish_trigger_current(conn: &Connection) -> Result<bool, Error> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'relaybook_guard_rereview_publish'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(sql.is_some_and(|sql| sql.contains("publishing") && sql.contains("selected.run_id")))
 }
 
 fn index_exists(conn: &Connection, name: &str) -> Result<bool, Error> {
@@ -340,10 +363,11 @@ fn pause_before_adding_invocation_token(conn: &Connection) {
 }
 
 /// Recreate any missing schema-8 trigger. Returns whether one was missing.
-/// A missing or outdated `relaybook_guard_rereview_authorize` counts, so a
-/// gated open reports `ledger_guard` `restored` when that trigger alone was
-/// replaced. Also installs [`ONE_LIVE_GATED_INDEX`] so a ledger already at
-/// version 8 gains it on the next read-write open.
+/// A missing or outdated `relaybook_guard_rereview_authorize` or
+/// `relaybook_guard_rereview_publish` counts, so a gated open reports
+/// `ledger_guard` `restored` when either trigger alone was replaced. Also
+/// installs [`ONE_LIVE_GATED_INDEX`] so a ledger already at version 8 gains
+/// it on the next read-write open.
 pub(crate) fn ensure_guards(conn: &Connection) -> Result<bool, Error> {
     debug_assert!(
         GUARDS.contains(GUARD_MESSAGE),
@@ -352,6 +376,7 @@ pub(crate) fn ensure_guards(conn: &Connection) -> Result<bool, Error> {
     ensure_one_live_gated(conn)?;
     ensure_review_invocation_token(conn)?;
     let rereview_current = rereview_trigger_current(conn)?;
+    let publish_current = publish_trigger_current(conn)?;
     ensure_reviewer_fallback(conn)?;
     let mut guard_missing = false;
     for name in GUARD_NAMES {
@@ -363,7 +388,7 @@ pub(crate) fn ensure_guards(conn: &Connection) -> Result<bool, Error> {
     if guard_missing {
         conn.execute_batch(GUARDS)?;
     }
-    Ok(guard_missing || !rereview_current)
+    Ok(guard_missing || !rereview_current || !publish_current)
 }
 
 fn trigger_exists(conn: &Connection, name: &str) -> Result<bool, Error> {

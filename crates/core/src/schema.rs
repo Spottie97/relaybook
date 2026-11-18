@@ -279,6 +279,47 @@ BEGIN
 END;
 ";
 
+/// Stops an older v8 binary from moving a gated run into stage `publishing`
+/// while Codex coverage is still pending. The R13 `runs::save` update
+/// increments `write_stamp`, so [`GUARDS`]'s run-update trigger allows it.
+/// Coverage is the approved Claude reviews on the run of this run's selected
+/// release review (the latest approved release review whose `run_id` is
+/// `NEW.id`). `fallback_rereview=off` does not fire. An update that leaves
+/// the row in `publishing`, or moves it out, does not fire.
+pub(crate) const REREVIEW_PUBLISH_TRIGGER: &str = "
+CREATE TRIGGER IF NOT EXISTS relaybook_guard_rereview_publish
+BEFORE UPDATE ON runs
+WHEN NEW.stage = 'publishing'
+ AND OLD.stage IS NOT 'publishing'
+ AND NEW.workflow = 'gated'
+ AND (
+    (SELECT value FROM settings WHERE key = 'fallback_rereview') IS NULL
+    OR (SELECT value FROM settings WHERE key = 'fallback_rereview') = 'before-release'
+ )
+ AND EXISTS (
+    SELECT 1 FROM reviews AS sonnet
+    WHERE sonnet.reviewer = 'claude'
+      AND sonnet.verdict = 'approved'
+      AND sonnet.run_id = (
+          SELECT selected.run_id FROM reviews AS selected
+          WHERE selected.scope = 'release'
+            AND selected.verdict = 'approved'
+            AND selected.run_id = NEW.id
+          ORDER BY selected.id DESC
+          LIMIT 1
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM reviews AS codex
+          WHERE codex.rereview_of = sonnet.id
+            AND codex.reviewer = 'codex'
+            AND codex.verdict = 'approved'
+      )
+ )
+BEGIN
+  SELECT RAISE(ABORT, 'codex re-review pending');
+END;
+";
+
 /// Triggers installed for schema 8. They only `RAISE`; they do not write.
 pub(crate) const GUARDS: &str = "
 CREATE TRIGGER IF NOT EXISTS relaybook_guard_task_report_insert
