@@ -80,7 +80,33 @@ fn graphify_smoke_init_ignores_inherited_git_directory() {
     let work_at = body
         .find("\ninit_throwaway \"$work\" \"\"\n")
         .expect("agent repo init keeps the caller HOME");
+    let schema_at = body.find("\nsmoke_schema_v8 ").expect("schema v8 smoke");
+    let remote_at = body.find("\nsmoke_ls_remote ").expect("ls-remote smoke");
+    let codex_at = body.find("\nsmoke_codex\n").expect("codex smoke");
+    let claude_at = body.find("\nclaude -p ").expect("agent prompts");
     assert!(clear_at < graph_at && graph_at < work_at);
+    assert!(
+        graph_at < schema_at
+            && schema_at < remote_at
+            && remote_at < codex_at
+            && codex_at < work_at
+            && work_at < claude_at
+    );
+    assert!(text.contains("git ls-remote"));
+    assert!(text.contains("--exit-code"));
+    assert!(text.contains("pushInsteadOf"));
+    assert!(text.contains("push_url_differs=true"));
+    assert!(text.contains("codex exec"));
+    assert!(text.contains("-s read-only"));
+    assert!(text.contains("--ephemeral"));
+    assert!(text.contains("--color never"));
+    assert!(text.contains("--output-schema"));
+    assert!(text.contains("codex-wrote.txt"));
+    assert!(!text.contains("--add-dir"));
+    assert!(!text.contains("--dangerously"));
+    assert!(!text.contains("--approve-for-me"));
+    assert!(!text.contains("--trust"));
+    assert!(!text.contains("--worktree"));
     let clear_line = body[..clear_at].lines().count();
     for line in body.lines().take(clear_line) {
         let code = line.split('#').next().unwrap_or("").trim();

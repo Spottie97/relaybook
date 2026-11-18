@@ -135,7 +135,7 @@ relaybook gates plan
 relaybook run docs/prd.md
 ```
 
-`plan` pauses after planning. Continue with `relaybook approve`. The terminal shows each phase as it happens, and `relaybook run watch` follows a run that was started in the background. `relaybook run --quiet docs/prd.md` prints only the phase headers and the closing summary. Limits, safety checks, and a PRD template are in [docs/auto-mode.md](docs/auto-mode.md).
+`plan` pauses after planning. Continue with `relaybook approve`. The terminal shows each phase as it happens, and `relaybook run watch` follows a run that was started in the background. `relaybook run --quiet docs/prd.md` prints only the phase headers and the closing summary. With `workflow=gated`, review uses Codex and `relaybook approve` publishes only after `relaybook release authorize` for that commit. Limits, safety checks, and a PRD template are in [docs/auto-mode.md](docs/auto-mode.md). See [Gated workflow](docs/auto-mode.md#gated-workflow).
 
 ## Token savings
 

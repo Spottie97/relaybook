@@ -1,6 +1,6 @@
 # Orca workflow
 
-Manual work with `workflow=gated` is implemented. The default stays `workflow=classic`: the same task commands, and no review, release, or graph gate. Auto mode with `workflow=classic` still plans and reviews with Claude, and `relaybook run` still pushes before sign-off. With `workflow=gated`, auto mode runs until review and does not push before sign-off. Sections marked **Planned** are not enforced.
+Manual work with `workflow=gated` is implemented. The default stays `workflow=classic`: the same task commands, and no review, release, or graph gate. Auto mode with `workflow=classic` still plans and reviews with Claude, and `relaybook run` still pushes before sign-off. With `workflow=gated`, auto mode plans with Claude, implements with Cursor, and reviews with Codex. It does not push before sign-off. `relaybook approve` publishes only after `relaybook release authorize` for that HEAD.
 
 ## Minimum version
 
@@ -47,7 +47,7 @@ relaybook config set workflow gated
 
 `signoff` defaults to `typed`. `relaybook config set signoff signed-tag` also requires an annotated tag `relaybook-signoff/<sha12>` on the authorized commit. Relaybook resolves `refs/tags/relaybook-signoff/<sha12>` once, peels that object with `git rev-parse --verify <object>^{commit}`, and checks the signature with `git verify-tag` on that same object. A tag that moves during the check cannot mix a commit with another tag's signature. It never creates or pushes the tag. A missing tag, a tag on another commit, or a tag that is not a valid signature is refused. The stored `method` is `tty-typed+signed-tag`. `evidence` is three lines: the tag name, the tag object SHA, and one verifier line. The authorization write reads `signoff` again inside its ledger transaction and refuses the row when the setting is `signed-tag` unless that method and evidence are present. Changing `signoff` either way requires the typed confirmation. Setting the current value does not. `signed-tag` does not apply to the other confirmation sites.
 
-A program that can read the prompt can type the line. A signing key that same user can use can satisfy `signed-tag`. Neither proves that a human is present.
+A program that can read the prompt can type the line. A signing key that same user can use can satisfy `signed-tag`. Neither proves that a human is present. The maintainer keeps push credentials off the agent machine and protects `main` on GitHub with branch protection or rulesets, including code-owner review. The maintainer pushes and merges from their own machine after `relaybook release status` shows an authorization at HEAD. Relaybook leaves `gh` login and GitHub settings unchanged, and it cannot tell whether those protections are in place.
 
 ## Nothing is published before sign-off
 
@@ -58,13 +58,11 @@ A program that can read the prompt can type the line. A signing key that same us
 - With `workflow=classic`, `relaybook run` pushes the run branch to `origin` after every accepted review and whenever it halts, then pushes again and runs `gh pr create` without a checkpoint. See [auto-mode.md](auto-mode.md#pushes-and-the-pull-request).
 - With `workflow=gated`, `relaybook run` freezes `gated` on the run row. It plans with Claude, implements with Cursor, and reviews with Codex. It does not push on halt, after review, or before authorization. An approved release review waits at `gate_release`. A ledger has at most one live gated run. Starting or resuming another fails and does not push. `relaybook approve` at `gate_release` pushes the authorized commit with `--no-follow-tags` and opens one pull request. It does not push annotated tags. A second overlapping approve does not push or replace that completed run. Once the push has started, `relaybook run stop`, `relaybook run complete`, `relaybook run add`, and `relaybook run --resume` do not release the claim or push. If the publishing process dies, the run stays at `publishing` and holds the one live gated slot. The push result is unknown. The manual steps are in [Known limits](auto-mode.md#known-limits). Resuming another run while one is publishing does not push. Manual review and report accept follow the task's owning gated run. A workflow change during an agent call does not push. See [auto-mode.md](auto-mode.md#gated-workflow). `relaybook config set workflow classic` requires a terminal, including a value that only differs by surrounding whitespace, and it is refused while that run is active, waiting, or paused. The write checks again, so a run that becomes live during the confirmation still refuses.
 
-**Planned:**
-
-- A runloop guard that stops a reviewer who edits the branch or the ledger.
-
 ## Reviewer edits
 
 `relaybook review start` stores `HEAD`, a worktree fingerprint, and a ledger mark. `relaybook review record` fails with `reviewer changed the repository` or `ledger changed during review` if those change. Orca must write nothing between the two commands. The check detects an edit. It does not sandbox the reviewer.
+
+The auto runner stops after Codex when the worktree, HEAD, a ref, git config, hooks, a tag, a remote-tracking ref, or the ledger mark changed. Nothing is pushed. The stop reasons are in [Codex review](auto-mode.md#codex-review).
 
 ## Graphify
 

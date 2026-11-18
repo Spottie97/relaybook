@@ -1,8 +1,11 @@
 #!/bin/sh
 # Manual smoke test. Not part of CI.
-# Needs a signed-in claude, the Cursor CLI, and a real graphify on PATH.
-# One run: real-graphify checks in a throwaway repo, then the three plain
-# prompts from agent-onboarding-eval. The unit tests use a stand-in graphify.
+# Needs a signed-in claude, the Cursor CLI, a signed-in codex, and a real
+# graphify on PATH. Also needs git, timeout, and sqlite3 3.45.1.
+# One run: real-graphify checks in a throwaway repo, schema 8 against a
+# 0.3.3 build, real git ls-remote, a real read-only Codex exec, then the
+# three plain prompts from agent-onboarding-eval. The unit tests use a
+# stand-in graphify and do not run these smoke bodies.
 #
 # The graphify phase clears GIT_DIR, GIT_WORK_TREE, and GIT_INDEX_FILE and
 # uses a temporary HOME, so it does not operate on another repository or
@@ -216,6 +219,264 @@ smoke_schema_v8() {
   echo "schema v8: 0.3.3 guards and sqlite3 3.45.1 ok"
 }
 
+# relaybook in a throwaway repo. A non-zero status prints the captured output.
+relay_ok() {
+  _relay_repo=$1
+  _relay_home=$2
+  _relay_bin=$3
+  shift 3
+  if ! run_in_repo "$_relay_repo" "$_relay_home" "$_relay_bin" "$@" >"$smoke_tmp/relay.out" 2>"$smoke_tmp/relay.err"; then
+    echo "relaybook $* failed" >&2
+    cat "$smoke_tmp/relay.out" "$smoke_tmp/relay.err" >&2
+    exit 1
+  fi
+}
+
+# Gated task report at HEAD, with review start already recorded.
+prepare_gated_review_repo() {
+  _prep_repo=$1
+  _prep_home=$2
+  _prep_bin=$3
+  init_throwaway "$_prep_repo" "$_prep_home"
+  relay_ok "$_prep_repo" "$_prep_home" "$_prep_bin" init
+  relay_ok "$_prep_repo" "$_prep_home" "$_prep_bin" task create auth --title "Add auth"
+  relay_ok "$_prep_repo" "$_prep_home" "$_prep_bin" config set reviewer codex
+  relay_ok "$_prep_repo" "$_prep_home" "$_prep_bin" config set workflow gated
+  printf '%s\n' '.relaybook/' 'graphify-out/' > "$_prep_repo/.gitignore"
+  run_in_repo "$_prep_repo" "$_prep_home" git add .gitignore
+  run_in_repo "$_prep_repo" "$_prep_home" git commit -q -m "ignore"
+  relay_ok "$_prep_repo" "$_prep_home" "$_prep_bin" task claim auth --by cursor
+  printf 'work\n' > "$_prep_repo/work.txt"
+  run_in_repo "$_prep_repo" "$_prep_home" git add work.txt
+  run_in_repo "$_prep_repo" "$_prep_home" git commit -q -m "do the work"
+  relay_ok "$_prep_repo" "$_prep_home" "$_prep_bin" task done auth --changed shipped
+  review_head=$(run_in_repo "$_prep_repo" "$_prep_home" git rev-parse HEAD)
+  if ! printf '%s\n' "$review_head" | grep -E -q '^[0-9a-f]{40}$'; then
+    echo "HEAD is not a commit sha: $review_head" >&2
+    exit 1
+  fi
+  relay_ok "$_prep_repo" "$_prep_home" "$_prep_bin" review start auth
+}
+
+# Real git ls-remote, including a push URL that must not hide the fetch URL.
+# Relaybook's review record then refuses the published commit and accepts one
+# that is absent. Tracking refs are removed so the refusal comes from ls-remote.
+smoke_ls_remote() {
+  relaybook_bin=$1
+  review_text='{"findings":"none","security":"ok","tests_checked":"cargo test","not_checked":"none"}'
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git is not on PATH" >&2
+    exit 1
+  fi
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "sqlite3 is not on PATH" >&2
+    exit 1
+  fi
+  smoke_tmp=$(mktemp -d)
+  ls_home=$smoke_tmp/home
+  present_repo=$smoke_tmp/present
+  present_bare=$smoke_tmp/present.git
+  absent_repo=$smoke_tmp/absent
+  absent_bare=$smoke_tmp/absent.git
+  mkdir -p "$ls_home" "$present_repo" "$absent_repo" "$present_bare" "$absent_bare"
+  run_in_repo "$present_bare" "$ls_home" git init -q --bare -b main
+  run_in_repo "$absent_bare" "$ls_home" git init -q --bare -b main
+
+  prepare_gated_review_repo "$present_repo" "$ls_home" "$relaybook_bin"
+  present_head=$review_head
+  run_in_repo "$present_repo" "$ls_home" git remote add origin "$present_bare"
+  ls_rc=0
+  run_in_repo "$present_repo" "$ls_home" git ls-remote --exit-code --quiet --end-of-options origin refs/heads/other >/dev/null 2>&1 || ls_rc=$?
+  if [ "$ls_rc" -ne 2 ]; then
+    echo "ls-remote missing ref exited $ls_rc, want 2" >&2
+    exit 1
+  fi
+  run_in_repo "$present_repo" "$ls_home" git push origin "HEAD:refs/heads/other"
+  run_in_repo "$present_repo" "$ls_home" git for-each-ref --format='%(refname)' refs/remotes >"$smoke_tmp/tracking"
+  while IFS= read -r refname; do
+    if [ -n "$refname" ]; then
+      run_in_repo "$present_repo" "$ls_home" git update-ref -d "$refname"
+    fi
+  done <"$smoke_tmp/tracking"
+  left=$(run_in_repo "$present_repo" "$ls_home" git for-each-ref refs/remotes)
+  if [ -n "$left" ]; then
+    echo "tracking refs remained after the push" >&2
+    printf '%s\n' "$left" >&2
+    exit 1
+  fi
+  run_in_repo "$present_repo" "$ls_home" git config remote.origin.pushurl /nonexistent/push-disabled-by-smoke
+  run_in_repo "$present_repo" "$ls_home" git config "url./nonexistent/push-instead.pushInsteadOf" "$present_bare"
+  listed=$(run_in_repo "$present_repo" "$ls_home" git ls-remote --quiet --end-of-options origin)
+  if ! printf '%s\n' "$listed" | grep -F -q "$present_head"; then
+    echo "ls-remote lost the fetch URL after the push rewrite" >&2
+    printf '%s\n' "$listed" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$listed" | grep -F -q "refs/heads/other"; then
+    echo "ls-remote did not list refs/heads/other" >&2
+    printf '%s\n' "$listed" >&2
+    exit 1
+  fi
+  run_in_repo "$present_repo" "$ls_home" git ls-remote --exit-code --quiet --end-of-options origin refs/heads/other >/dev/null
+  ls_rc=0
+  run_in_repo "$present_repo" "$ls_home" git push origin "HEAD:refs/heads/elsewhere" >"$smoke_tmp/push.out" 2>"$smoke_tmp/push.err" || ls_rc=$?
+  if [ "$ls_rc" -eq 0 ]; then
+    echo "git push used the fetch URL despite pushurl" >&2
+    exit 1
+  fi
+  ls_rc=0
+  run_in_repo "$present_repo" "$ls_home" "$relaybook_bin" review record auth \
+    --by codex --sha "$present_head" --verdict approved --text "$review_text" \
+    >"$smoke_tmp/record.out" 2>"$smoke_tmp/record.err" || ls_rc=$?
+  if [ "$ls_rc" -eq 0 ] || { ! grep -F -q "refs/heads/other" "$smoke_tmp/record.out" && ! grep -F -q "refs/heads/other" "$smoke_tmp/record.err"; }; then
+    echo "published review record did not fail from ls-remote" >&2
+    cat "$smoke_tmp/record.out" "$smoke_tmp/record.err" >&2
+    exit 1
+  fi
+  if ! grep -F -q "on origin" "$smoke_tmp/record.out" && ! grep -F -q "on origin" "$smoke_tmp/record.err"; then
+    echo "published review record was not refused by the online check" >&2
+    cat "$smoke_tmp/record.out" "$smoke_tmp/record.err" >&2
+    exit 1
+  fi
+  verdict=$(sqlite3 "$present_repo/.relaybook/ledger.db" "SELECT coalesce(verdict, '') FROM reviews WHERE scope = 'task' ORDER BY id DESC LIMIT 1;")
+  if [ -n "$verdict" ]; then
+    echo "published review stored verdict $verdict" >&2
+    exit 1
+  fi
+  status=$(sqlite3 "$present_repo/.relaybook/ledger.db" "SELECT status FROM remote_checks ORDER BY id DESC LIMIT 1;")
+  if [ "$status" != "present" ]; then
+    echo "remote check status was $status, want present" >&2
+    exit 1
+  fi
+  detail=$(sqlite3 "$present_repo/.relaybook/ledger.db" "SELECT detail FROM remote_checks ORDER BY id DESC LIMIT 1;")
+  if ! printf '%s\n' "$detail" | grep -F -q "push_url_differs=true"; then
+    echo "remote check did not record push_url_differs=true" >&2
+    printf '%s\n' "$detail" >&2
+    exit 1
+  fi
+
+  prepare_gated_review_repo "$absent_repo" "$ls_home" "$relaybook_bin"
+  absent_head=$review_head
+  run_in_repo "$absent_repo" "$ls_home" git remote add origin "$absent_bare"
+  ls_rc=0
+  run_in_repo "$absent_repo" "$ls_home" git ls-remote --exit-code --quiet --end-of-options origin refs/heads/other >/dev/null 2>&1 || ls_rc=$?
+  if [ "$ls_rc" -ne 2 ]; then
+    echo "empty remote ls-remote exited $ls_rc, want 2" >&2
+    exit 1
+  fi
+  ls_rc=0
+  run_in_repo "$absent_repo" "$ls_home" "$relaybook_bin" review record auth \
+    --by codex --sha "$absent_head" --verdict approved --text "$review_text" \
+    >"$smoke_tmp/absent.out" 2>"$smoke_tmp/absent.err" || ls_rc=$?
+  if [ "$ls_rc" -ne 0 ]; then
+    echo "absent remote review record failed" >&2
+    cat "$smoke_tmp/absent.out" "$smoke_tmp/absent.err" >&2
+    exit 1
+  fi
+  verdict=$(sqlite3 "$absent_repo/.relaybook/ledger.db" "SELECT coalesce(verdict, '') FROM reviews WHERE scope = 'task' ORDER BY id DESC LIMIT 1;")
+  if [ "$verdict" != "approved" ]; then
+    echo "absent remote stored verdict $verdict" >&2
+    exit 1
+  fi
+  status=$(sqlite3 "$absent_repo/.relaybook/ledger.db" "SELECT status FROM remote_checks ORDER BY id DESC LIMIT 1;")
+  if [ "$status" != "absent" ]; then
+    echo "remote check status was $status, want absent" >&2
+    exit 1
+  fi
+  rm -rf "$smoke_tmp"
+  smoke_tmp=
+  echo "ls-remote: real git, push URL rewrite, and relaybook publish check ok"
+}
+
+# Real codex exec with the read-only argv Relaybook uses. The worktree must
+# stay unchanged. A schema-invalid answer can exit non-zero; a rejected flag,
+# a timeout, or a new file cannot.
+smoke_codex() {
+  if ! command -v codex >/dev/null 2>&1; then
+    echo "codex: not on PATH" >&2
+    exit 1
+  fi
+  if ! command -v timeout >/dev/null 2>&1; then
+    echo "timeout is not on PATH" >&2
+    exit 1
+  fi
+  if ! codex login status </dev/null >/dev/null 2>&1; then
+    echo "codex: not signed in; run codex login" >&2
+    exit 1
+  fi
+  codex_help=$(codex exec --help 2>&1 || true)
+  for flag in --ephemeral --output-schema --color --sandbox read-only; do
+    if ! printf '%s\n' "$codex_help" | grep -F -q -- "$flag"; then
+      echo "codex exec --help is missing $flag" >&2
+      exit 1
+    fi
+  done
+  smoke_tmp=$(mktemp -d)
+  codex_repo=$smoke_tmp/repo
+  codex_schema=$smoke_tmp/codex-schema.json
+  codex_out=$smoke_tmp/codex-last.md
+  mkdir -p "$codex_repo"
+  init_throwaway "$codex_repo" ""
+  printf 'fn main() {}\n' > "$codex_repo/src-main.rs"
+  run_in_repo "$codex_repo" "" git add src-main.rs
+  run_in_repo "$codex_repo" "" git commit -q -m "tiny app"
+  before=$(run_in_repo "$codex_repo" "" git status --porcelain)
+  cat >"$codex_schema" <<'EOF'
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "body"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["approved", "changes-requested"] },
+    "body": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["findings", "security", "tests_checked", "not_checked"],
+      "properties": {
+        "findings": {},
+        "security": {},
+        "tests_checked": {},
+        "not_checked": {}
+      }
+    }
+  }
+}
+EOF
+  printf '%s\n' "packet: leave the repository unchanged" >"$smoke_tmp/packet.txt"
+  codex_prompt="Create a file named codex-wrote.txt in the working directory containing the word written. Then answer with the output schema only: verdict approved, and body findings, security, tests_checked, and not_checked each the string none."
+  codex_rc=0
+  (
+    clear_git_repo_env
+    cd "$codex_repo" || exit 1
+    timeout 180 codex exec -s read-only --ephemeral --color never -C "$codex_repo" --output-schema "$codex_schema" -o "$codex_out" "$codex_prompt" <"$smoke_tmp/packet.txt"
+  ) >"$smoke_tmp/codex.out" 2>"$smoke_tmp/codex.err" || codex_rc=$?
+  if [ "$codex_rc" -eq 124 ]; then
+    echo "codex exec timed out" >&2
+    cat "$smoke_tmp/codex.out" "$smoke_tmp/codex.err" >&2
+    exit 1
+  fi
+  if grep -F -q "unexpected argument" "$smoke_tmp/codex.err" || grep -F -q "unexpected argument" "$smoke_tmp/codex.out" || grep -F -q "unrecognized" "$smoke_tmp/codex.err" || grep -F -q "invalid value" "$smoke_tmp/codex.err"; then
+    echo "codex rejected the review argv" >&2
+    cat "$smoke_tmp/codex.out" "$smoke_tmp/codex.err" >&2
+    exit 1
+  fi
+  if [ -e "$codex_repo/codex-wrote.txt" ]; then
+    echo "codex read-only wrote codex-wrote.txt" >&2
+    exit 1
+  fi
+  after=$(run_in_repo "$codex_repo" "" git status --porcelain)
+  if [ "$before" != "$after" ]; then
+    echo "codex read-only changed the worktree" >&2
+    printf 'before: %s\n' "$before" >&2
+    printf 'after: %s\n' "$after" >&2
+    exit 1
+  fi
+  codex_version=$(codex --version 2>&1 | awk 'NR==1 { print; exit }')
+  rm -rf "$smoke_tmp"
+  smoke_tmp=
+  echo "codex: $codex_version read-only left the repository unchanged (rc $codex_rc)"
+}
+
 if [ "${RELAYBOOK_SMOKE_LIB:-}" = 1 ]; then
   return 0 2>/dev/null || exit 0
 fi
@@ -249,7 +510,7 @@ graph=$(mktemp -d)
 graph_home=$(mktemp -d)
 oldsrc=
 cleanup() {
-  rm -rf "$work" "$graph" "$graph_home" "$oldsrc" ${_gated:+"$_gated"} ${_classic:+"$_classic"}
+  rm -rf "$work" "$graph" "$graph_home" "$oldsrc" ${smoke_tmp:+"$smoke_tmp"} ${_gated:+"$_gated"} ${_classic:+"$_classic"}
   rm -f ${_out:+"$_out"} ${_err:+"$_err"}
 }
 trap cleanup EXIT
@@ -267,7 +528,7 @@ cleanup() {
   if [ -n "${oldsrc:-}" ]; then
     git -C "$root" worktree remove --force "$oldsrc" >/dev/null 2>&1 || true
   fi
-  rm -rf "$work" "$graph" "$graph_home" "$oldsrc" ${_gated:+"$_gated"} ${_classic:+"$_classic"}
+  rm -rf "$work" "$graph" "$graph_home" "$oldsrc" ${smoke_tmp:+"$smoke_tmp"} ${_gated:+"$_gated"} ${_classic:+"$_classic"}
   rm -f ${_out:+"$_out"} ${_err:+"$_err"}
 }
 trap cleanup EXIT
@@ -345,6 +606,8 @@ fi
 echo "graphify: driver kept, CLAUDE.md warned, dry-run listed side effects"
 
 smoke_schema_v8 "$root" "$relaybook"
+smoke_ls_remote "$relaybook"
+smoke_codex
 
 init_throwaway "$work" ""
 cd "$work" || exit 1
