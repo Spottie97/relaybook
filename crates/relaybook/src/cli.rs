@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use relaybook_core::{Error, Ledger, RECENT_EVENT_LIMIT, Status};
 
+use crate::gate;
 use crate::gitinfo;
 use crate::guide;
 use crate::install;
@@ -12,6 +13,7 @@ use crate::picker::{self, Pick};
 use crate::render;
 use crate::runloop;
 use crate::setup;
+use crate::signoff;
 use crate::uninstall;
 
 pub(crate) fn execute() -> ExitCode {
@@ -37,14 +39,11 @@ pub(crate) fn execute() -> ExitCode {
     }
     match dispatch(cli) {
         Ok(outcome) => {
+            let data = attach_restored_guard(outcome.data);
             if json {
                 print!(
                     "{}",
-                    envelope(
-                        outcome.code == 0,
-                        Some(&outcome.data),
-                        outcome.error.as_deref()
-                    )
+                    envelope(outcome.code == 0, Some(&data), outcome.error.as_deref())
                 );
             } else {
                 print!("{}", outcome.human);
@@ -53,13 +52,36 @@ pub(crate) fn execute() -> ExitCode {
         }
         Err(err) => {
             if json {
-                print!("{}", envelope(false, None, Some(&err.to_string())));
+                print!(
+                    "{}",
+                    envelope(
+                        false,
+                        restored_guard_data().as_ref(),
+                        Some(&err.to_string())
+                    )
+                );
             } else {
                 eprintln!("{err}");
             }
             ExitCode::from(err.code())
         }
     }
+}
+
+fn attach_restored_guard(mut data: serde_json::Value) -> serde_json::Value {
+    if Ledger::reported_restored_guard()
+        && let Some(map) = data.as_object_mut()
+    {
+        map.insert(
+            "ledger_guard".to_string(),
+            serde_json::Value::String("restored".to_string()),
+        );
+    }
+    data
+}
+
+fn restored_guard_data() -> Option<serde_json::Value> {
+    Ledger::reported_restored_guard().then(|| serde_json::json!({ "ledger_guard": "restored" }))
 }
 
 #[derive(Parser)]
@@ -103,6 +125,15 @@ enum Command {
     Report(ReportCmd),
     /// List unreviewed reports.
     Inbox,
+    /// Refresh the graph and record the commit it was built from.
+    #[command(subcommand)]
+    Graph(GraphCmd),
+    /// Hand off a done task or the branch, or record its verdict.
+    #[command(subcommand)]
+    Review(ReviewCmd),
+    /// Sign off the checked-out commit, or show whether it is signed off.
+    #[command(subcommand)]
+    Release(ReleaseCmd),
     /// Print or set manual/auto mode.
     Mode {
         /// `manual` or `auto`. Omit to print the current mode.
@@ -120,9 +151,9 @@ enum Command {
     },
     /// Print mode, limits, and the active run.
     Status,
-    /// Print the planner or executor workflow.
+    /// Print the planner, executor, or reviewer workflow.
     Guide {
-        /// `planner` or `executor`. Omit this to print both.
+        /// `planner`, `executor`, or `reviewer`. Omit this to print all three.
         role: Option<GuideRole>,
     },
     /// Run the auto-mode loop, or stop and complete it.
@@ -298,6 +329,71 @@ enum TaskCmd {
 }
 
 #[derive(Subcommand)]
+enum GraphCmd {
+    /// Run `graphify update .` and record the commit the graph was built from.
+    Refresh {
+        /// `plan`, `implement`, `commit`, `review`, or `release-review`.
+        #[arg(long)]
+        step: String,
+        /// Task slug for `implement`, `commit`, and `review`.
+        #[arg(long)]
+        task: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReviewCmd {
+    /// Hand off one done task, or the branch with `--release`.
+    Start {
+        /// Task slug. Omit this with `--release`.
+        slug: Option<String>,
+        /// Review `merge-base(main, HEAD)..HEAD`.
+        #[arg(long)]
+        release: bool,
+    },
+    /// Record the verdict for the pending task or release review.
+    Record {
+        /// Task slug. Omit this with `--release`.
+        slug: Option<String>,
+        /// Record the branch review instead of one task.
+        #[arg(long)]
+        release: bool,
+        /// Reviewer identity. Must match the `reviewer` setting.
+        #[arg(long)]
+        by: String,
+        /// Full HEAD the review applies to. Must equal the checked-out commit.
+        #[arg(long)]
+        sha: String,
+        /// `approved` or `changes-requested`.
+        #[arg(long, allow_hyphen_values = true)]
+        verdict: String,
+        /// Review body JSON. A release review also includes prd_covered and gaps.
+        #[arg(long, allow_hyphen_values = true)]
+        text: String,
+    },
+    /// Show the latest task review, or the release review with `--release`.
+    Show {
+        /// Task slug. Omit this with `--release`.
+        slug: Option<String>,
+        /// Show the latest release review.
+        #[arg(long)]
+        release: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseCmd {
+    /// Record maintainer sign-off for HEAD. Requires a terminal confirmation.
+    Authorize {
+        /// Full HEAD this sign-off applies to. Must equal the checked-out commit.
+        #[arg(long)]
+        sha: String,
+    },
+    /// Show whether HEAD is release-reviewed or signed off.
+    Status,
+}
+
+#[derive(Subcommand)]
 enum RunAction {
     /// End the active run.
     Stop,
@@ -312,7 +408,14 @@ enum RunAction {
 #[derive(Subcommand)]
 enum ConfigAction {
     /// Change one setting.
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        /// Setting value. A leading dash is part of the value.
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+    },
+    /// Print one setting.
+    Get { key: String },
 }
 
 #[derive(Subcommand)]
@@ -329,6 +432,8 @@ enum GuideRole {
     Planner,
     /// The implementation workflow.
     Executor,
+    /// The Codex review workflow. It does not edit the ledger.
+    Reviewer,
 }
 
 #[derive(Subcommand)]
@@ -548,6 +653,25 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         }
         Command::Report(ReportCmd::Note { by, text }) => add_note(&cwd, &by, text),
         Command::Inbox => show_inbox(&cwd),
+        Command::Graph(GraphCmd::Refresh { step, task }) => {
+            refresh_graph_cmd(&cwd, &step, task.as_deref())
+        }
+        Command::Review(ReviewCmd::Start { slug, release }) => {
+            review_start(&cwd, slug.as_deref(), release)
+        }
+        Command::Review(ReviewCmd::Record {
+            slug,
+            release,
+            by,
+            sha,
+            verdict,
+            text,
+        }) => review_record(&cwd, slug.as_deref(), release, &by, &sha, &verdict, &text),
+        Command::Review(ReviewCmd::Show { slug, release }) => {
+            review_show(&cwd, slug.as_deref(), release)
+        }
+        Command::Release(ReleaseCmd::Authorize { sha }) => release_authorize(&cwd, &sha),
+        Command::Release(ReleaseCmd::Status) => release_status(&cwd),
         Command::Mode { value } => match value {
             Some(value) => set_mode(&cwd, &value),
             None => choose_setting(&cwd, "mode", picker::MODES, set_mode, show_mode),
@@ -558,6 +682,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
         },
         Command::Config { action } => match action {
             Some(ConfigAction::Set { key, value }) => set_config(&cwd, &key, &value),
+            Some(ConfigAction::Get { key }) => get_config(&cwd, &key),
             None => show_config(&cwd),
         },
         Command::Status => show_status(&cwd),
@@ -634,6 +759,7 @@ fn dispatch(cli: Cli) -> Result<Outcome, Fail> {
             let text = guide::render(role.map(|role| match role {
                 GuideRole::Planner => guide::Role::Planner,
                 GuideRole::Executor => guide::Role::Executor,
+                GuideRole::Reviewer => guide::Role::Reviewer,
             }));
             Ok(Outcome {
                 human: text,
@@ -762,10 +888,44 @@ fn list_tasks(cwd: &Path, status: Option<Status>, ready: bool, all: bool) -> Res
 
 fn claim_task(cwd: &Path, slug: &str, by: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let task = ledger.claim_task(slug, by)?;
+    let gated = ledger.settings()?.workflow == "gated";
+    let (task, refresh) = if gated {
+        require_gated_clean_tree(cwd, &ledger)?;
+        let root = gate::repository_root(cwd)?;
+        let anchored = ledger.claim_task_anchored(slug, by, gate::env_run_id(), || {
+            gate::ensure_gated_clean(cwd)?;
+            Ok(gitinfo::verified_head(&root))
+        })?;
+        let refresh = match (anchored.graph_build_id, anchored.base_sha.as_deref()) {
+            (Some(id), Some(head)) => gate::settle_claim_graph(&mut ledger, &root, head, id)?,
+            (None, None) => gate::GraphRefresh {
+                commit_sha: String::new(),
+                graph_sha: None,
+                status: "failed".to_string(),
+                detail: Some(crate::graphify::NO_GRAPH.to_string()),
+            },
+            _ => {
+                return Err(invalid_setting("claim anchor is missing its graph build"));
+            }
+        };
+        (anchored.task, Some(refresh))
+    } else {
+        (ledger.claim_task(slug, by)?, None)
+    };
     let agent = task.claimed_by.clone().unwrap_or_default();
     let human = render::line(&format!("claimed {} by {agent}", task.slug));
-    json_outcome(task_ack(&task), human)
+    let mut data = task_ack(&task);
+    if let Some(refresh) = refresh
+        && let Some(fields) = data.as_object_mut()
+    {
+        let base = if refresh.commit_sha.is_empty() {
+            None
+        } else {
+            Some(refresh.commit_sha.clone())
+        };
+        attach_graph_fields(fields, base, &refresh);
+    }
+    json_outcome(data, human)
 }
 
 fn report_sections(
@@ -808,9 +968,418 @@ fn complete_task(
     sections: Option<relaybook_core::Sections>,
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let task = ledger.finish_task(slug, sections)?;
+    let gated = ledger.settings()?.workflow == "gated";
+    let already_done = gated && gate::task_is_done(&ledger, slug)?;
+    let task = if gated {
+        require_gated_clean_tree(cwd, &ledger)?;
+        let head = gitinfo::verified_head(cwd).ok_or(Error::NoHeadCommit)?;
+        let expected = head.clone();
+        if already_done {
+            ledger.finish_task_with(slug, sections, Some(head.as_str()), move || {
+                gate::recheck_gated_completion(cwd, &expected)
+            })?
+        } else {
+            let (base, graph) = implement_anchor(&ledger, slug)?;
+            ledger.finish_task_anchored(
+                slug,
+                sections,
+                Some(head.as_str()),
+                base.as_deref(),
+                graph.as_deref(),
+                move || gate::recheck_gated_completion(cwd, &expected),
+            )?
+        }
+    } else {
+        let head = gitinfo::head(cwd);
+        ledger.finish_task(slug, sections, head.as_deref())?
+    };
+    // The report row, including commit_sha, is committed before this refresh.
+    if gated && !already_done {
+        gate::record_graph_refresh(&mut ledger, cwd, "commit", Some(task.slug.as_str()))?;
+    }
+    let stored = ledger.report_commit_sha(&task.slug)?;
     let human = render::line(&format!("done {}", task.slug));
-    json_outcome(task_ack(&task), human)
+    let mut data = task_ack(&task);
+    if let Some(fields) = data.as_object_mut() {
+        fields.insert(
+            "commit_sha".to_string(),
+            stored.map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+        if gated {
+            let report = ledger.latest_task_report(&task.slug)?;
+            let (base, graph) = match report {
+                Some(report) => (report.base_sha, report.graph_sha),
+                None => (None, None),
+            };
+            fields.insert("base_sha".to_string(), json_string(base));
+            fields.insert("graph_sha".to_string(), json_string(graph));
+        }
+    }
+    json_outcome(data, human)
+}
+
+fn require_gated_clean_tree(cwd: &Path, ledger: &Ledger) -> Result<(), Fail> {
+    if ledger.settings()?.workflow != "gated" {
+        return Ok(());
+    }
+    gate::ensure_gated_clean(cwd)?;
+    Ok(())
+}
+
+fn refresh_graph_cmd(cwd: &Path, step: &str, task: Option<&str>) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let refresh = gate::record_graph_refresh(&mut ledger, cwd, step, task)?;
+    let human = if refresh.graph_sha.is_some() {
+        render::line(&format!("graph {step} built {}", refresh.commit_sha))
+    } else {
+        render::line(&format!(
+            "graph {step} {}: {}",
+            refresh.status,
+            refresh
+                .detail
+                .as_deref()
+                .unwrap_or(crate::graphify::NO_GRAPH)
+        ))
+    };
+    json_outcome(graph_json(step, task, &refresh), human)
+}
+
+fn review_start(cwd: &Path, slug: Option<&str>, release: bool) -> Result<Outcome, Fail> {
+    match review_subject(slug, release)? {
+        ReviewSubject::Task(slug) => review_start_task(cwd, slug),
+        ReviewSubject::Release => review_start_release(cwd),
+    }
+}
+
+fn review_start_task(cwd: &Path, slug: &str) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let started = gate::review_start_task(&mut ledger, cwd, slug)?;
+    let data = serde_json::json!({
+        "slug": started.slug,
+        "base_sha": started.base_sha,
+        "commit_sha": started.commit_sha,
+        "range": started.range,
+        "graph_sha": started.graph_sha,
+        "graph_status": started.graph_status,
+        "detail": started.detail,
+        "report": started.report,
+        "graph_context": started.graph_context,
+    });
+    json_outcome(data, render::line(&format!("review start {slug}")))
+}
+
+fn review_record(
+    cwd: &Path,
+    slug: Option<&str>,
+    release: bool,
+    by: &str,
+    sha: &str,
+    verdict: &str,
+    text: &str,
+) -> Result<Outcome, Fail> {
+    match review_subject(slug, release)? {
+        ReviewSubject::Task(slug) => review_record_task(cwd, slug, by, sha, verdict, text),
+        ReviewSubject::Release => review_record_release(cwd, by, sha, verdict, text),
+    }
+}
+
+fn review_record_task(
+    cwd: &Path,
+    slug: &str,
+    by: &str,
+    sha: &str,
+    verdict: &str,
+    text: &str,
+) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let review = gate::review_record_task(&mut ledger, cwd, slug, by, sha, verdict, text)?;
+    let stored = review.verdict.clone().unwrap_or_default();
+    json_outcome(review, render::line(&format!("recorded {slug} {stored}")))
+}
+
+enum ReviewSubject<'a> {
+    Task(&'a str),
+    Release,
+}
+
+fn review_subject(slug: Option<&str>, release: bool) -> Result<ReviewSubject<'_>, Fail> {
+    let slug = slug.map(str::trim).filter(|slug| !slug.is_empty());
+    match (slug, release) {
+        (Some(slug), false) => Ok(ReviewSubject::Task(slug)),
+        (None, true) => Ok(ReviewSubject::Release),
+        _ => Err(Fail::Usage("pass a task slug or --release".to_string())),
+    }
+}
+
+fn review_start_release(cwd: &Path) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let started = gate::review_start_release(&mut ledger, cwd)?;
+    let data = serde_json::json!({
+        "slug": serde_json::Value::Null,
+        "base_sha": started.base_sha,
+        "commit_sha": started.commit_sha,
+        "range": started.range,
+        "graph_sha": started.graph_sha,
+        "graph_status": started.graph_status,
+        "detail": started.detail,
+        "tasks": started.tasks,
+        "graph_context": started.graph_context,
+    });
+    json_outcome(data, render::line("review start release"))
+}
+
+fn review_record_release(
+    cwd: &Path,
+    by: &str,
+    sha: &str,
+    verdict: &str,
+    text: &str,
+) -> Result<Outcome, Fail> {
+    let mut ledger = open_ledger(cwd)?;
+    let review = gate::review_record_release(&mut ledger, cwd, by, sha, verdict, text)?;
+    let stored = review.verdict.clone().unwrap_or_default();
+    json_outcome(review, render::line(&format!("recorded release {stored}")))
+}
+
+fn range_text(range: &gitinfo::ReleaseRange) -> String {
+    format!("{}..{}", range.base, range.head)
+}
+
+fn release_authorize(cwd: &Path, sha: &str) -> Result<Outcome, Fail> {
+    let sha = sha.trim();
+    let mut ledger = open_ledger(cwd)?;
+    gate::refuse_pending_rereview(&ledger, sha)?;
+    gate::allow_release_authorize(&ledger)?;
+    let first = gate::prepare_authorize(&ledger, cwd, sha)?;
+    if let gate::PublishScreen::Present(message) =
+        gate::screen_publish(&mut ledger, &first.root, "authorize")?
+    {
+        return Err(invalid_setting(message));
+    }
+    confirm_release(sha)?;
+    let checkout = gate::prepare_authorize(&ledger, cwd, sha)?;
+    match gate::screen_publish(&mut ledger, &checkout.root, "authorize")? {
+        gate::PublishScreen::Present(message) => return Err(invalid_setting(message)),
+        gate::PublishScreen::Unknown { check_id, .. } => {
+            confirm_without_remote(sha)?;
+            ledger.set_remote_check_override(check_id)?;
+        }
+        gate::PublishScreen::Clear => {}
+    }
+    let root = checkout.root.clone();
+    let sha_owned = sha.to_string();
+    let commits = checkout.range.commits.clone();
+    let (method, evidence) = signoff_record(&ledger, &checkout.root, sha)?;
+    let run_id = gate::gate_release_run_id(&ledger, &checkout.branch)?.or_else(gate::env_run_id);
+    let authorization = ledger.authorize_release_with(
+        &checkout.branch,
+        sha,
+        &checkout.range.head,
+        "maintainer",
+        run_id,
+        Some(&commits),
+        Some(method),
+        evidence.as_deref(),
+        move || gate::recheck_release_authorize(&root, &sha_owned),
+    )?;
+    json_outcome(authorization, render::line(&format!("authorized {sha}")))
+}
+
+fn confirm_without_remote(sha: &str) -> Result<(), Fail> {
+    signoff::confirm(&signoff::Challenge {
+        ask: "Proceed without remote verification?",
+        verb: "offline",
+        token: signoff::token_from_sha(sha)?,
+        missing_tty: "proceeding without remote verification requires confirmation at a TTY",
+        declined: "proceeding without remote verification was not confirmed",
+    })?;
+    Ok(())
+}
+
+fn confirm_release(sha: &str) -> Result<(), Fail> {
+    signoff::confirm(&signoff::Challenge {
+        ask: "Authorize this release?",
+        verb: "authorize",
+        token: signoff::token_from_sha(sha)?,
+        missing_tty: "release authorize requires confirmation at a TTY",
+        declined: "release was not confirmed",
+    })?;
+    Ok(())
+}
+
+fn signoff_record(
+    ledger: &Ledger,
+    root: &std::path::Path,
+    sha: &str,
+) -> Result<(&'static str, Option<String>), Fail> {
+    if ledger.settings()?.signoff == "signed-tag" {
+        Ok((
+            signoff::METHOD_SIGNED,
+            Some(signoff::verify_signoff_tag(root, sha)?),
+        ))
+    } else {
+        Ok((signoff::METHOD_TYPED, None))
+    }
+}
+
+fn release_status(cwd: &Path) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    if ledger.settings()?.workflow != "gated" {
+        return Err(invalid_setting("release status requires workflow=gated"));
+    }
+    let root = gitinfo::toplevel(cwd)
+        .ok_or_else(|| invalid_setting("release status requires a git repository"))?;
+    let branch = match gitinfo::branch(&root).as_deref() {
+        Some(name) if name != "HEAD" => Some(name.to_string()),
+        _ => None,
+    };
+    let range = gitinfo::release_range(&root).map_err(invalid_setting)?;
+    let life = ledger.lifecycle(&range.head, &range.commits)?;
+    let release = life.release.map(|phase| phase.as_str());
+    let tasks: Vec<serde_json::Value> = life
+        .tasks
+        .iter()
+        .map(|task| {
+            serde_json::json!({
+                "slug": task.slug,
+                "phase": task.phase.map(|phase| phase.as_str()),
+            })
+        })
+        .collect();
+    let review = ledger.release_review_at(&range.head)?;
+    let authorization = ledger.authorization_at(&range.head)?;
+    let remote = remote_status(&ledger)?;
+    let label = release.unwrap_or("unsigned");
+    let data = serde_json::json!({
+        "branch": branch,
+        "base_sha": range.base,
+        "commit_sha": range.head,
+        "range": range_text(&range),
+        "release": release,
+        "tasks": tasks,
+        "review": review,
+        "authorization": authorization,
+        "remote": remote,
+    });
+    let remote_line = match remote.get("status").and_then(serde_json::Value::as_str) {
+        Some(status) => format!(
+            "remote {} {status}",
+            remote["remote_check"].as_str().unwrap_or("online")
+        ),
+        None => format!(
+            "remote {}",
+            remote["remote_check"].as_str().unwrap_or("online")
+        ),
+    };
+    json_outcome(
+        data,
+        format!(
+            "{}{}{}",
+            render::line(&format!("release {label} {}", range.head)),
+            render::line(&remote_line),
+            review_extra_lines(review.as_ref())
+        ),
+    )
+}
+
+fn review_show(cwd: &Path, slug: Option<&str>, release: bool) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let review = if release {
+        ledger.latest_review("release", None)?
+    } else {
+        let slug = slug.ok_or_else(|| invalid_setting("review show requires a task slug"))?;
+        ledger.latest_review("task", Some(slug))?
+    };
+    let Some(review) = review else {
+        return Err(invalid_setting("no review"));
+    };
+    let human = format!(
+        "{}{}",
+        render::line(&format!(
+            "review {} {}",
+            review.reviewer,
+            review.verdict.as_deref().unwrap_or("pending")
+        )),
+        review_extra_lines(Some(&review))
+    );
+    json_outcome(review, human)
+}
+
+fn review_extra_lines(review: Option<&relaybook_core::Review>) -> String {
+    let Some(review) = review else {
+        return String::new();
+    };
+    let mut out = String::new();
+    if let Some(model) = &review.reviewer_model {
+        out.push_str(&render::line(&format!("reviewer_model {model}")));
+    }
+    if let Some(reason) = &review.fallback_reason {
+        out.push_str(&render::line(&format!("fallback_reason {reason}")));
+    }
+    if let Some(id) = review.rereview_of {
+        out.push_str(&render::line(&format!("rereview_of {id}")));
+    }
+    out
+}
+
+fn remote_status(ledger: &Ledger) -> Result<serde_json::Value, Fail> {
+    let settings = ledger.settings()?;
+    let latest = ledger.latest_remote_check()?;
+    let detail = latest.as_ref().and_then(|row| row.detail.clone());
+    let push_url_differs = detail
+        .as_deref()
+        .is_some_and(|text| text.lines().any(|line| line == "push_url_differs=true"));
+    Ok(serde_json::json!({
+        "remote_check": settings.remote_check,
+        "status": latest.as_ref().map(|row| row.status.clone()),
+        "remote": latest.as_ref().and_then(|row| row.remote.clone()),
+        "push_url_differs": push_url_differs,
+        "override": latest.as_ref().is_some_and(|row| row.overridden),
+        "detail": detail,
+    }))
+}
+
+fn implement_anchor(ledger: &Ledger, slug: &str) -> Result<(Option<String>, Option<String>), Fail> {
+    match ledger.claim_anchor(slug)? {
+        Some(anchor) => Ok((anchor.base_sha, anchor.graph_sha)),
+        None => Ok((None, None)),
+    }
+}
+
+fn invalid_setting(message: impl Into<String>) -> Fail {
+    Fail::Core(Error::InvalidSetting(message.into()))
+}
+
+fn graph_json(step: &str, task: Option<&str>, refresh: &gate::GraphRefresh) -> serde_json::Value {
+    serde_json::json!({
+        "step": step,
+        "task": task,
+        "commit_sha": refresh.commit_sha,
+        "graph_sha": refresh.graph_sha,
+        "status": refresh.status,
+        "detail": refresh.detail,
+    })
+}
+
+fn attach_graph_fields(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    base_sha: Option<String>,
+    refresh: &gate::GraphRefresh,
+) {
+    fields.insert("base_sha".to_string(), json_string(base_sha));
+    fields.insert(
+        "graph_sha".to_string(),
+        json_string(refresh.graph_sha.clone()),
+    );
+    fields.insert(
+        "graph_status".to_string(),
+        serde_json::Value::String(refresh.status.clone()),
+    );
+    fields.insert("detail".to_string(), json_string(refresh.detail.clone()));
+}
+
+fn json_string(value: Option<String>) -> serde_json::Value {
+    value.map_or(serde_json::Value::Null, serde_json::Value::String)
 }
 
 fn reopen_task(cwd: &Path, slug: &str, reason: &str) -> Result<Outcome, Fail> {
@@ -834,7 +1403,13 @@ fn accept_report(
     all: bool,
 ) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
+    let gated = ledger.settings()?.workflow == "gated";
     if all {
+        if gated {
+            return Err(invalid_setting(
+                "report accept --all is unavailable when workflow=gated",
+            ));
+        }
         let count = ledger.accept_all_reports()?;
         return json_outcome(
             serde_json::json!({ "accepted": count }),
@@ -851,7 +1426,18 @@ fn accept_report(
     let Some(slug) = slug else {
         return Err(Fail::Usage("pass a slug, --note, or --all".to_string()));
     };
-    ledger.accept_report(slug)?;
+    gate::refuse_live_task(&ledger, slug)?;
+    if gated {
+        require_gated_clean_tree(cwd, &ledger)?;
+        let head = gitinfo::verified_head(cwd)
+            .ok_or_else(|| invalid_setting("report accept requires a commit at HEAD"))?;
+        let expected = head.clone();
+        ledger.accept_gated_report(slug, &head, move || {
+            gate::recheck_gated_completion(cwd, &expected)
+        })?;
+    } else {
+        ledger.accept_report(slug)?;
+    }
     json_outcome(
         serde_json::json!({ "slug": slug, "verdict": "accepted" }),
         render::line(&format!("accepted {slug}")),
@@ -913,7 +1499,7 @@ fn hook_prompt() {
         return;
     };
     if count > 0 {
-        println!("{count} new Cursor reports: relaybook inbox");
+        println!("{count} new reports: relaybook inbox");
     }
     if let Ok(Some(line)) = ledger.hook_wait_line() {
         println!("{line}");
@@ -997,23 +1583,134 @@ fn show_config(cwd: &Path) -> Result<Outcome, Fail> {
     json_outcome(settings.clone(), relaybook_core::format_config(&settings))
 }
 
+fn confirm_leave_gated(cwd: &Path) -> Result<(), Fail> {
+    signoff::confirm(&signoff::Challenge {
+        ask: "Leave gated workflow?",
+        verb: "classic",
+        token: signoff::confirmation_token(cwd),
+        missing_tty: "leaving workflow=gated requires confirmation at a TTY",
+        declined: "leaving workflow=gated was not confirmed",
+    })?;
+    Ok(())
+}
+
+fn workflow_leave_confirmed(
+    ledger: &Ledger,
+    cwd: &Path,
+    key: &str,
+    value: &str,
+) -> Result<bool, Fail> {
+    // `settings::set` trims before it validates and stores the value.
+    if key != "workflow" || value.trim() != "classic" || ledger.settings()?.workflow != "gated" {
+        return Ok(false);
+    }
+    confirm_leave_gated(cwd)?;
+    Ok(true)
+}
+
+fn remote_local_confirmed(
+    ledger: &Ledger,
+    cwd: &Path,
+    key: &str,
+    value: &str,
+) -> Result<bool, Fail> {
+    if key != "remote_check"
+        || value.trim() != "local"
+        || ledger.settings()?.remote_check == "local"
+    {
+        return Ok(false);
+    }
+    signoff::confirm(&signoff::Challenge {
+        ask: "Set remote_check=local?",
+        verb: "local",
+        token: signoff::confirmation_token(cwd),
+        missing_tty: "remote_check=local requires confirmation at a TTY",
+        declined: "remote_check=local was not confirmed",
+    })?;
+    Ok(true)
+}
+
+fn signoff_change_confirmed(
+    ledger: &Ledger,
+    cwd: &Path,
+    key: &str,
+    value: &str,
+) -> Result<bool, Fail> {
+    if key != "signoff" {
+        return Ok(false);
+    }
+    let next = value.trim();
+    if next != "typed" && next != "signed-tag" {
+        return Ok(false);
+    }
+    if ledger.settings()?.signoff == next {
+        return Ok(false);
+    }
+    signoff::confirm(&signoff::Challenge {
+        ask: "Change signoff?",
+        verb: "signoff",
+        token: signoff::confirmation_token(cwd),
+        missing_tty: "changing signoff requires confirmation at a TTY",
+        declined: "signoff change was not confirmed",
+    })?;
+    Ok(true)
+}
+
+fn fallback_change_confirmed(
+    ledger: &Ledger,
+    cwd: &Path,
+    key: &str,
+    value: &str,
+) -> Result<bool, Fail> {
+    let settings = ledger.settings()?;
+    let (ask, verb) = match key {
+        "review_fallback" if value.trim() == "sonnet" && settings.review_fallback != "sonnet" => {
+            ("Allow Sonnet to review when Codex is limited?", "sonnet")
+        }
+        "fallback_rereview" if value.trim() == "off" && settings.fallback_rereview != "off" => {
+            ("Turn off Codex re-review before release?", "off")
+        }
+        _ => return Ok(false),
+    };
+    if !ledger.live_gated_runs()?.is_empty() {
+        return Err(invalid_setting("a gated run is already live"));
+    }
+    signoff::confirm(&signoff::Challenge {
+        ask,
+        verb,
+        token: signoff::confirmation_token(cwd),
+        missing_tty: "loosening reviewer fallback requires confirmation at a TTY",
+        declined: "reviewer fallback change was not confirmed",
+    })?;
+    Ok(true)
+}
+
 fn set_config(cwd: &Path, key: &str, value: &str) -> Result<Outcome, Fail> {
     let mut ledger = open_ledger(cwd)?;
-    let settings = ledger.set_setting(key, value)?;
-    let shown = match key {
-        "est_cost_cap_usd" => settings
-            .est_cost_cap_usd
-            .clone()
-            .unwrap_or_else(|| "unset".to_string()),
-        "mode" => settings.mode.clone(),
-        "gates" => settings.gates.clone(),
-        "max_cycles" => settings.max_cycles.to_string(),
-        "max_reopens_per_task" => settings.max_reopens_per_task.to_string(),
-        "max_agent_calls" => settings.max_agent_calls.to_string(),
-        "cursor_timeout_min" => settings.cursor_timeout_min.to_string(),
-        _ => value.to_string(),
-    };
+    if key == "workflow" {
+        gate::refuse_live_workflow(&ledger)?;
+    }
+    let leave_confirmed = workflow_leave_confirmed(&ledger, cwd, key, value)?;
+    let remote_confirmed = remote_local_confirmed(&ledger, cwd, key, value)?;
+    let signoff_confirmed = signoff_change_confirmed(&ledger, cwd, key, value)?;
+    let fallback_confirmed = fallback_change_confirmed(&ledger, cwd, key, value)?;
+    let settings = ledger.set_setting_with(
+        key,
+        value,
+        leave_confirmed || remote_confirmed || signoff_confirmed || fallback_confirmed,
+    )?;
+    let shown = relaybook_core::configured_value(&settings, key)?;
     json_outcome(settings, render::line(&format!("{key} {shown}")))
+}
+
+fn get_config(cwd: &Path, key: &str) -> Result<Outcome, Fail> {
+    let ledger = open_ledger(cwd)?;
+    let settings = ledger.settings()?;
+    let shown = relaybook_core::configured_value(&settings, key)?;
+    json_outcome(
+        serde_json::json!({ key: shown }),
+        render::line(&format!("{key} {shown}")),
+    )
 }
 
 fn show_status(cwd: &Path) -> Result<Outcome, Fail> {

@@ -3,10 +3,31 @@ use serde::Serialize;
 
 use crate::error::Error;
 
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-6.1-sol";
+
+/// Pinned Claude API id for the fallback reviewer. Not a setting.
+pub const SONNET_REVIEW_MODEL: &str = "claude-sonnet-5-5";
+pub const CODEX_MODEL_MAX_LEN: usize = 64;
+pub const DEFAULT_CODEX_BACKOFF_MIN: i64 = 60;
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Snapshot {
     pub mode: String,
     pub gates: String,
+    pub reviewer: String,
+    /// `read-only` or `isolated`. Only gated Codex reviews read this.
+    pub codex_sandbox: String,
+    /// Model passed to `codex exec -m`. Default `gpt-6.1-sol`.
+    pub codex_model: String,
+    /// `off` or `sonnet`. Default `off`. The Sonnet model is not configurable.
+    pub review_fallback: String,
+    /// Minutes to wait after a classified Codex limit. 5 to 1440, default 60.
+    pub codex_backoff_min: i64,
+    /// `before-release` or `off`. Default `before-release`.
+    pub fallback_rereview: String,
+    pub workflow: String,
+    pub remote_check: String,
+    pub signoff: String,
     pub max_cycles: i64,
     pub max_reopens_per_task: i64,
     pub max_agent_calls: i64,
@@ -28,6 +49,23 @@ pub struct RunView {
     pub status: String,
 }
 
+/// One Claude approval that still needs an approved Codex re-review.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PendingRereview {
+    pub review_id: i64,
+    pub slug: Option<String>,
+}
+
+/// Gated reviewer state. Omitted from classic status JSON.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReviewerStatus {
+    pub active: String,
+    /// `available`, `limited until <t>`, or `probing`.
+    pub codex: String,
+    pub fallback: String,
+    pub pending_rereviews: Vec<PendingRereview>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatusView {
     pub mode: String,
@@ -39,6 +77,9 @@ pub struct StatusView {
     pub est_cost_cap_usd: Option<String>,
     pub run: Option<RunView>,
     pub waiting_on: Option<String>,
+    /// Present only when `workflow=gated`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<ReviewerStatus>,
 }
 
 struct RunRow {
@@ -57,6 +98,15 @@ pub fn load(conn: &Connection) -> Result<Snapshot, Error> {
     Ok(Snapshot {
         mode: value_or(conn, "mode", "manual")?,
         gates: value_or(conn, "gates", "plan")?,
+        reviewer: value_or(conn, "reviewer", "claude")?,
+        codex_sandbox: value_or(conn, "codex_sandbox", "read-only")?,
+        codex_model: value_or(conn, "codex_model", DEFAULT_CODEX_MODEL)?,
+        review_fallback: value_or(conn, "review_fallback", "off")?,
+        codex_backoff_min: number_or(conn, "codex_backoff_min", DEFAULT_CODEX_BACKOFF_MIN)?,
+        fallback_rereview: value_or(conn, "fallback_rereview", "before-release")?,
+        workflow: value_or(conn, "workflow", "classic")?,
+        remote_check: value_or(conn, "remote_check", "online")?,
+        signoff: value_or(conn, "signoff", "typed")?,
         max_cycles: number_or(conn, "max_cycles", 20)?,
         max_reopens_per_task: number_or(conn, "max_reopens_per_task", 2)?,
         max_agent_calls: number_or(conn, "max_agent_calls", 60)?,
@@ -74,7 +124,7 @@ pub fn set(conn: &Connection, key: &str, value: &str) -> Result<Snapshot, Error>
         conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
         return load(conn);
     }
-    let stored = validate(key, value)?;
+    let stored = validate(conn, key, value)?;
     let ts = now(conn)?;
     conn.execute(
         "INSERT INTO settings (key, value, updated_at, updated_by)
@@ -114,6 +164,7 @@ pub fn status(conn: &Connection) -> Result<StatusView, Error> {
             status: row.status,
         }),
         waiting_on,
+        reviewer: None,
     })
 }
 
@@ -130,9 +181,18 @@ pub fn hook_wait_line(conn: &Connection) -> Result<Option<String>, Error> {
 
 pub fn format_config(settings: &Snapshot) -> String {
     format!(
-        "mode {}\ngates {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
+        "mode {}\ngates {}\nreviewer {}\ncodex_sandbox {}\ncodex_model {}\nreview_fallback {}\ncodex_backoff_min {}\nfallback_rereview {}\nworkflow {}\nremote_check {}\nsignoff {}\nmax_cycles {}\nmax_reopens_per_task {}\nmax_agent_calls {}\ncursor_timeout_min {}\nest_cost_cap_usd {}\n",
         settings.mode,
         settings.gates,
+        settings.reviewer,
+        settings.codex_sandbox,
+        settings.codex_model,
+        settings.review_fallback,
+        settings.codex_backoff_min,
+        settings.fallback_rereview,
+        settings.workflow,
+        settings.remote_check,
+        settings.signoff,
         settings.max_cycles,
         settings.max_reopens_per_task,
         settings.max_agent_calls,
@@ -174,6 +234,18 @@ pub fn format_status(view: &StatusView) -> String {
     }
     if let Some(waiting) = &view.waiting_on {
         writeln_line(&mut out, &format!("waiting on {waiting}"));
+    }
+    if let Some(reviewer) = &view.reviewer {
+        writeln_line(
+            &mut out,
+            &format!(
+                "reviewer active {} codex {} fallback {} pending {}",
+                reviewer.active,
+                reviewer.codex,
+                reviewer.fallback,
+                reviewer.pending_rereviews.len()
+            ),
+        );
     }
     out
 }
@@ -259,10 +331,29 @@ fn active_run(conn: &Connection) -> Result<Option<RunRow>, Error> {
     Ok(row)
 }
 
-fn validate(key: &str, value: &str) -> Result<String, Error> {
-    match key {
-        "mode" => one_of(key, value, &["manual", "auto"]),
-        "gates" => one_of(key, value, &["none", "plan", "plan,review"]),
+fn validate(conn: &Connection, key: &str, value: &str) -> Result<String, Error> {
+    let stored = match key {
+        "mode" => one_of(key, value, &["manual", "auto"])?,
+        "gates" => one_of(key, value, &["none", "plan", "plan,review"])?,
+        "reviewer" => one_of(key, value, &["claude", "codex"])?,
+        "codex_sandbox" => one_of(key, value, &["read-only", "isolated"])?,
+        "codex_model" => parse_codex_model(value)?,
+        "review_fallback" => one_of(key, value, &["off", "sonnet"])?,
+        "codex_backoff_min" => {
+            let parsed = value
+                .parse::<i64>()
+                .map_err(|_| Error::InvalidSetting(format!("invalid {key}: {value}")))?;
+            if !(5..=1440).contains(&parsed) {
+                return Err(Error::InvalidSetting(
+                    "codex_backoff_min must be from 5 to 1440".to_string(),
+                ));
+            }
+            parsed.to_string()
+        }
+        "fallback_rereview" => one_of(key, value, &["before-release", "off"])?,
+        "workflow" => one_of(key, value, &["classic", "gated"])?,
+        "remote_check" => one_of(key, value, &["online", "local"])?,
+        "signoff" => one_of(key, value, &["typed", "signed-tag"])?,
         "max_cycles" | "max_reopens_per_task" | "max_agent_calls" | "cursor_timeout_min" => {
             let parsed = value
                 .parse::<i64>()
@@ -270,7 +361,7 @@ fn validate(key: &str, value: &str) -> Result<String, Error> {
             if parsed < 1 {
                 return Err(Error::InvalidSetting(format!("{key} must be at least 1")));
             }
-            Ok(parsed.to_string())
+            parsed.to_string()
         }
         "est_cost_cap_usd" => {
             let parsed = value
@@ -281,10 +372,33 @@ fn validate(key: &str, value: &str) -> Result<String, Error> {
                     "est_cost_cap_usd must be greater than 0".to_string(),
                 ));
             }
-            Ok(format!("{parsed:.2}"))
+            format!("{parsed:.2}")
         }
-        _ => Err(Error::InvalidSetting(format!("unknown setting: {key}"))),
+        _ => return Err(Error::InvalidSetting(format!("unknown setting: {key}"))),
+    };
+    if key == "reviewer" || key == "workflow" {
+        require_codex_for_gated(conn, key, &stored)?;
     }
+    Ok(stored)
+}
+
+fn require_codex_for_gated(conn: &Connection, key: &str, stored: &str) -> Result<(), Error> {
+    let reviewer = if key == "reviewer" {
+        stored.to_string()
+    } else {
+        value_or(conn, "reviewer", "claude")?
+    };
+    let workflow = if key == "workflow" {
+        stored.to_string()
+    } else {
+        value_or(conn, "workflow", "classic")?
+    };
+    if workflow == "gated" && reviewer != "codex" {
+        return Err(Error::InvalidSetting(
+            "workflow=gated requires reviewer=codex".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<String, Error> {
@@ -292,6 +406,56 @@ fn one_of(key: &str, value: &str, allowed: &[&str]) -> Result<String, Error> {
         Ok(value.to_string())
     } else {
         Err(Error::InvalidSetting(format!("invalid {key}: {value}")))
+    }
+}
+
+/// Accept a Codex model that can be passed as one argv value.
+///
+/// Non-empty after trim, no leading `-`, at most 64 bytes, and only
+/// `A-Za-z0-9._:-`. That keeps `-m` from becoming another flag.
+pub fn parse_codex_model(value: &str) -> Result<String, Error> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(Error::InvalidSetting("codex_model is required".to_string()));
+    }
+    if value.len() > CODEX_MODEL_MAX_LEN {
+        return Err(Error::InvalidSetting(
+            "codex_model must be at most 64 characters".to_string(),
+        ));
+    }
+    let allowed = value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '-'));
+    if value.starts_with('-') || !allowed {
+        return Err(Error::InvalidSetting(format!(
+            "invalid codex_model: {value}"
+        )));
+    }
+    Ok(value.to_string())
+}
+
+pub fn configured_value(settings: &Snapshot, key: &str) -> Result<String, Error> {
+    match key {
+        "mode" => Ok(settings.mode.clone()),
+        "gates" => Ok(settings.gates.clone()),
+        "reviewer" => Ok(settings.reviewer.clone()),
+        "codex_sandbox" => Ok(settings.codex_sandbox.clone()),
+        "codex_model" => Ok(settings.codex_model.clone()),
+        "review_fallback" => Ok(settings.review_fallback.clone()),
+        "codex_backoff_min" => Ok(settings.codex_backoff_min.to_string()),
+        "fallback_rereview" => Ok(settings.fallback_rereview.clone()),
+        "workflow" => Ok(settings.workflow.clone()),
+        "remote_check" => Ok(settings.remote_check.clone()),
+        "signoff" => Ok(settings.signoff.clone()),
+        "max_cycles" => Ok(settings.max_cycles.to_string()),
+        "max_reopens_per_task" => Ok(settings.max_reopens_per_task.to_string()),
+        "max_agent_calls" => Ok(settings.max_agent_calls.to_string()),
+        "cursor_timeout_min" => Ok(settings.cursor_timeout_min.to_string()),
+        "est_cost_cap_usd" => Ok(settings
+            .est_cost_cap_usd
+            .clone()
+            .unwrap_or_else(|| "unset".to_string())),
+        _ => Err(Error::InvalidSetting(format!("unknown setting: {key}"))),
     }
 }
 
@@ -324,4 +488,29 @@ fn now(conn: &Connection) -> Result<String, Error> {
         row.get(0)
     })?;
     Ok(ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_CODEX_MODEL, parse_codex_model};
+
+    #[test]
+    fn codex_model_accepts_the_default_and_rejects_argv_injection() {
+        assert_eq!(
+            parse_codex_model("  gpt-6.1-sol  ").expect("trim"),
+            DEFAULT_CODEX_MODEL
+        );
+        assert_eq!(
+            parse_codex_model("openai:gpt-6.1-sol").expect("colon"),
+            "openai:gpt-6.1-sol"
+        );
+        assert!(parse_codex_model("").is_err());
+        assert!(parse_codex_model("   ").is_err());
+        assert!(parse_codex_model("-m").is_err());
+        assert!(parse_codex_model("--dangerously-bypass-approvals-and-sandbox").is_err());
+        assert!(parse_codex_model("gpt 6").is_err());
+        assert!(parse_codex_model("model/name").is_err());
+        assert!(parse_codex_model(&"a".repeat(65)).is_err());
+        assert_eq!(parse_codex_model(&"a".repeat(64)).expect("bound").len(), 64);
+    }
 }

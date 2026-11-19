@@ -18,6 +18,17 @@ const GUARD_PREFIX: &str = "command -v graphify >/dev/null 2>&1 && graphify ";
 const POWERSHELL_GUARD_PREFIX: &str = "if (Get-Command graphify -ErrorAction SilentlyContinue) { ";
 const GRAPHIFY_NAME: &str = "graphify graph.json union merge";
 const GRAPHIFY_DRIVER: &str = "graphify merge-driver %O %A %B";
+const GRAPHIFY_UNINSTALL: &[(&str, &str)] = &[
+    (
+        "claude uninstall",
+        "removes the Graphify section of CLAUDE.md and Graphify hooks from .claude/settings.json",
+    ),
+    ("cursor uninstall", "deletes .cursor/rules/graphify.mdc"),
+    (
+        "hook uninstall",
+        "removes Graphify git hooks, removes graphify-out/graph.json merge=graphify from .gitattributes, and unsets merge.graphify.*",
+    ),
+];
 
 pub(crate) struct Options {
     pub yes: bool,
@@ -143,10 +154,10 @@ fn planned(root: &Path, manifest: Option<&manifest::Manifest>, graphify: bool) -
         changes.extend(plan_dirs(root, manifest));
     }
     if graphify {
-        for command in ["claude uninstall", "cursor uninstall", "hook uninstall"] {
+        for &(command, effect) in GRAPHIFY_UNINSTALL {
             let item = format!("graphify {command}");
             if crate::graphify::installed() {
-                changes.push(change(item, "removed", "graphify uninstaller"));
+                changes.push(change(item, "removed", effect));
             } else {
                 changes.push(change(item, "skipped", "graphify is not on PATH"));
             }
@@ -831,7 +842,7 @@ fn active_run(root: &Path) -> Result<bool, String> {
         .is_some())
 }
 
-fn confirm(prompt: &str) -> Result<bool, String> {
+pub(crate) fn confirm(prompt: &str) -> Result<bool, String> {
     if !io::stdin().is_terminal() {
         println!("{prompt} re-run with --yes");
         return Ok(false);

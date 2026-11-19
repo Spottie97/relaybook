@@ -146,6 +146,9 @@ auto_reviewer=$(wc -c < "$root/crates/relaybook/templates/auto-reviewer.md" | tr
 auto_executor=$(wc -c < "$root/crates/relaybook/templates/auto-executor.md" | tr -d ' ')
 claude_command=$(wc -c < "$root/crates/relaybook/templates/claude-command.md" | tr -d ' ')
 cursor_command=$(wc -c < "$root/crates/relaybook/templates/cursor-command.md" | tr -d ' ')
+guide_planner=$(wc -c < "$root/crates/relaybook/templates/guide-planner.md" | tr -d ' ')
+guide_executor=$(wc -c < "$root/crates/relaybook/templates/guide-executor.md" | tr -d ' ')
+guide_reviewer=$(wc -c < "$root/crates/relaybook/templates/guide-reviewer.md" | tr -d ' ')
 printf '%-32s %8s bytes %8s est\n' planner-block "$planner" "$((planner / 4))"
 printf '%-32s %8s bytes %8s est\n' executor-block "$executor" "$((executor / 4))"
 printf '%-32s %8s bytes %8s est\n' auto-planner "$auto_planner" "$((auto_planner / 4))"
@@ -153,6 +156,9 @@ printf '%-32s %8s bytes %8s est\n' auto-reviewer "$auto_reviewer" "$((auto_revie
 printf '%-32s %8s bytes %8s est\n' auto-executor "$auto_executor" "$((auto_executor / 4))"
 printf '%-32s %8s bytes %8s est\n' claude-command "$claude_command" "$((claude_command / 4))"
 printf '%-32s %8s bytes %8s est\n' cursor-command "$cursor_command" "$((cursor_command / 4))"
+printf '%-32s %8s bytes %8s est\n' guide-planner "$guide_planner" "$((guide_planner / 4))"
+printf '%-32s %8s bytes %8s est\n' guide-executor "$guide_executor" "$((guide_executor / 4))"
+printf '%-32s %8s bytes %8s est\n' guide-reviewer "$guide_reviewer" "$((guide_reviewer / 4))"
 
 if [ "$check" -eq 1 ]; then
   if [ "$planner" -gt 1000 ] || [ "$executor" -gt 1000 ]; then
@@ -169,6 +175,12 @@ if [ "$check" -eq 1 ]; then
     echo "over budget: a slash command exceeds 1500 bytes" >&2
     over=1
   fi
+  for guide in "$guide_planner" "$guide_executor" "$guide_reviewer"; do
+    if [ "$guide" -gt 4000 ]; then
+      echo "over budget: a guide exceeds 4000 bytes" >&2
+      over=1
+    fi
+  done
   if command -v rtk >/dev/null 2>&1; then
     rtk_out="$work/rtk-out"
     if rtk rewrite "relaybook context" >"$rtk_out" 2>/dev/null; then

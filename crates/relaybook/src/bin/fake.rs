@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -15,6 +15,7 @@ fn main() {
         "gh" => gh(&args),
         "claude" => claude(&args),
         "cursor-agent" | "agent" => cursor(&args),
+        "codex" => codex(&args),
         other => {
             eprintln!("unknown fake role {other}");
             std::process::exit(1);
@@ -32,11 +33,27 @@ fn role_name() -> String {
         .unwrap_or_else(|| "fake".to_string())
 }
 
+fn codex_kind() -> String {
+    env::var("RELAYBOOK_FAKE_CODEX_KIND").unwrap_or_else(|_| kind())
+}
+
 fn kind() -> String {
     env::var("RELAYBOOK_FAKE_KIND").unwrap_or_default()
 }
 
+/// Planner and executor skip their `edit` and `tag` side effects. Codex still
+/// performs the kind. Classic tests leave this unset.
+fn reviewer_only() -> bool {
+    env::var("RELAYBOOK_FAKE_REVIEWER_ONLY").ok().as_deref() == Some("1")
+}
+
 fn graphify(args: &[String]) {
+    if let Ok(path) = env::var("GRAPHIFY_CWD_LOG") {
+        let cwd = env::current_dir()
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
+        append(&path, &cwd);
+    }
     if env::var("RELAYBOOK_FAKE_GRAPHIFY").ok().as_deref() == Some("claude-settings")
         && args.first().map(String::as_str) == Some("claude")
     {
@@ -50,10 +67,47 @@ fn graphify(args: &[String]) {
     if let Ok(log) = env::var("GRAPHIFY_LOG") {
         append(&log, &args.join(" "));
     }
+    match env::var("RELAYBOOK_FAKE_GRAPHIFY").ok().as_deref() {
+        Some("graph") => {
+            if args.first().map(String::as_str) == Some("update") {
+                write_graph();
+            }
+            return;
+        }
+        Some("affected-large") => {
+            if args.first().map(String::as_str) == Some("update") {
+                write_graph();
+            }
+            if args.first().map(String::as_str) == Some("affected") {
+                print!("{}", "a".repeat(5000));
+            }
+            return;
+        }
+        Some("fail") => {
+            eprintln!("boom");
+            std::process::exit(1);
+        }
+        Some("hold") => {
+            if args.first().map(String::as_str) == Some("update") && !wait_for_graphify_hold() {
+                eprintln!("graphify hold timed out");
+                std::process::exit(98);
+            }
+            if args.first().map(String::as_str) == Some("update") {
+                write_graph();
+            }
+            return;
+        }
+        _ => {}
+    }
     eprintln!("boom");
     if sibling_fail() {
         std::process::exit(1);
     }
+}
+
+fn write_graph() {
+    let _ = fs::create_dir_all("graphify-out");
+    let _ = fs::write("graphify-out/graph.json", "{}\n");
 }
 
 fn rtk(args: &[String]) {
@@ -78,6 +132,10 @@ fn claude(args: &[String]) {
         println!("logged in");
         return;
     }
+    if args.iter().any(|arg| arg == "--tools") {
+        claude_reviewer(args);
+        return;
+    }
     if let Ok(log) = env::var("LOG") {
         append(
             &PathBuf::from(log).join("claude.args").display().to_string(),
@@ -85,7 +143,7 @@ fn claude(args: &[String]) {
         );
     }
     match kind().as_str() {
-        "edit" => {
+        "edit" if !reviewer_only() => {
             let _ = fs::write("dirty.txt", "dirty\n");
         }
         "fail" => std::process::exit(1),
@@ -178,7 +236,7 @@ fn cursor(args: &[String]) {
             relay(&["task", "block", "work", "--reason", "stuck"]);
             return;
         }
-        "tag" => {
+        "tag" if !reviewer_only() => {
             git(&["tag", "v9"]);
         }
         "extra" => {
@@ -206,6 +264,10 @@ fn cursor(args: &[String]) {
     relay(&["task", "claim", "work", "--by", "cursor"]);
     let _ = append_file("work.txt", "hello\n");
     git(&["add", "work.txt"]);
+    if kind() == "huge" {
+        let _ = fs::write("huge.txt", "x".repeat(80_000));
+        git(&["add", "huge.txt"]);
+    }
     git(&["commit", "-m", "do the work"]);
     relay(&[
         "task",
@@ -224,6 +286,437 @@ fn cursor(args: &[String]) {
         git(&["push", "origin", "HEAD:main"]);
     }
     emit_stream(r#"{"type":"result","subtype":"success","ok":true}"#);
+}
+
+fn claude_reviewer(args: &[String]) {
+    if let Ok(log) = env::var("LOG") {
+        append(
+            &PathBuf::from(log).join("claude.args").display().to_string(),
+            &args.join(" "),
+        );
+    }
+    let mut packet = String::new();
+    let _ = std::io::stdin().read_to_string(&mut packet);
+    if let Ok(log) = env::var("LOG") {
+        append(
+            &PathBuf::from(log)
+                .join("claude.stdin")
+                .display()
+                .to_string(),
+            &packet,
+        );
+    }
+    if let Ok(dir) = env::var("RELAYBOOK_CLAUDE_REVIEW_HOLD") {
+        let seq = claim_hold_slot(&dir);
+        if seq == 0 {
+            eprintln!("claude review hold slot failed");
+            std::process::exit(98);
+        }
+        let root = PathBuf::from(&dir);
+        let _ = fs::write(root.join(format!("started-{seq}")), "claude-review\n");
+        let release = root.join(format!("release-{seq}"));
+        for _ in 0..1600 {
+            if release.is_file() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !release.is_file() {
+            eprintln!("claude review hold timed out");
+            std::process::exit(98);
+        }
+    }
+    let mode = env::var("RELAYBOOK_FAKE_CLAUDE_REVIEW").unwrap_or_else(|_| "approve".to_string());
+    match mode.as_str() {
+        "fail" => std::process::exit(1),
+        "garbage" => {
+            println!("not json");
+        }
+        "wrong-model" => {
+            let result = verdict_json(args, "approved");
+            // Captured envelope model from claude-envelope-evidence.md. No top-level model.
+            println!(
+                "{}",
+                claude_envelope(result.trim(), &[("claude-opus-5-5", "claude-opus-5-5")])
+            );
+        }
+        "changes" => {
+            let result = verdict_json(args, "changes-requested");
+            println!(
+                "{}",
+                claude_envelope(result.trim(), &[("claude-sonnet-5-5", "claude-sonnet-5-5")])
+            );
+        }
+        _ => {
+            let result = verdict_json(args, "approved");
+            println!(
+                "{}",
+                claude_envelope(result.trim(), &[("claude-sonnet-5-5", "claude-sonnet-5-5")])
+            );
+        }
+    }
+}
+
+/// JSON envelope shape from claude-envelope-evidence.md (Claude Code 2.1.325).
+/// That capture has no top-level `model`. It used `claude-opus-5-5`. A real
+/// Sonnet envelope has not been captured; the pinned id is substituted here.
+fn claude_envelope(result: &str, usage: &[(&str, &str)]) -> String {
+    let mut model_usage = serde_json::Map::new();
+    for (key, canonical) in usage {
+        model_usage.insert(
+            (*key).to_string(),
+            serde_json::json!({
+                "inputTokens": 44,
+                "outputTokens": 32677,
+                "cacheReadInputTokens": 1461950,
+                "cacheCreationInputTokens": 110819,
+                "webSearchRequests": 0,
+                "costUSD": 1.832658,
+                "contextWindow": 1000000,
+                "maxOutputTokens": 128000,
+                "thinkingTokens": 20638,
+                "cacheCreationEphemeral5mInputTokens": 0,
+                "cacheCreationEphemeral1hInputTokens": 110819,
+                "canonicalModel": canonical,
+                "provider": "firstParty",
+                "costBasis": "list"
+            }),
+        );
+    }
+    serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "permission_denials": [],
+        "result": result,
+        "modelUsage": model_usage,
+    })
+    .to_string()
+}
+
+fn codex(args: &[String]) {
+    if args.first().map(String::as_str) == Some("login") {
+        // codex-verification-v2.md row 3: `Not logged in` / `Logged in using ChatGPT`.
+        if env::var("RELAYBOOK_FAKE_CODEX_AUTH").ok().as_deref() == Some("missing") {
+            eprintln!("Not logged in");
+            vanish_after_status();
+            std::process::exit(1);
+        }
+        println!("Logged in using ChatGPT");
+        vanish_after_status();
+        return;
+    }
+    if args.first().map(String::as_str) == Some("--version") {
+        if let Ok(log) = env::var("LOG") {
+            append(
+                &PathBuf::from(log).join("codex.args").display().to_string(),
+                &args.join(" "),
+            );
+        }
+        // V3 verified version, also the version string from the V2 run.
+        println!(
+            "{}",
+            env::var("RELAYBOOK_FAKE_CODEX_VERSION")
+                .unwrap_or_else(|_| "codex-cli 0.169.0".to_string())
+        );
+        vanish_after_status();
+        return;
+    }
+    if let Ok(log) = env::var("LOG") {
+        append(
+            &PathBuf::from(log).join("codex.args").display().to_string(),
+            &args.join(" "),
+        );
+    }
+    let mut packet = String::new();
+    let _ = std::io::stdin().read_to_string(&mut packet);
+    if let Ok(log) = env::var("LOG") {
+        append(
+            &PathBuf::from(log).join("codex.stdin").display().to_string(),
+            &packet,
+        );
+    }
+    let out = flag_value(args, "-o").or_else(|| flag_value(args, "--output-last-message"));
+    match codex_kind().as_str() {
+        "limit" | "limit-stdout" | "plain429" | "auth401" | "too-large" | "limit-then-ok" => {
+            if codex_kind() == "limit-then-ok" && args.iter().any(|arg| arg.starts_with("Probe.")) {
+                write_out(out.as_deref(), "{\"ok\":true}\n");
+                return;
+            }
+            // Fixture stderr is copied from the verification notes. Do not paraphrase.
+            // - plain429: codex-verification-v3.md E2, 429 rate_limit_exceeded.
+            // - auth401: V3 E2, 401. The ellipsis in `url: …` is the note's character.
+            // - too-large: codex-verification-v2.md row 4, byte for byte. rc 1, empty -o.
+            //   That capture has no `ERROR:` prefix.
+            // - limit / limit-stdout: V3 E2, 429 usage_limit_reached, plan pro, resets_at.
+            //   limit-stdout prints that same line on stdout.
+            let stderr = match codex_kind().as_str() {
+                "plain429" => "ERROR: exceeded retry limit, last status: 429 Too Many Requests\n",
+                "auth401" => {
+                    "ERROR: Reconnecting... 1/1\nERROR: unexpected status 401 Unauthorized: bad key, url: …\n"
+                }
+                "too-large" => {
+                    "Input exceeds the maximum length of 1048576 characters (input_error_code input_too_large, max_chars 1048576, actual_chars 4194123)\n"
+                }
+                "limit-stdout" => "",
+                _ => {
+                    "ERROR: You\u{2019}ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 6:39 AM.\n"
+                }
+            };
+            write_out(out.as_deref(), "");
+            if codex_kind() == "limit-stdout" {
+                println!(
+                    "ERROR: You\u{2019}ve hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at 6:39 AM."
+                );
+            } else {
+                eprint!("{stderr}");
+            }
+            std::process::exit(1);
+        }
+        "probe-ok-changes" => {
+            if args.iter().any(|arg| arg.starts_with("Probe.")) {
+                write_out(out.as_deref(), "{\"ok\":true}\n");
+                return;
+            }
+            write_out(out.as_deref(), &verdict_json(args, "changes-requested"));
+            return;
+        }
+        "sleep" => {
+            let secs = env::var("RELAYBOOK_CODEX_TIMEOUT_SECS")
+                .ok()
+                .and_then(|text| text.parse::<u64>().ok())
+                .unwrap_or(1)
+                .saturating_add(30);
+            thread::sleep(Duration::from_secs(secs));
+        }
+        "edit" => {
+            let _ = fs::write("reviewer-edit.txt", "edited\n");
+        }
+        "branch" => {
+            git(&["commit", "--allow-empty", "-m", "reviewer moved HEAD"]);
+        }
+        "tag" => {
+            git(&["tag", "reviewer-tag"]);
+        }
+        "config" => {
+            git(&["config", "reviewer.probe", "1"]);
+        }
+        "hook" => {
+            let _ = fs::create_dir_all(".git/hooks");
+            let _ = fs::write(".git/hooks/pre-commit", "#!/bin/sh\n");
+        }
+        "hook-target" => {
+            // Edit the file a hook symlink points at. Leave the link unchanged.
+            let _ = fs::write(".git/shared-pre-commit", "#!/bin/sh\necho changed\n");
+        }
+        "ledger" => {
+            relay(&[
+                "decision",
+                "log",
+                "work",
+                "--why",
+                "reviewer wrote",
+                "--by",
+                "codex",
+            ]);
+        }
+        "ledger-fail" => {
+            relay(&[
+                "decision",
+                "log",
+                "work",
+                "--why",
+                "reviewer wrote",
+                "--by",
+                "codex",
+            ]);
+            write_out(out.as_deref(), "");
+            std::process::exit(1);
+        }
+        "ledger-garbage" => {
+            relay(&[
+                "decision",
+                "log",
+                "work",
+                "--why",
+                "reviewer wrote",
+                "--by",
+                "codex",
+            ]);
+            write_out(out.as_deref(), "not json\n");
+            return;
+        }
+        "garbage" => {
+            write_out(out.as_deref(), "not json\n");
+            return;
+        }
+        "schema" => {
+            let text = verdict_json(args, "approved");
+            let text = text.trim_end();
+            let Some(text) = text.strip_suffix('}') else {
+                write_out(out.as_deref(), "not json\n");
+                return;
+            };
+            write_out(out.as_deref(), &format!("{text},\"injected\":true}}\n"));
+            return;
+        }
+        "hold" => {
+            let Some(dir) = env::var("RELAYBOOK_CODEX_HOLD").ok() else {
+                eprintln!("RELAYBOOK_CODEX_HOLD is unset");
+                std::process::exit(99);
+            };
+            let seq = claim_hold_slot(&dir);
+            if seq == 0 {
+                eprintln!("codex hold slot failed");
+                std::process::exit(98);
+            }
+            let root = PathBuf::from(&dir);
+            let _ = fs::write(
+                root.join(format!("started-{seq}")),
+                out.clone().unwrap_or_default(),
+            );
+            let release = root.join(format!("release-{seq}"));
+            for _ in 0..1600 {
+                if release.is_file() {
+                    let text = fs::read_to_string(&release).unwrap_or_default();
+                    if let Some(rest) = text.strip_prefix("relaybook-hold-exit ") {
+                        let mut lines = rest.splitn(2, '\n');
+                        let code = lines
+                            .next()
+                            .unwrap_or("1")
+                            .trim()
+                            .parse::<i32>()
+                            .unwrap_or(1);
+                        write_out(out.as_deref(), lines.next().unwrap_or(""));
+                        std::process::exit(code);
+                    }
+                    write_out(out.as_deref(), &text);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            eprintln!("codex hold timed out");
+            std::process::exit(98);
+        }
+        "empty" | "fail" => {
+            write_out(out.as_deref(), "");
+            std::process::exit(1);
+        }
+        "changes" => {
+            let marker = PathBuf::from(".git/codex-asked-changes");
+            if marker.is_file() {
+                write_out(out.as_deref(), &verdict_json(args, "approved"));
+            } else {
+                let _ = fs::create_dir_all(".git");
+                let _ = fs::write(&marker, "1\n");
+                write_out(out.as_deref(), &verdict_json(args, "changes-requested"));
+            }
+            return;
+        }
+        _ => {}
+    }
+    write_out(out.as_deref(), &verdict_json(args, "approved"));
+}
+
+fn wait_for_graphify_hold() -> bool {
+    let Some(dir) = env::var("RELAYBOOK_GRAPHIFY_HOLD").ok() else {
+        eprintln!("RELAYBOOK_GRAPHIFY_HOLD is unset");
+        std::process::exit(99);
+    };
+    let from = env::var("RELAYBOOK_GRAPHIFY_HOLD_FROM")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(1);
+    let seq = claim_hold_slot(&dir);
+    if seq == 0 {
+        eprintln!("graphify hold slot failed");
+        std::process::exit(98);
+    }
+    let root = PathBuf::from(&dir);
+    let _ = fs::write(root.join(format!("started-{seq}")), "update");
+    if seq < from {
+        return true;
+    }
+    let release = root.join(format!("release-{seq}"));
+    for _ in 0..1600 {
+        if release.is_file() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+fn claim_hold_slot(dir: &str) -> i64 {
+    let root = PathBuf::from(dir);
+    let _ = fs::create_dir_all(&root);
+    for n in 1..100 {
+        let path = root.join(format!("claim-{n}"));
+        if OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .is_ok()
+        {
+            return n;
+        }
+    }
+    0
+}
+
+/// Test seam. `RELAYBOOK_FAKE_CODEX_VANISH=1` removes this executable after
+/// `login` or `--version`, so the next `codex` lookup fails on every platform.
+/// Renaming uses [`std::env::consts::EXE_SUFFIX`] because a running Windows
+/// image can be renamed when it cannot be deleted.
+fn vanish_after_status() {
+    if env::var("RELAYBOOK_FAKE_CODEX_VANISH").ok().as_deref() != Some("1") {
+        return;
+    }
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    let dest = exe.with_file_name(format!(
+        "codex-vanished-{}{}",
+        std::process::id(),
+        std::env::consts::EXE_SUFFIX
+    ));
+    if fs::rename(&exe, &dest).is_ok() {
+        let _ = fs::remove_file(&dest);
+        return;
+    }
+    let _ = fs::remove_file(&exe);
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == flag)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+fn verdict_json(args: &[String], verdict: &str) -> String {
+    let release = args
+        .iter()
+        .any(|arg| arg.contains("Release review") || arg.contains("Re-review release"));
+    if release {
+        format!(
+            "{{\"verdict\":\"{verdict}\",\"body\":{{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[],\"prd_covered\":[],\"gaps\":[]}}}}\n"
+        )
+    } else {
+        format!(
+            "{{\"verdict\":\"{verdict}\",\"body\":{{\"findings\":[],\"security\":[],\"tests_checked\":[],\"not_checked\":[]}}}}\n"
+        )
+    }
+}
+
+fn write_out(path: Option<&str>, text: &str) {
+    let Some(path) = path else {
+        return;
+    };
+    if let Some(parent) = PathBuf::from(path).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, text);
 }
 
 fn emit_stream(result: &str) {

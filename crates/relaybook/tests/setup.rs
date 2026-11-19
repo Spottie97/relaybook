@@ -826,10 +826,13 @@ fn guide_prints_a_role_or_both() {
     assert!(both.status.success(), "{text}");
     assert!(text.contains("# Planner"), "{text}");
     assert!(text.contains("# Executor"), "{text}");
+    assert!(text.contains("# Reviewer"), "{text}");
     assert!(text.contains("depends-on login"), "{text}");
     assert!(text.contains("planning from memory"), "{text}");
     assert!(text.contains("working unclaimed"), "{text}");
     assert!(text.contains("1,500 bytes"), "{text}");
+    assert!(text.contains("graphify extract"), "{text}");
+    assert!(text.contains("no graph"), "{text}");
     let planner = relaybook(dir.path())
         .args(["guide", "planner"])
         .output()
@@ -837,6 +840,7 @@ fn guide_prints_a_role_or_both() {
     let planner = String::from_utf8_lossy(&planner.stdout);
     assert!(planner.contains("depends-on login"), "{planner}");
     assert!(!planner.contains("# Executor"), "{planner}");
+    assert!(!planner.contains("# Reviewer"), "{planner}");
     assert!(planner.len() <= 4000, "{}", planner.len());
     let executor = relaybook(dir.path())
         .args(["guide", "executor"])
@@ -845,7 +849,20 @@ fn guide_prints_a_role_or_both() {
     let executor = String::from_utf8_lossy(&executor.stdout);
     assert!(executor.contains("task claim login"), "{executor}");
     assert!(!executor.contains("# Planner"), "{executor}");
+    assert!(!executor.contains("# Reviewer"), "{executor}");
     assert!(executor.len() <= 4000, "{}", executor.len());
+    let reviewer = relaybook(dir.path())
+        .args(["guide", "reviewer"])
+        .output()
+        .expect("reviewer");
+    let reviewer = String::from_utf8_lossy(&reviewer.stdout);
+    assert!(reviewer.contains("graphify extract"), "{reviewer}");
+    assert!(reviewer.contains("codex"), "{reviewer}");
+    assert!(reviewer.contains("no graph"), "{reviewer}");
+    assert!(reviewer.contains("findings"), "{reviewer}");
+    assert!(!reviewer.contains("# Planner"), "{reviewer}");
+    assert!(!reviewer.contains("# Executor"), "{reviewer}");
+    assert!(reviewer.len() <= 4000, "{}", reviewer.len());
 }
 
 #[test]
@@ -1306,6 +1323,65 @@ fn assert_no_path_before_graphify(command: &str) {
             "path before graphify in {command}"
         );
     }
+}
+
+#[test]
+fn setup_warns_when_graphify_changes_claude_md() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dir.path().join("bin");
+    write_drift_graphify(&bin);
+    let warn = "CLAUDE.md: warn (graphify claude install changed CLAUDE.md)";
+    setup_plain(dir.path(), &["setup"])
+        .env("PATH", isolated_path(&bin))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(warn));
+    let claude = fs::read_to_string(dir.path().join("CLAUDE.md")).expect("claude");
+    assert!(claude.contains("GRAPHIFY-SECTION"), "{claude}");
+    setup_plain(dir.path(), &["setup"])
+        .env("PATH", isolated_path(&bin))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(warn).not());
+
+    let quiet = tempfile::tempdir().expect("tempdir");
+    let fake = quiet.path().join("bin");
+    copy_fake(&fake, "graphify");
+    setup_plain(quiet.path(), &["setup"])
+        .env("PATH", isolated_path(&fake))
+        .assert()
+        .success()
+        .stdout(predicates::str::contains(warn).not());
+}
+
+fn write_drift_graphify(bin: &Path) {
+    fs::create_dir_all(bin).expect("mkdir");
+    if cfg!(windows) {
+        fs::write(
+            bin.join("graphify.cmd"),
+            "@echo off\r\nif /I not \"%~1\"==\"claude\" exit /b 0\r\nif /I not \"%~2\"==\"install\" exit /b 0\r\nif exist .graphify-claude-installed exit /b 0\r\necho GRAPHIFY-SECTION>>CLAUDE.md\r\necho.>.graphify-claude-installed\r\nexit /b 0\r\n",
+        )
+        .expect("graphify.cmd");
+        return;
+    }
+    let path = bin.join("graphify");
+    fs::write(
+        &path,
+        "#!/bin/sh\nif [ \"$1\" = claude ] && [ \"$2\" = install ] && [ ! -f .graphify-claude-installed ]; then\n  printf '\\nGRAPHIFY-SECTION\\n' >> CLAUDE.md\n  touch .graphify-claude-installed\nfi\nexit 0\n",
+    )
+    .expect("graphify");
+    make_executable(&path);
+}
+
+fn isolated_path(bin: &Path) -> std::ffi::OsString {
+    let mut path = bin.as_os_str().to_os_string();
+    path.push(if cfg!(windows) { ";" } else { ":" });
+    path.push(if cfg!(windows) {
+        r"C:\Windows\System32"
+    } else {
+        "/usr/bin:/bin"
+    });
+    path
 }
 
 #[test]

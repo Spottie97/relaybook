@@ -25,3 +25,5 @@ relaybook task block login --reason "needs an API key"
 A reopened task lists `reopened:` on `relaybook task list --ready`. Claim it, fix the reason, and file a new report.
 
 Common mistakes: working unclaimed, skipping the report, and planning tasks instead of implementing them.
+
+Never run `graphify extract`. In `workflow=gated`, claim and done need a clean tree, and the report stores the commit. Codex reviews that commit. You do not.

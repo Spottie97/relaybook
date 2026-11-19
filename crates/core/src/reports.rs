@@ -4,6 +4,17 @@ use crate::error::Error;
 
 pub const TASK_LIMIT: usize = 1500;
 pub const NOTE_LIMIT: usize = 500;
+pub const REVIEW_LIMIT: usize = 1500;
+
+const TASK_REVIEW_KEYS: &[&str] = &["findings", "security", "tests_checked", "not_checked"];
+const RELEASE_REVIEW_KEYS: &[&str] = &[
+    "findings",
+    "security",
+    "tests_checked",
+    "not_checked",
+    "prd_covered",
+    "gaps",
+];
 
 #[derive(Clone, Debug)]
 pub struct Sections {
@@ -34,6 +45,7 @@ pub fn note_body(text: &str) -> Result<String, Error> {
     Ok(body)
 }
 
+#[allow(clippy::too_many_arguments)] // commit, base, and graph SHAs are separate nullable columns
 pub fn insert(
     conn: &Connection,
     task_id: Option<i64>,
@@ -41,11 +53,25 @@ pub fn insert(
     author: &str,
     body: &str,
     created_at: &str,
+    commit_sha: Option<&str>,
+    base_sha: Option<&str>,
+    graph_sha: Option<&str>,
 ) -> Result<i64, Error> {
     conn.execute(
-        "INSERT INTO reports (task_id, kind, author, body, bytes, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![task_id, kind, author, body, body.len() as i64, created_at],
+        "INSERT INTO reports (
+            task_id, kind, author, body, bytes, created_at, commit_sha, base_sha, graph_sha
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            task_id,
+            kind,
+            author,
+            body,
+            body.len() as i64,
+            created_at,
+            commit_sha,
+            base_sha,
+            graph_sha
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -173,6 +199,35 @@ pub fn reopened_reason(conn: &Connection, task_id: i64) -> Result<Option<String>
     } else {
         Ok(None)
     }
+}
+
+pub(crate) fn review_body(scope: &str, text: &str) -> Result<String, Error> {
+    let bytes = text.len();
+    if bytes > REVIEW_LIMIT {
+        return Err(Error::InvalidSetting(format!(
+            "review is {bytes} bytes; limit {REVIEW_LIMIT}"
+        )));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|err| Error::Json(err.to_string()))?;
+    let Some(object) = value.as_object() else {
+        return Err(Error::InvalidSetting(
+            "review body must be a JSON object".to_string(),
+        ));
+    };
+    let keys = if scope == "release" {
+        RELEASE_REVIEW_KEYS
+    } else {
+        TASK_REVIEW_KEYS
+    };
+    for key in keys {
+        if !object.contains_key(*key) {
+            return Err(Error::InvalidSetting(format!(
+                "review body is missing {key}"
+            )));
+        }
+    }
+    Ok(text.to_string())
 }
 
 fn check_size(body: &str, limit: usize) -> Result<(), Error> {

@@ -20,6 +20,15 @@ impl Program {
             Command::new(&self.path)
         }
     }
+
+    pub(crate) fn is_shell_shim(&self) -> bool {
+        is_shell_shim(&self.path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_path(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
 }
 
 /// `cursor-agent` when it is installed, otherwise `agent` when `--version` names Cursor.

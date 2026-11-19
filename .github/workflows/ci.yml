@@ -26,7 +26,7 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: test
-        run: cargo test
+        run: cargo test --no-fail-fast
       - name: PSScriptAnalyzer
         if: runner.os == 'Windows'
         shell: pwsh
@@ -51,6 +51,7 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File scripts/test-windows-install.ps1 -Phase Finish
       - name: context budget
+        shell: bash
         run: scripts/measure-context.sh --check
       - name: docs commands
         run: python3 scripts/check-docs.py

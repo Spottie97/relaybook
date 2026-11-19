@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use assert_cmd::prelude::*;
@@ -156,6 +156,131 @@ fn uninstall_removes_each_attribute_form() {
 }
 
 #[test]
+fn setup_keeps_an_existing_merge_driver() {
+    let custom_driver = "\"/usr/bin/python3\" -m graphify merge-driver %O %A %B";
+    let custom_name = "graphify union";
+
+    let repaired = tempfile::tempdir().expect("tempdir");
+    git_init(repaired.path());
+    git_ok(
+        repaired.path(),
+        &["config", "merge.graphify.driver", custom_driver],
+    );
+    git_ok(
+        repaired.path(),
+        &["config", "merge.graphify.name", custom_name],
+    );
+    fs::write(
+        repaired.path().join(".gitattributes"),
+        "graphify-out/graph.json merge=graphify # relaybook\n",
+    )
+    .expect("write");
+    setup(repaired.path(), &["setup", "--no-graphify"]);
+    assert_eq!(
+        config_get(repaired.path(), "merge.graphify.driver"),
+        custom_driver
+    );
+    assert_eq!(
+        config_get(repaired.path(), "merge.graphify.name"),
+        custom_name
+    );
+    let attributes =
+        fs::read_to_string(repaired.path().join(".gitattributes")).expect("attributes");
+    assert!(
+        attributes.contains("graphify-out/graph.json merge=graphify\n"),
+        "{attributes}"
+    );
+
+    let ci = tempfile::tempdir().expect("tempdir");
+    git_init(ci.path());
+    git_ok(
+        ci.path(),
+        &["config", "merge.graphify.driver", custom_driver],
+    );
+    git_ok(ci.path(), &["config", "merge.graphify.name", custom_name]);
+    setup(ci.path(), &["setup", "--ci", "--no-graphify"]);
+    assert_eq!(
+        config_get(ci.path(), "merge.graphify.driver"),
+        custom_driver
+    );
+    assert_eq!(config_get(ci.path(), "merge.graphify.name"), custom_name);
+    let attributes = fs::read_to_string(ci.path().join(".gitattributes")).expect("attributes");
+    assert!(
+        attributes.contains("graphify-out/graph.json merge=graphify\n"),
+        "{attributes}"
+    );
+
+    let fresh = tempfile::tempdir().expect("tempdir");
+    git_init(fresh.path());
+    setup(fresh.path(), &["setup", "--ci", "--no-graphify"]);
+    assert_eq!(
+        config_get(fresh.path(), "merge.graphify.driver"),
+        "graphify merge-driver %O %A %B"
+    );
+    assert_eq!(
+        config_get(fresh.path(), "merge.graphify.name"),
+        "graphify graph.json union merge"
+    );
+}
+
+#[test]
+fn setup_keeps_a_global_merge_driver() {
+    // Child processes only. GIT_CONFIG_COUNT and its pushInsteadOf pairs stay inherited.
+    let root = tempfile::tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    let global = root.path().join("global.gitconfig");
+    fs::create_dir(&repo).expect("repo");
+    fs::write(&global, "").expect("global gitconfig");
+    fs::create_dir(root.path().join("home")).expect("home");
+    let home_before = real_global_configs();
+    let system_before = fs::read("/etc/gitconfig").ok();
+
+    let custom_driver = "\"/usr/bin/python3\" -m graphify merge-driver %O %A %B";
+    let custom_name = "graphify union";
+    let init = git_global(&repo, &global, &["init", "-b", "main"]);
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    write_global_config(&global, "merge.graphify.driver", custom_driver);
+    write_global_config(&global, "merge.graphify.name", custom_name);
+
+    setup_with_global(&repo, &global, &["setup", "--ci", "--no-graphify"]);
+
+    let local = fs::read_to_string(repo.join(".git/config")).expect("local gitconfig");
+    assert!(
+        !local.contains("[merge \"graphify\"]"),
+        "local config overrode the global driver:\n{local}"
+    );
+    assert_local_absent(&repo, &global, "merge.graphify.driver");
+    assert_local_absent(&repo, &global, "merge.graphify.name");
+    assert_eq!(
+        effective_config(&repo, &global, "merge.graphify.driver"),
+        custom_driver
+    );
+    assert_eq!(
+        effective_config(&repo, &global, "merge.graphify.name"),
+        custom_name
+    );
+    assert_eq!(file_config(&global, "merge.graphify.driver"), custom_driver);
+    assert_eq!(file_config(&global, "merge.graphify.name"), custom_name);
+    let attributes = fs::read_to_string(repo.join(".gitattributes")).expect("attributes");
+    assert!(
+        attributes.contains("graphify-out/graph.json merge=graphify\n"),
+        "{attributes}"
+    );
+    assert!(
+        real_global_configs() == home_before,
+        "real ~/.gitconfig was modified"
+    );
+    assert!(
+        fs::read("/etc/gitconfig").ok() == system_before,
+        "system gitconfig was modified"
+    );
+}
+
+#[test]
 fn setup_repairs_old_attribute_lines_without_ci() {
     for original in [
         "keep text=auto\ngraphify-out/graph.json merge=graphify # relaybook\n",
@@ -197,12 +322,23 @@ fn setup(dir: &Path, args: &[&str]) {
     relaybook(dir).args(args).assert().success();
 }
 
+fn child_path() -> std::ffi::OsString {
+    if cfg!(windows) {
+        let dir = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .find(|dir| dir.join("git.exe").is_file())
+            .expect("git.exe on PATH");
+        std::env::join_paths([dir]).expect("git.exe on PATH")
+    } else {
+        "/usr/bin:/bin".into()
+    }
+}
+
 fn relaybook(dir: &Path) -> Command {
     let mut cmd = Command::cargo_bin("relaybook").expect("relaybook binary");
     cmd.current_dir(dir);
     cmd.env_remove("GIT_DIR");
     cmd.env_remove("GIT_WORK_TREE");
-    cmd.env("PATH", "/usr/bin:/bin");
+    cmd.env("PATH", child_path());
     cmd
 }
 
@@ -234,4 +370,179 @@ fn git(dir: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .output()
         .expect("git")
+}
+
+#[track_caller]
+fn git_ok(dir: &Path, args: &[&str]) {
+    let output = git(dir, args);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[track_caller]
+fn config_get(dir: &Path, key: &str) -> String {
+    let output = git(dir, &["config", "--local", "--get", key]);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}
+
+fn real_global_configs() -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    let mut dirs = Vec::new();
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(value) = std::env::var_os(key) {
+            let dir = PathBuf::from(value);
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    if let (Some(drive), Some(path)) = (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
+    {
+        let mut joined = drive;
+        joined.push(path);
+        let dir = PathBuf::from(joined);
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    assert!(
+        !dirs.is_empty(),
+        "no HOME, USERPROFILE or HOMEDRIVE+HOMEPATH"
+    );
+
+    let mut found = Vec::new();
+    for dir in dirs {
+        let path = dir.join(".gitconfig");
+        let bytes = fs::read(&path).ok();
+        found.push((path, bytes));
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(xdg).join("git").join("config");
+        let bytes = fs::read(&path).ok();
+        found.push((path, bytes));
+    } else if let Some(home) = std::env::var_os("HOME") {
+        let path = PathBuf::from(home)
+            .join(".config")
+            .join("git")
+            .join("config");
+        let bytes = fs::read(&path).ok();
+        found.push((path, bytes));
+    }
+    found
+}
+
+fn isolate(cmd: &mut Command, home: &Path) {
+    cmd.env("HOME", home);
+    cmd.env("USERPROFILE", home);
+    cmd.env("XDG_CONFIG_HOME", home);
+}
+
+fn git_global(dir: &Path, global: &Path, args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(args);
+    isolate(&mut cmd, &global.parent().unwrap().join("home"));
+    cmd.output().expect("git")
+}
+
+fn write_global_config(global: &Path, key: &str, value: &str) {
+    let mut cmd = Command::new("git");
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["config", "--file"])
+        .arg(global)
+        .arg(key)
+        .arg(value);
+    isolate(&mut cmd, &global.parent().unwrap().join("home"));
+    let output = cmd.output().expect("git config --file");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[track_caller]
+fn file_config(global: &Path, key: &str) -> String {
+    let mut cmd = Command::new("git");
+    cmd.env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["config", "--file"])
+        .arg(global)
+        .args(["--get", key]);
+    isolate(&mut cmd, &global.parent().unwrap().join("home"));
+    let output = cmd.output().expect("git config --file --get");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}
+
+#[track_caller]
+fn effective_config(dir: &Path, global: &Path, key: &str) -> String {
+    let output = git_global(dir, global, &["config", "--get", key]);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}
+
+#[track_caller]
+fn assert_local_absent(dir: &Path, global: &Path, key: &str) {
+    let output = git_global(dir, global, &["config", "--local", "--get", key]);
+    assert!(
+        !output.status.success(),
+        "local {key} was set: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+fn setup_with_global(dir: &Path, global: &Path, args: &[&str]) {
+    let mut cmd = Command::cargo_bin("relaybook").expect("relaybook binary");
+    cmd.current_dir(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_CONFIG_GLOBAL", global)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PATH", child_path())
+        .args(args);
+    isolate(&mut cmd, &global.parent().unwrap().join("home"));
+    cmd.assert().success();
 }

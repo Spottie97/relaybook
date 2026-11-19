@@ -34,6 +34,12 @@ pub(crate) fn context(ctx: &Context, compact: bool, summarize_events: bool) -> S
     if let Some(report) = &ctx.latest_report {
         write_report(&mut out, report);
     }
+    if let Some(review) = &ctx.latest_review {
+        write_latest_review(&mut out, review);
+    }
+    if let Some(sha) = &ctx.graph_sha {
+        let _ = writeln!(out, "graph {sha}");
+    }
     if compact && ctx.unreviewed_reports > 0 {
         let _ = writeln!(
             out,
@@ -166,6 +172,22 @@ fn reopened_suffix(task: &Task) -> String {
     }
 }
 
+fn write_latest_review(out: &mut String, review: &serde_json::Value) {
+    let verdict = review
+        .get("verdict")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("pending");
+    let reviewer = review
+        .get("reviewer")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let sha = review
+        .get("commit_sha")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let _ = writeln!(out, "review {verdict} by {reviewer} at {sha}");
+}
+
 fn write_report(out: &mut String, report: &serde_json::Value) {
     for key in [
         "changed",
@@ -291,6 +313,8 @@ mod tests {
                 hidden_done: 0,
                 unreviewed_reports: 0,
                 latest_report: None,
+                latest_review: None,
+                graph_sha: None,
             },
             false,
             false,
@@ -345,6 +369,8 @@ mod tests {
                 hidden_done: 2,
                 unreviewed_reports: 0,
                 latest_report: None,
+                latest_review: None,
+                graph_sha: None,
             },
             true,
             false,
@@ -363,5 +389,32 @@ mod tests {
         }
         assert!(rendered.contains("2. [ ] open step"));
         assert!(!rendered.contains("done step"));
+    }
+
+    #[test]
+    fn context_shows_a_review_and_graph_sha_when_present() {
+        let rendered = context(
+            &Context {
+                tasks: vec![TaskDetail {
+                    task: task(Status::Done, Some("cursor")),
+                    steps: Vec::new(),
+                    decisions: Vec::new(),
+                }],
+                events: Vec::new(),
+                hidden_done: 0,
+                unreviewed_reports: 0,
+                latest_report: None,
+                latest_review: Some(serde_json::json!({
+                    "verdict": null,
+                    "reviewer": "codex",
+                    "commit_sha": "abc",
+                })),
+                graph_sha: Some("def".to_string()),
+            },
+            false,
+            false,
+        );
+        assert!(rendered.contains("review pending by codex at abc"));
+        assert!(rendered.contains("graph def"));
     }
 }

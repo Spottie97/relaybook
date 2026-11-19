@@ -19,11 +19,19 @@ relaybook setup --ci
 - `relaybook setup --no-commands` skips `.claude/commands/relaybook.md` and `.cursor/commands/relaybook.md`.
 - `relaybook setup --ci` writes `.github/workflows/graphify-update.yml` and adds `graphify-out/graph.json merge=graphify` to `.gitattributes`. An existing workflow file is left untouched. The workflow opens a pull request instead of pushing to `main`. `graphify-out/` stays tracked.
 
+Setup leaves an existing `merge.graphify.driver` unchanged, including a driver in global or system git config and the command `graphify hook install` registered. When that key is unset in the effective git configuration, setup sets a repository-local `merge.graphify.driver` to `graphify merge-driver %O %A %B` and `merge.graphify.name` to `graphify graph.json union merge`.
+
 `relaybook setup` writes a `# relaybook:start` / `# relaybook:end` block in `.gitignore` and, with `--ci`, in `.gitattributes`. The entries sit on their own lines. A pattern you already ignore is left where it is. The ignore block covers Graphify backups, `graphify-out/` (unless you passed `--ci`), `.relaybook/*.db-wal`, `.relaybook/*.db-shm`, and `.relaybook/runs/`. `.relaybook/ledger.db` stays committable.
 
 ## How the graph stays current
 
 Local hooks are the default. `graphify hook install` refreshes the graph after a commit and a checkout. `relaybook setup` adds post-merge and post-rewrite hooks that run `graphify update .` in the background, so `git pull` and `git pull --rebase` return immediately. `relaybook setup --no-hooks` leaves those hooks out.
+
+With `workflow=classic` (the default), Relaybook does not check whether `graphify-out/graph.json` exists or which Graphify version built it, and it does not record which commit the graph was built from. The auto runner never calls Graphify. Relaybook runs Graphify from `relaybook setup`, `relaybook uninstall --graphify`, and the post-merge and post-rewrite hooks.
+
+With `workflow=gated`, `relaybook graph refresh`, a gated `relaybook task claim`, `relaybook review start`, a gated `relaybook task done`, and a gated auto run also run `graphify update .` and record that commit. The auto run does this before planning (`plan`), before each task implementation (`implement`), and before task and release review. When that refresh is `built`, `relaybook review start` adds `graphify affected` output for the files in the reviewed range, capped at 4,000 bytes. If Graphify is missing, the update fails, or `graphify-out/graph.json` is missing afterwards, the recorded status is `skipped` or `failed`, `graph_sha` is null, and the handoff says `no graph`. That does not stop the command. Gated mode needs `graphify-out/` gitignored. `relaybook setup --ci` tracks `graphify-out/graph.json`, so that layout is not usable with `workflow=gated`.
+
+Relaybook never runs `graphify extract`. The opt-in workflow below does, when an LLM API secret is set. The Graphify section of `CLAUDE.md` mentions `graphify-out/wiki/index.md`. That file exists only after `graphify export wiki`, which neither `graphify update` nor Relaybook runs. A gated auto run refreshes the graph before planning, before each implementation step, and before task and release review. A skipped or failed refresh does not stop the run. The planner prompt gains `Graph: <graph_sha or no graph> at <commit>`. The executor prompt gains `Base: <HEAD>` and that Graph line. A classic auto run does not call Graphify. See [orca-workflow.md](orca-workflow.md).
 
 `relaybook setup --ci` is the opt-in GitHub Actions path for teams that want the graph committed. Pushes that only change `graphify-out/` do not start another run. Delete `.github/workflows/graphify-update.yml` to turn that job off.
 
@@ -52,17 +60,40 @@ relaybook gates
 relaybook gates none
 relaybook gates plan
 relaybook gates plan,review
+relaybook config set reviewer codex
+relaybook config set workflow gated
 ```
 
 | Key | Default | Values |
 | --- | --- | --- |
 | `mode` | `manual` | `manual` or `auto` |
 | `gates` | `plan` | `none`, `plan`, or `plan,review` |
+| `reviewer` | `claude` | `claude` or `codex` |
+| `codex_sandbox` | `read-only` | `read-only` or `isolated` |
+| `codex_model` | `gpt-6.1-sol` | 1–64 characters, no leading `-`, only `A-Za-z0-9._:-` |
+| `review_fallback` | `off` | `off` or `sonnet` |
+| `codex_backoff_min` | 60 | integer from 5 to 1440 |
+| `fallback_rereview` | `before-release` | `before-release` or `off` |
+| `workflow` | `classic` | `classic` or `gated` |
+| `remote_check` | `online` | `online` or `local` |
+| `signoff` | `typed` | `typed` or `signed-tag` |
 | `max_cycles` | 20 | integer, at least 1 |
 | `max_reopens_per_task` | 2 | integer, at least 1 |
 | `max_agent_calls` | 60 | integer, at least 1 |
 | `cursor_timeout_min` | 30 | integer, at least 1 |
 | `est_cost_cap_usd` | unset | a number greater than 0, or `unset` to clear it |
+
+`review_fallback` defaults to `off`. `sonnet` lets a gated run call Claude `claude-sonnet-5-5` after a classified Codex usage limit. That model id is not a setting. `relaybook config set review_fallback sonnet` asks `Allow Sonnet to review when Codex is limited?` and requires the typed challenge. The line starts with `sonnet`. Without a terminal it fails with `loosening reviewer fallback requires confirmation at a TTY`. A live gated run fails with `a gated run is already live` before that prompt. Setting `off`, or setting `sonnet` when it is already `sonnet`, does not ask. `codex_backoff_min` is the wait after a limit, in minutes, from 5 to 1440, default 60. Changing it does not ask. `fallback_rereview` defaults to `before-release`. `relaybook config set fallback_rereview off` asks `Turn off Codex re-review before release?` and requires the typed challenge. The line starts with `off`. The same terminal and live-run rules apply. Setting `before-release` does not ask. See [Reviewer fallback](auto-mode.md#reviewer-fallback).
+
+`codex_model` defaults to `gpt-6.1-sol`. Gated review passes it as `-m` on `codex exec`. `relaybook config` prints it. `relaybook config get codex_model` prints that one value. `relaybook config set codex_model gpt-6.1-sol` stores another model. The value is trimmed. It must be non-empty, at most 64 characters, must not start with `-`, and may contain only `A-Z`, `a-z`, `0-9`, `.`, `_`, `:`, and `-`. Changing it does not ask for a terminal, including while `workflow=gated`. It is not a loosening change, so it follows `codex_sandbox`: the write does not use the typed challenge. `codex login status` does not take `-m`.
+
+`codex_sandbox` applies only to gated auto review. `read-only` runs `codex exec -s read-only` with `-m` set to `codex_model` and passes the review packet on stdin. `relaybook config set codex_sandbox isolated` omits `-s`. Use `isolated` only when Codex already runs as its own OS user against a read-only mount. Relaybook writes that review's `-o` file outside the repository so the reviewer can create it while the worktree is read-only. The directory is mode 0700 and the schema is mode 0600. When that account is not the Relaybook user, set `RELAYBOOK_CODEX_USER` to it. Relaybook grants only that account access and does not start Codex if the grant fails. Relaybook does not verify that setup, and it never passes `--add-dir`, `--dangerously-*`, `--approve-for-me`, `--trust`, or `--worktree`. See [auto-mode.md](auto-mode.md#codex-review).
+
+`workflow=gated` requires `reviewer=codex`. Set `reviewer` first. `relaybook config set workflow gated` fails with `workflow=gated requires reviewer=codex` while the reviewer is `claude`. Setting `workflow=gated` does not ask for a terminal. Leaving it does: `relaybook config set workflow classic` prompts `Leave gated workflow?` and requires the typed challenge in [Sign-off](orca-workflow.md#sign-off). The line starts with `classic`. A value that trims to `classic` is the same change. The write checks the current workflow again, so a concurrent change to `gated` cannot skip that prompt. Without a terminal it fails with `leaving workflow=gated requires confirmation at a TTY` and the setting stays `gated`. The gated commands are in [orca-workflow.md](orca-workflow.md). A live gated run refuses `relaybook config set workflow` until the run is stopped. The setting write checks again, so a run that starts while the typed confirmation is still pending still refuses. See [auto-mode.md](auto-mode.md#gated-workflow).
+
+`remote_check` defaults to `online`. Gated review and release authorization then query every remote. `relaybook config set remote_check local` prompts `Set remote_check=local?` and requires the typed challenge. The line starts with `local`. Without a terminal it fails with `remote_check=local requires confirmation at a TTY` and the setting stays `online`. A value that trims to `local` is the same change. Setting `remote_check=online`, and setting `local` when it is already `local`, does not ask. The publish check is in [Nothing is published before sign-off](orca-workflow.md#nothing-is-published-before-sign-off).
+
+`signoff` defaults to `typed`. `relaybook config set signoff signed-tag` adds a signed tag check to `relaybook release authorize`. The authorization write reads `signoff` again, so a concurrent change to `signed-tag` refuses a typed authorization. Changing `signoff` either way prompts `Change signoff?` and requires the typed challenge. The line starts with `signoff`. Without a terminal it fails with `changing signoff requires confirmation at a TTY` and the setting stays as it was. Setting the current value does not ask. `invalid signoff` rejects any other word. See [Sign-off](orca-workflow.md#sign-off). A typed confirmation and a signed tag do not prove that a human is present. The maintainer keeps push credentials off the agent machine and protects `main` on GitHub. Relaybook leaves `gh` login and GitHub settings unchanged.
 
 `relaybook mode` prints the current mode. `relaybook mode auto` sets it. `relaybook gates` prints the current checkpoints. `relaybook gates plan` sets them. The same words work from `/relaybook` in Claude Code and Cursor. `/relaybook` with no arguments shows status and a menu.
 
@@ -78,6 +109,8 @@ curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh
 ```
 
 `--yes` also runs `rtk init -g` without the y/N prompt. Without a terminal and without `--yes`, the installer prints `rtk init -g` instead of editing `~/.claude/settings.json`. `relaybook setup` never installs RTK and never edits that global file. The pull hooks run `graphify update .` in the background and print nothing. Graphify's editor hook does not rewrite `relaybook` commands.
+
+Setup was last checked by hand against Graphify 0.9.111. The automated tests use a stand-in `graphify`, not the real one. `scripts/agent-smoke.sh` is the manual check and is not part of CI. It uses a real Graphify, a 0.3.3 build against a schema 8 ledger, system `sqlite3` 3.45.1, real `git ls-remote`, and a real `codex exec -s read-only --ephemeral --color never -m gpt-6.1-sol`. That review passes only when Codex exits 0 and `-o` is one nonempty schema-valid verdict. A separate read-only exec must exit 0 without creating `codex-wrote.txt` and without changing the worktree. The hooks that setup guards call `graphify hook-guard`, which `graphify --help` does not list, so a Graphify release can change it without notice. `graphify claude install` rewrites the Graphify section of `CLAUDE.md`, and its wording changes between Graphify versions. When that changes `CLAUDE.md`, `relaybook setup` warns `CLAUDE.md: warn (graphify claude install changed CLAUDE.md)` and leaves the file as Graphify wrote it. The warning does not fail setup.
 
 `scripts/measure-context.sh --check` fails when fixture context exceeds 4000 bytes, a write acknowledgement exceeds 120 bytes, or an instruction block exceeds 1000 bytes. Role prompts stay under 1200 bytes. Slash commands stay under 1500 bytes. `relaybook guide` stays under 4000 bytes per role.
 
@@ -97,7 +130,7 @@ relaybook uninstall --yes --graphify
 | `--dry-run` | Show what would change. Write nothing |
 | `--yes` | Apply without asking |
 | `--purge` | Also delete `.relaybook/` and `graphify-out/`. Asks `y/N` unless `--yes` is set |
-| `--graphify` | Also run `graphify claude uninstall`, `graphify cursor uninstall`, and `graphify hook uninstall` |
+| `--graphify` | Also run `graphify claude uninstall`, `graphify cursor uninstall`, and `graphify hook uninstall`. `graphify claude uninstall` removes the Graphify section of `CLAUDE.md` and Graphify hooks from `.claude/settings.json`. `graphify cursor uninstall` deletes `.cursor/rules/graphify.mdc`. `graphify hook uninstall` removes Graphify's git hooks, removes `graphify-out/graph.json merge=graphify` from `.gitattributes`, and unsets `merge.graphify.*`. Relaybook ignores their exit codes. `--dry-run` lists each command with those effects and writes nothing |
 
 What it removes, and only inside Relaybook's markers or the setup manifest:
 
@@ -110,7 +143,7 @@ What it removes, and only inside Relaybook's markers or the setup manifest:
 - The `command -v graphify` guards wrapped around Graphify hooks under every event, including `PreToolUse` and `SessionStart`. Graphify sometimes writes an absolute path such as `~/.local/bin/graphify`. Setup rewrites that to `graphify hook-guard ...`, and skips the command when `graphify` is not on PATH, so a committed settings file does not leak a home directory or fail for teammates. Graphify's own hooks stay. Uninstall puts the command back to `graphify hook-guard ...`.
 - The post-merge and post-rewrite blocks between the relaybook hook markers.
 - The `# relaybook:start` / `# relaybook:end` block in `.gitignore` and `.gitattributes`, including an older `pattern # relaybook` line and a lone `# relaybook` line directly above a pattern Relaybook owns. Other lines stay.
-- `.github/workflows/graphify-update.yml` when it still matches the template, the graphify merge attribute, and `merge.graphify.name` / `merge.graphify.driver`.
+- `.github/workflows/graphify-update.yml` when it still matches the template, the graphify merge attribute, and `merge.graphify.name` / `merge.graphify.driver`. A `merge.graphify.driver` that setup left unchanged stays. `relaybook uninstall --graphify` still lists Graphify's own unset of `merge.graphify.*`.
 
 What it keeps unless you pass `--purge`:
 

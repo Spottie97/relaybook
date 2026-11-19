@@ -5,6 +5,10 @@
 - If Graphify is missing, install [uv](https://docs.astral.sh/uv/) and run `uv tool install graphifyy`. `pipx install graphifyy` is the fallback. Setup still finishes and skips the Graphify steps. Skip Graphify during install with `curl -fsSL https://raw.githubusercontent.com/Spottie97/relaybook/main/install.sh | sh -s -- --no-graphify`.
 - If `core.hooksPath` is set, or the repo uses Husky or Lefthook, setup does not write `.git/hooks`. It prints where to add post-merge and post-rewrite commands that run `graphify update .` in the background.
 
+## Codex limited
+
+A gated run can pause with `usage limit reached on codex` or `codex limited until <t>`. That is a classified usage limit, not a failed review. With `review_fallback=off`, wait until `<t>` and run `relaybook run --resume`. Resume before `<t>` does not call Codex. With `review_fallback=sonnet`, the run continues on Claude `claude-sonnet-5-5` until a probe says Codex is available again. `waiting for Codex re-review` means an approved Sonnet review still needs Codex before release. `codex probe failed (not a usage limit)` is an ordinary probe failure: fix Codex, then resume. The captured Codex messages and the open E3 item are in [Reviewer fallback](auto-mode.md#reviewer-fallback).
+
 ## Build
 
 ```sh
